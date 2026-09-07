@@ -2005,7 +2005,7 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy,
     });
 }
 
-template <int ncols_dst, int rows_per_sg, bool shared_weights>
+template <int ncols_dst, int rows_per_sg>
 static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl(
         const void * vx, const void * vy, float * dst,
         const int ncols, const int nrows,
@@ -2021,8 +2021,7 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl(
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>, ncols_dst,
-                                                        /*has_fusion=*/ false, rows_per_sg, shared_weights>(
+                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>, ncols_dst, false, rows_per_sg>(
                                  vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
                                  /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
                          });
@@ -2035,12 +2034,14 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols(
         const int ncols, const int nrows,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
-    if (ggml_sycl_q5_k_mmvq_reuse(ggml_sycl_get_device())) {
-        constexpr int rows_per_sg = ncols_dst >= 3 ? 2 : 1;
-        reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl<ncols_dst, rows_per_sg, true>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
-    } else {
-        reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl<ncols_dst, 1, false>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+    if constexpr (ncols_dst == 3) {
+        // 5120 is the smallest tested row count where pairing improves the Q5_K model shapes.
+        if (nrows >= 5120) {
+            reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl<3, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            return;
+        }
     }
+    reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl<ncols_dst, 1>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
 }
 
 static void reorder_mul_mat_vec_q5_k_q8_1_sycl_switch_ncols(
