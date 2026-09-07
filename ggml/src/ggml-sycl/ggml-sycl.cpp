@@ -4854,6 +4854,18 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
+    // Types without a reordered MMVQ never enter the block above, so DMMV keeps winning
+    // the single-column case that can_use_dequantize_mul_mat_vec() restricts it to, even
+    // where MMVQ is plainly faster. On an Arc Pro B70 at k=17408 m=5120, one column costs
+    // 220.5 us through DMMV against 129.8 us through MMVQ for Q5_1, and 184.7 against
+    // 107.6 for Q4_1 - in both cases slower at one column than the same weights cost at
+    // two. Q5_0 is left on DMMV: it gains only 8-11% and MMVQ's q8_1 activations push
+    // test-backend-ops past its 5e-4 threshold on the single-block k=32 case.
+    if (!g_ggml_sycl_prioritize_dmmv && use_mul_mat_vec_q && src0->type != GGML_TYPE_Q5_0 &&
+        !ggml_sycl_supports_reorder_mmvq(src0->type)) {
+        use_dequantize_mul_mat_vec = false;
+    }
+
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
