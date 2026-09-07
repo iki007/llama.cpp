@@ -114,6 +114,9 @@ if (GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
     find_library(ZE_LOADER_LIB ze_loader HINTS ${ONEAPI_ROOT}/lib ${LEVEL_ZERO_V1_SDK_LIB_PATH} ENV LD_LIBRARY_PATH)
     if(ZE_LOADER_LIB AND LEVEL_ZERO_INCLUDE_DIR)
         target_link_libraries(ggml-sycl PRIVATE ${ZE_LOADER_LIB})
+        # find_path() only records where the header is; without this the compile still
+        # relies on the header sitting somewhere already on the default include path.
+        target_include_directories(ggml-sycl PRIVATE ${LEVEL_ZERO_INCLUDE_DIR})
         target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
         message(STATUS "Level Zero loader found: ${ZE_LOADER_LIB}")
         message(STATUS "Level Zero headers found: ${LEVEL_ZERO_INCLUDE_DIR}")
