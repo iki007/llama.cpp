@@ -370,6 +370,10 @@ template <> struct reorder_vec_dot_shared_weights<GGML_TYPE_IQ4_XS> {
     static constexpr bool value = true;
 };
 
+template <> struct reorder_vec_dot_shared_weights<GGML_TYPE_IQ4_NL> {
+    static constexpr bool value = true;
+};
+
 template <ggml_type T> struct reorder_vec_dot_shared_activations {
     static constexpr bool value = false;
 };
@@ -735,6 +739,77 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K> {
         const auto a = load_activations(q8_1_quant_ptr, q8_1_ds, iqs);
 
         return apply(w, a);
+    }
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        return dot(load(vbq, ibx_offset, d_offset, iqs), q8_1_quant_ptr, q8_1_ds, iqs);
+    }
+};
+
+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_NL> {
+    static constexpr ggml_type gtype = GGML_TYPE_IQ4_NL;
+
+    using iq4_nl_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_IQ4_NL>;
+    using iq4_nl_traits = typename iq4_nl_block::traits;
+
+    // As for IQ4_XS, the 16-entry table lookup is weight-only, so expand it once per block.
+    struct weights {
+        int   v1[iq4_nl_traits::vdr_mmvq];
+        int   v2[iq4_nl_traits::vdr_mmvq];
+        float d;
+    };
+
+    struct activations {
+        int   u1[iq4_nl_traits::vdr_mmvq];
+        int   u2[iq4_nl_traits::vdr_mmvq];
+        float ds;
+    };
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs) {
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        const uint8_t * qs   = base + ibx_offset.first;
+
+        weights w;
+        w.d = (float) *reinterpret_cast<const ggml_half *>(base + d_offset.first);
+
+        const uint8_t * values = (const uint8_t *) kvalues_iq4nl;
+#pragma unroll
+        for (size_t l = 0; l < iq4_nl_traits::vdr_mmvq; ++l) {
+            const int aux = get_int_from_uint8(qs, iqs + l);
+            get_int_from_table_16(aux, values, w.v1[l], w.v2[l]);
+        }
+        return w;
+    }
+
+    __dpct_inline__ static activations load_activations(const int8_t * q8_1_quant_ptr,
+                                                        const sycl::half2 * q8_1_ds, const int & iqs) {
+        activations     a;
+        const int32_t * q8 = (const int32_t *) q8_1_quant_ptr + iqs;
+#pragma unroll
+        for (size_t l = 0; l < iq4_nl_traits::vdr_mmvq; ++l) {
+            a.u1[l] = q8[l + 0];
+            a.u2[l] = q8[l + 4];
+        }
+        a.ds = (*q8_1_ds)[0];
+        return a;
+    }
+
+    __dpct_inline__ static float apply(const weights & w, const activations & a) {
+        int sumi1 = 0, sumi2 = 0;
+#pragma unroll
+        for (size_t l = 0; l < iq4_nl_traits::vdr_mmvq; ++l) {
+            sumi1 = dpct::dp4a(w.v1[l], a.u1[l], sumi1);
+            sumi2 = dpct::dp4a(w.v2[l], a.u2[l], sumi2);
+        }
+        return w.d * a.ds * (sumi1 + sumi2);
+    }
+
+    __dpct_inline__ static float dot(const weights & w, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        return apply(w, load_activations(q8_1_quant_ptr, q8_1_ds, iqs));
     }
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
