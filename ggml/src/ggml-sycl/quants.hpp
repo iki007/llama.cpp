@@ -152,6 +152,35 @@ template <> struct block_q_t<GGML_TYPE_Q5_K> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+template <> struct block_q_t<GGML_TYPE_IQ4_XS> {
+    struct traits {
+        static constexpr uint32_t qk = QK_K;
+        // the dot product below indexes q8_1 sub-blocks directly, so iqs must come out
+        // as 0..7: that needs qi/vdr_mmvq == 8, matching the plain launcher's QI4_XS/4.
+        static constexpr uint32_t qi       = QI4_XS / 4;
+        static constexpr uint32_t qr       = QR4_XS;
+        static constexpr uint32_t vdr_mmvq = 1;
+    };
+
+    // Reordered layout: [qs (QK_K/2 per block)] [scales_l (QK_K/64 per block)]
+    // [scales_h (uint16 per block)] [d (half per block)]. Unlike the K-quants there is
+    // no high-bit array; the 6-bit scales are split across scales_l and scales_h.
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int n_blocks) {
+        auto qs_offset       = block_index * (QK_K / 2);
+        auto scales_l_offset = n_blocks * (QK_K / 2) + block_index * (QK_K / 64);
+        return { qs_offset, scales_l_offset };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        auto nblocks        = (nrows * (ncols / QK_K));
+        auto total_qs_bytes = nblocks * (QK_K / 2) + nblocks * (QK_K / 64);
+        return { total_qs_bytes + block_index * sizeof(uint16_t),
+                 total_qs_bytes + nblocks * sizeof(uint16_t) + block_index * sizeof(ggml_half) };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_Q6_K> {
     struct traits {
         static constexpr uint32_t qk       = QK_K;
