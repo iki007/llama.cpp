@@ -1787,7 +1787,11 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols(
         const int ncols, const int nrows,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
-    constexpr int rows_per_sg = ncols_dst >= 3 && ncols_dst <= 4 ? 2 : 1;
+    // Four rows per sub-group, not two. The per-column activation reads are on the
+    // critical path - sharing one activation load across four rows instead of two cuts
+    // 31% off k=17408 m=5120 at three columns. Eight rows is worse than two, so this is
+    // a register-pressure optimum rather than a monotonic knob.
+    constexpr int rows_per_sg = ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 1;
     reorder_mul_mat_vec_q4_k_q8_1_sycl_ncols_impl<ncols_dst, rows_per_sg>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
 }
 
@@ -1934,7 +1938,7 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols(
     if constexpr (ncols_dst == 3) {
         // 5120 is the smallest tested row count where pairing improves the Q5_K model shapes.
         if (nrows >= 5120) {
-            reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl<3, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+            reorder_mul_mat_vec_q5_k_q8_1_sycl_ncols_impl<3, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
             return;
         }
     }
