@@ -374,6 +374,10 @@ template <> struct reorder_vec_dot_shared_activations<GGML_TYPE_Q4_K> {
     static constexpr bool value = true;
 };
 
+template <> struct reorder_vec_dot_shared_activations<GGML_TYPE_Q5_K> {
+    static constexpr bool value = true;
+};
+
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
     static constexpr ggml_type gtype = GGML_TYPE_Q4_0;
 
