@@ -227,7 +227,7 @@ typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
-#define MMVQ_MAX_BATCH_SIZE  8
+#define MMVQ_MAX_BATCH_SIZE  16
 
 #if defined(__INTEL_LLVM_COMPILER) && __has_include(<sycl/ext/intel/esimd/xmx/dpas.hpp>)
 #    define GGML_SYCL_MMVQ_HAS_XMX
