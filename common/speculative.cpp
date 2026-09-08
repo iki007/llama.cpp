@@ -1193,7 +1193,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // honour a per-request draft length here rather than truncating afterwards, so a
+            // shorter request also shrinks the block this sequence contributes to the batch
+            const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1223,6 +1225,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
 
+            // a request that lowered n_max must not then fail a server-wide n_min that its
+            // own draft can no longer reach: that would pay for the block and discard it
+            const int32_t n_draft_eff = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+            const int32_t n_min_eff   = std::min(params.n_min, n_draft_eff);
+
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
@@ -1251,7 +1258,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
-                if (result.size() < (size_t) params.n_min) {
+                if (result.size() < (size_t) n_min_eff) {
                     result.clear();
                 }
                 continue;
@@ -1310,7 +1317,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
-            if (result.size() < (size_t) params.n_min) {
+            if (result.size() < (size_t) n_min_eff) {
                 result.clear();
             }
         }
