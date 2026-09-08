@@ -166,7 +166,7 @@ typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
-#define MMVQ_MAX_BATCH_SIZE  8
+#define MMVQ_MAX_BATCH_SIZE  16
 
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
