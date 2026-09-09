@@ -637,7 +637,8 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_IQ4_NL:
-            case GGML_TYPE_IQ3_S:{
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ3_XXS:{
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
@@ -3977,6 +3978,7 @@ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
             return !g_ggml_sycl_prioritize_dmmv;
         default:
             return false;
@@ -4012,6 +4014,7 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
             return true;
         default:
             return false;
@@ -4499,6 +4502,44 @@ static bool reorder_qw_iq4_nl_moe(uint8_t * data_device, size_t expert_bytes, in
 
         for (int j = 0; j < QK4_NL / 2; ++j) {
             qs_ptr[ib * (QK4_NL / 2) + j] = x[ib].qs[j];
+        }
+        d_ptr[ib] = x[ib].d;
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
+static bool reorder_qw_iq3_xxs(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+    GGML_ASSERT(size % sizeof(block_iq3_xxs) == 0);
+    GGML_ASSERT(offset % sizeof(block_iq3_xxs) == 0);
+
+    const int nblocks = size / sizeof(block_iq3_xxs);
+
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    // [qs (3*QK_K/8 per block)] [d (half per block)]
+    auto * qs_ptr = data_device;
+    auto * d_ptr  = (sycl::half *) (qs_ptr + (size_t) (3 * QK_K / 8) * nblocks);
+
+    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+        const block_iq3_xxs * x  = (const block_iq3_xxs *) tmp_buf;
+        const int             ib = i;
+
+        for (int j = 0; j < 3 * QK_K / 8; ++j) {
+            qs_ptr[ib * (3 * QK_K / 8) + j] = x[ib].qs[j];
         }
         d_ptr[ib] = x[ib].d;
     });
@@ -5023,6 +5064,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             return reorder_qw_iq4_xs(data_device, size, 0, stream);
         case GGML_TYPE_IQ3_S:
             return reorder_qw_iq3_s(data_device, size, 0, stream);
+        case GGML_TYPE_IQ3_XXS:
+            return reorder_qw_iq3_xxs(data_device, size, 0, stream);
         case GGML_TYPE_IQ4_NL:
             return reorder_qw_iq4_nl(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_Q2_K:
