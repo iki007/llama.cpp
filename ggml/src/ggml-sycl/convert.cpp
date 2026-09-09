@@ -501,6 +501,22 @@ static void dequantize_row_iq4_nl_sycl_reorder(const void * vx, dst_t * y, const
 }
 
 template <typename dst_t>
+static void dequantize_row_iq3_xxs_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
+                                               dpct::queue_ptr stream) {
+    const int64_t nb = (k + QK_K - 1) / QK_K;
+
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32),
+                                           sycl::range<3>(1, 1, 32)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             dequantize_block_iq3_xxs_reorder(vx, y, item_ct1, nb);
+                         });
+    });
+}
+
+template <typename dst_t>
 static void dequantize_row_iq3_s_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
                                              dpct::queue_ptr stream) {
     const int64_t nb = (k + QK_K - 1) / QK_K;
@@ -769,6 +785,9 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
         case GGML_TYPE_IQ2_S:
             return dequantize_row_iq2_s_sycl;
         case GGML_TYPE_IQ3_XXS:
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_iq3_xxs_sycl_reorder;
+            }
             return dequantize_row_iq3_xxs_sycl;
         case GGML_TYPE_IQ3_S:
             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
@@ -871,6 +890,9 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
         case GGML_TYPE_IQ2_S:
             return dequantize_row_iq2_s_sycl;
         case GGML_TYPE_IQ3_XXS:
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_iq3_xxs_sycl_reorder;
+            }
             return dequantize_row_iq3_xxs_sycl;
         case GGML_TYPE_IQ3_S:
             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
