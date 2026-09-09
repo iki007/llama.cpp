@@ -1724,6 +1724,37 @@ static void dequantize_block_iq3_xxs_reorder(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
+static void dequantize_block_iq2_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                           const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
+    const int64_t i = item_ct1.get_group(2);
+
+    const int64_t tid = item_ct1.get_local_id(2);
+    const int64_t il  = tid / 8;  // 0...3
+    const int64_t ib  = tid % 8;  // 0...7
+
+    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
+
+    const uint8_t * base = static_cast<const uint8_t *>(vx);
+
+    // Reordered layout: [qs (QK_K/4 per block)] [qh (QK_K/32)] [scales (QK_K/32)] [d (half)]
+    const size_t scales_base = (size_t) n_blocks * (QK_K / 4) + (size_t) n_blocks * (QK_K / 32);
+    const uint8_t * qs     = base + i * (QK_K / 4);
+    const uint8_t   qh     = *(base + (size_t) n_blocks * (QK_K / 4) + i * (QK_K / 32) + ib);
+    const uint8_t * scales = base + scales_base + i * (QK_K / 32);
+    const ggml_half dv     = *reinterpret_cast<const ggml_half *>(
+        base + scales_base + (size_t) n_blocks * (QK_K / 32) + (size_t) i * sizeof(ggml_half));
+
+    const uint8_t * grid  = (const uint8_t *) (iq2s_grid + (qs[4 * ib + il] | ((qh << (8 - 2 * il)) & 0x300)));
+    const float     d     = (float) dv * (0.5f + ((scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const uint8_t   signs = qs[QK_K / 8 + 4 * ib + il];
+
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+    }
+}
+
+template<typename dst_t>
 static void dequantize_block_iq3_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                            const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
     const int64_t i = item_ct1.get_group(2);
