@@ -5295,6 +5295,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
+        ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
+        const int64_t fp16_min_rows = src0->type == GGML_TYPE_F16 ? 1 : MMVQ_MAX_BATCH_SIZE;
+#ifdef GGML_SYCL_F16
+        const bool fp16_weights = src0->type == GGML_TYPE_F16 ||
+                                  (ggml_is_quantized(src0->type) && !ggml_sycl_supports_mmq(src0->type));
+        if (fp16_weights && ggml_is_contiguous(&src0_row) && dst->op_params[0] == GGML_PREC_DEFAULT &&
+            n_routed_rows >= 2*n_as && std::count_if(expert_row_counts.begin(), expert_row_counts.end(),
+                                                  [=](int64_t rows) { return rows > fp16_min_rows; }) > 1) {
+            src1_as_f16.alloc(n_routed_rows*ne10);
+            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
+            GGML_ASSERT(to_fp16_sycl != nullptr);
+            to_fp16_sycl(src1_contiguous.get(), src1_as_f16.get(), n_routed_rows*ne10, stream);
+        }
+#endif
+
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
@@ -5308,12 +5323,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);
-            src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
+            const bool use_f16 = src1_as_f16.get() != nullptr && num_src1_rows > fp16_min_rows;
+            const size_t src1_element_size = use_f16 ? sizeof(sycl::half) : sizeof(float);
+            const size_t src1_row_size = src1_element_size*ne10;
+            src1_row.type = use_f16 ? GGML_TYPE_F16 : src1->type;
+            src1_row.data = use_f16 ? (void *) (src1_as_f16.get() + expert_row_offset*ne10) :
+                                     (void *) (src1_contiguous.get() + expert_row_offset*nb11);
             src1_row.ne[1] = num_src1_rows;
 
-            src1_row.nb[1] = nb11;
-            src1_row.nb[2] = num_src1_rows*nb11;
-            src1_row.nb[3] = num_src1_rows*nb11;
+            src1_row.nb[0] = src1_element_size;
+            src1_row.nb[1] = src1_row_size;
+            src1_row.nb[2] = num_src1_rows*src1_row_size;
+            src1_row.nb[3] = num_src1_rows*src1_row_size;
 
             dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
             dst_row.ne[1] = num_src1_rows;
