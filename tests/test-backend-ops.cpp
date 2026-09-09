@@ -11071,6 +11071,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // Expert-count sweep at fixed work. m, k, batch and n_used are held constant, so the
+    // total arithmetic and the routed-row count (bs*n_used) are identical across rows;
+    // only the number of experts changes, and with it the number of per-expert GEMM
+    // launches and the rows each one gets. Isolates launch overhead from GEMM throughput.
+    for (int n_mats : {8, 16, 32, 64, 128, 256}) {
+        for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, 8, false, 768, 512, 2048));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
