@@ -1691,6 +1691,46 @@ dequantize_block_iq4_xs_reorder(const void * __restrict__ vx, dst_t * __restrict
 }
 
 template<typename dst_t>
+static void dequantize_block_iq3_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                           const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
+    const int64_t i = item_ct1.get_group(2);
+
+    const int64_t tid = item_ct1.get_local_id(2);
+    const int64_t il  = tid / 8;  // 0...3
+    const int64_t ib  = tid % 8;  // 0...7
+
+    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
+
+    const uint8_t * base = static_cast<const uint8_t *>(vx);
+
+    // Reordered layout: [qs (QK_K/4 per block)] [qh (QK_K/32)] [signs (QK_K/8)]
+    // [scales (QK_K/64) followed by d (half), grouped per block].
+    constexpr int  sd_bytes    = (QK_K / 64) + (int) sizeof(ggml_half);
+    const size_t   qs_offset   = i * (QK_K / 4);
+    const size_t   qh_offset   = (size_t) n_blocks * (QK_K / 4) + i * (QK_K / 32);
+    const size_t   signs_base  = (size_t) n_blocks * (QK_K / 4) + (size_t) n_blocks * (QK_K / 32);
+    const size_t   signs_off   = signs_base + i * (QK_K / 8);
+    const size_t   sd_off      = signs_base + (size_t) n_blocks * (QK_K / 8) + (size_t) i * sd_bytes;
+
+    const uint8_t * qs    = base + qs_offset + 8 * ib;
+    const uint8_t   qh    = *(base + qh_offset + ib);
+    const uint8_t   signs = *(base + signs_off + 4 * ib + il);
+    const uint8_t * sd    = base + sd_off;
+
+    const uint8_t * grid1 = (const uint8_t *) (iq3s_grid + (qs[2 * il + 0] | ((qh << (8 - 2 * il)) & 256)));
+    const uint8_t * grid2 = (const uint8_t *) (iq3s_grid + (qs[2 * il + 1] | ((qh << (7 - 2 * il)) & 256)));
+
+    const ggml_half dv = *reinterpret_cast<const ggml_half *>(sd + (QK_K / 64));
+    const float     d  = (float) dv * (1 + 2 * ((sd[ib / 2] >> (4 * (ib % 2))) & 0xf));
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[j + 0] = d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+        y[j + 4] = d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+    }
+}
+
+template<typename dst_t>
 static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                    const sycl::nd_item<3> &item_ct1) {
     // auto                item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
