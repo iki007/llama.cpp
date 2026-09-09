@@ -225,6 +225,34 @@ template <> struct block_q_t<GGML_TYPE_IQ3_XXS> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+template <> struct block_q_t<GGML_TYPE_IQ2_S> {
+    struct traits {
+        static constexpr uint32_t qk = QK_K;
+        static constexpr uint32_t qi       = QI2_S / 2;
+        static constexpr uint32_t qr       = QR2_S;
+        static constexpr uint32_t vdr_mmvq = 1;
+    };
+
+    // Reordered layout: [qs (QK_K/4 per block)] [qh (QK_K/32)] [scales (QK_K/32)]
+    // [d (half)]. qs carries the grid indices in its first QK_K/8 bytes and the signs
+    // after, and the dot product needs both, so it stays one array. Four arrays, four
+    // offsets - no grouping needed.
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int n_blocks) {
+        auto qs_offset = block_index * (QK_K / 4);
+        auto qh_offset = n_blocks * (QK_K / 4) + block_index * (QK_K / 32);
+        return { qs_offset, qh_offset };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        auto nblocks      = (nrows * (ncols / QK_K));
+        auto scales_base  = nblocks * (QK_K / 4) + nblocks * (QK_K / 32);
+        auto d_base       = scales_base + nblocks * (QK_K / 32);
+        return { scales_base + block_index * (QK_K / 32), d_base + block_index * (int) sizeof(ggml_half) };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_IQ3_S> {
     struct traits {
         static constexpr uint32_t qk = QK_K;
