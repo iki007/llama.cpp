@@ -3038,6 +3038,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .p_min    = */ slot.task->params.speculative.draft.p_min,
                         };
 
                         drafting.push_back(&slot);

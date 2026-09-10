@@ -334,7 +334,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -796,7 +796,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1238,6 +1238,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                const float p_min_eff = std::max(params.p_min, dp.p_min);
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1245,13 +1247,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
+                    if (p_min_eff > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (1.0f / sum < params.p_min) {
+                        if (1.0f / sum < p_min_eff) {
                             break;
                         }
                     }
@@ -1307,7 +1309,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                         break;
                     }
 
@@ -1684,7 +1686,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
