@@ -3396,6 +3396,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .p_min    = */ slot.task->params.speculative.draft.p_min,
                         };
 
                         drafting.push_back(&slot);
