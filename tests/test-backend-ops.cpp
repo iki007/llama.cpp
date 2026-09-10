@@ -9756,8 +9756,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+    // Up to MMVQ_MAX_BATCH_SIZE: past the multi-column bound a backend may compute only
+    // column 0 and silently skip the rest, which is a wrong result rather than a slow one.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
-        for (int n = 1; n <= 8; ++n) {
+        for (int n = 1; n <= 16; ++n) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
         }
