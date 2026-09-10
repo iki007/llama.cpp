@@ -69,6 +69,10 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // per-request minimum draft-token probability. The effective gate is the larger of this and
+    // the server-wide p_min, so a request can make drafting stricter but not looser (-1 disabled)
+    float p_min = -1.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
