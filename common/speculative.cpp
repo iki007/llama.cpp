@@ -420,7 +420,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -870,7 +870,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1356,20 +1356,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
-                // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
-                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
-
-                // greedy keeps temperature 1, sampling uses the target's
-                const float temp = sample ? dp.temp : 1.0f;
-
-                if (sample && dflash2_seed[seq_id] != dp.seed) {
-                    dflash2_seed[seq_id] = dp.seed;
-                    // the default seed means random; mixed so it differs from the target's, as in spec_retune
-                    dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
-                }
-
-                std::vector<float>   probs;
-                std::vector<int32_t> sorted_idx;
+                const float p_min_eff = std::max(params.p_min, dp.p_min);
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
@@ -1378,16 +1365,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f || sample) {
-                        // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
-                        probs.resize(top_k);
+                            std::max_element(scores, scores + selector_top_k));
+                    if (p_min_eff > 0.0f) {
+                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
                             sum += probs[k];
                         }
-                        if (1.0f / sum < params.p_min) {
+                        if (1.0f / sum < p_min_eff) {
                             break;
                         }
                         for (int32_t k = 0; k < top_k; ++k) {
@@ -1473,7 +1459,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                         break;
                     }
 
@@ -1851,7 +1837,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < std::max(params.p_min, dparams.at(seq_id).p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
