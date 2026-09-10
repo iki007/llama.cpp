@@ -207,7 +207,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_num("speculative.p_min", params.speculative.draft.p_min))
         ->set_hard_limits(0.0f, 1.0f)
-        ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
+        ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy). Can raise the server-wide --spec-draft-p-min, not lower it"));
 
     // TODO: switching the speculator type or ngram parameters per request would require
     //       rebuilding the implementation, so those stay server-wide.
