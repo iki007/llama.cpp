@@ -30,14 +30,18 @@ bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,             // start of stacked expert weights
     const void *       vy,                  // pre-quantized src1 (Q8_1)
-    const int32_t *    ids_dev,             // device-side int32, length n_experts_used
+    const int32_t *    ids_dev,             // device-side int32, n_experts_used per token
     float *            dst_base,
     int                ncols,
     int                nrows,
     int                n_experts_used,
+    int                n_tokens,
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
+    size_t             dst_token_stride,     // bytes between tokens in dst
+    size_t             src1_token_stride,    // bytes between tokens in vy
+    size_t             ids_token_stride,     // ids elements between tokens
     dpct::queue_ptr    stream);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
@@ -52,9 +56,13 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     int                ncols,
     int                nrows,
     int                n_experts_used,
+    int                n_tokens,
     size_t             expert_weight_stride,
     size_t             dst_row_stride,
     size_t             src1_row_stride,
+    size_t             dst_token_stride,
+    size_t             src1_token_stride,
+    size_t             ids_token_stride,
     dpct::queue_ptr    stream);
 
 // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
