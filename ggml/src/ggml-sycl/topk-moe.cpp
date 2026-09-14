@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "topk-moe.hpp"
+#include "moe-weighted-reduction.hpp"
 
 // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
 // path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
@@ -542,6 +543,17 @@ static bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, con
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion) {
         return 0;
+    }
+
+    if (cgraph->nodes[i]->op == GGML_OP_MUL) {
+        ggml_sycl_moe_weighted_reduction_match match;
+        if (ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_sycl_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                ggml_sycl_op_moe_weighted_reduction(ctx, match);
+                return match.node_count - 1;
+            }
+        }
     }
 
     return ggml_sycl_fuse_topk_moe(ctx, cgraph, i);
