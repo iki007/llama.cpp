@@ -5857,6 +5857,60 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Fused MoE FFN mat-vec for the {mul_mat_id(gate), mul_mat_id(up), GLU} subgraph at node_idx.
+// Returns false if it declined, in which case the caller runs the three nodes normally.
+static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_sycl_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {})) {
+        return false;
+    }
+
+    ggml_tensor *       glu  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * wu   = up->src[0];
+    const ggml_tensor * wg   = gate->src[0];
+    const ggml_tensor * act  = up->src[1];
+    const ggml_tensor * ids  = up->src[2];
+
+    // same dispatch as ggml_sycl_mul_mat_id(): past one routed row per expert the per-expert loop wins
+    if (act->ne[2] * ids->ne[0] > wu->ne[2]) {
+        return false;
+    }
+
+    opt_for_reorder_id(&ctx, wu);
+    opt_for_reorder_id(&ctx, wg);
+    const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+    const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
+    if (!extra_u || !extra_g || !extra_u->optimized_feature.reorder || !extra_g->optimized_feature.reorder) {
+        return false;
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/3, " : fused with gate + GLU");
+
+    const int64_t ne10 = act->ne[0];
+    const int64_t ne11 = act->ne[1];
+    const int64_t ne12 = act->ne[2];
+
+    const queue_ptr stream           = ctx.stream();
+    const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
+    const size_t    bytes_per_qrow   = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(), (size_t) (ne11 * ne12) * bytes_per_qrow);
+    char *                     src1_ddq = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne10,
+                                                          (int) (ne11 * ne12), src1_padded_cols, stream);
+
+    return ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+        wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq, (const int32_t *) ids->data,
+        (float *) glu->data, (int) ne10, (int) wu->ne[1], (int) ids->ne[0], (int) ne12,
+        /*expert_weight_stride=*/ wu->nb[2],
+        /*dst_row_stride=*/ glu->nb[1],
+        /*src1_row_stride=*/ ne11 == 1 ? 0 : bytes_per_qrow,
+        /*dst_token_stride=*/ glu->nb[2],
+        /*src1_token_stride=*/ (size_t) ne11 * bytes_per_qrow,
+        /*ids_token_stride=*/ ids->nb[1] / sizeof(int32_t), stream);
+}
+
 static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_scale(ctx, dst);
@@ -6631,6 +6685,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+            i += 2;
+            continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID && ggml_sycl_mul_mat_id_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
             continue;
         }

@@ -58,6 +58,45 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     return true;
 }
 
+// mul_mat_id(gate) + mul_mat_id(up) + GLU: graph shape and tensor properties only. Weight layout and
+// the fused-path dispatch are checked by ggml_sycl_mul_mat_id_glu_mmvq_fused().
+static bool ggml_sycl_should_fuse_mul_mat_id_glu(const ggml_tensor * gate, const ggml_tensor * up,
+                                                 const ggml_tensor * glu) {
+    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(glu, 1) /* swapped */) {
+        return false;
+    }
+
+    const ggml_tensor * wu  = up->src[0];
+    const ggml_tensor * wg  = gate->src[0];
+    const ggml_tensor * act = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+
+    // one set of expert and block offsets and one quantized activation must serve both weights
+    if (wu->type != wg->type || !ggml_are_same_shape(wu, wg) || !ggml_are_same_stride(wu, wg)) {
+        return false;
+    }
+    if (act != gate->src[1] || ids != gate->src[2]) {
+        return false;
+    }
+
+    if (act->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) ||
+        !ggml_is_contiguous(glu) || act->ne[0] % QK8_1 != 0) {
+        return false;
+    }
+    if (act->ne[1] != 1 && act->ne[1] != ids->ne[0]) {
+        return false;
+    }
+    if (ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops) {
 #ifndef NDEBUG
@@ -71,8 +110,9 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
     // gate and up are siblings, not a chain, so ggml_can_fuse cannot express this: use the
     // subgraph form with the GLU as the only materialised output.
-    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_MUL_MAT &&
-        ops.begin()[2] == GGML_OP_GLU) {
+    const bool is_mul_mat_id = ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT_ID;
+    if (ops.size() == 3 && ops.begin()[0] == ops.begin()[1] &&
+        (ops.begin()[0] == GGML_OP_MUL_MAT || ops.begin()[0] == GGML_OP_MUL_MAT_ID) && ops.begin()[2] == GGML_OP_GLU) {
         if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
             return false;
         }
@@ -88,7 +128,8 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
             return false;
         }
 
-        return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+        return is_mul_mat_id ? ggml_sycl_should_fuse_mul_mat_id_glu(gate, up, glu) :
+                               ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

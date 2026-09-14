@@ -65,6 +65,28 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             ids_token_stride,
     dpct::queue_ptr    stream);
 
+// Fused MoE FFN GEMV over reorder (SoA) experts: writes glu(gate . y, up . y) per token and selected expert.
+// vgate_base holds the gate experts with vx_base's type, shape and stride. Returns false if unhandled.
+bool ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+    enum ggml_type     src0_type,
+    enum ggml_glu_op   glu_op,
+    const void *       vx_base,
+    const void *       vgate_base,
+    const void *       vy,
+    const int32_t *    ids_dev,
+    float *            dst_base,
+    int                ncols,
+    int                nrows,
+    int                n_experts_used,
+    int                n_tokens,
+    size_t             expert_weight_stride,
+    size_t             dst_row_stride,
+    size_t             src1_row_stride,
+    size_t             dst_token_stride,
+    size_t             src1_token_stride,
+    size_t             ids_token_stride,
+    dpct::queue_ptr    stream);
+
 // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
 // vx / vgate must share shape, stride and reorder layout. Returns false if unhandled.
 bool ggml_sycl_mul_mat_vec_q_glu_reorder(
