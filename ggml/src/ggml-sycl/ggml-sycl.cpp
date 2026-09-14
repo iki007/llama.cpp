@@ -3780,38 +3780,43 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
                                                 " : converting src1 to fp16");
 
 #if GGML_SYCL_DNNL
-        // iterate tensor dims and find the slowest moving dim and stride
-        int last_dim=0;
-        int last_str=0;
-        size_t largest_str=0;
-        for(int i = 0; i< 4; i++){
-            // last stride is always the largest
-            if(src1->nb[i] == largest_str){
-                if(src1->ne[last_dim] == 1){
+        // the layout-preserving conversion only suits the oneDNN branch below, which reads src1 with its own
+        // strides; with oneDNN disabled at runtime the oneMKL branch needs the dense copy
+        if (g_ggml_sycl_enable_dnn) {
+            // iterate tensor dims and find the slowest moving dim and stride
+            int last_dim=0;
+            int last_str=0;
+            size_t largest_str=0;
+            for(int i = 0; i< 4; i++){
+                // last stride is always the largest
+                if(src1->nb[i] == largest_str){
+                    if(src1->ne[last_dim] == 1){
+                        last_str = i;
+                        last_dim = i;
+                    }
+                }
+                if(src1->nb[i] > largest_str){
+                    largest_str = src1->nb[i];
                     last_str = i;
                     last_dim = i;
                 }
-            }
-            if(src1->nb[i] > largest_str){
-                largest_str = src1->nb[i];
-                last_str = i;
-                last_dim = i;
-            }
 
-        }
-        // oneDNN handles strided data and does not need overhead of ggml_get_to_fp16_nc_sycl
-        const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
-        src1_f16_alloc.alloc(ne_src1);
-        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
-        GGML_ASSERT(to_fp16_sycl != nullptr);
-        to_fp16_sycl(src1_f16, src1_f16_alloc.get(), ne_src1, queue);
-# else
-        const int64_t ne_src1 = ggml_nelements(src1);
-        src1_f16_alloc.alloc(ne_src1);
-        const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
-        GGML_ASSERT(to_fp16_nc_sycl != nullptr);
-        to_fp16_nc_sycl(src1_f16, src1_f16_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+            }
+            // oneDNN handles strided data and does not need overhead of ggml_get_to_fp16_nc_sycl
+            const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
+            src1_f16_alloc.alloc(ne_src1);
+            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
+            GGML_ASSERT(to_fp16_sycl != nullptr);
+            to_fp16_sycl(src1_f16, src1_f16_alloc.get(), ne_src1, queue);
+        } else
 #endif
+        {
+            const int64_t ne_src1 = ggml_nelements(src1);
+            src1_f16_alloc.alloc(ne_src1);
+            const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
+            GGML_ASSERT(to_fp16_nc_sycl != nullptr);
+            to_fp16_nc_sycl(src1_f16, src1_f16_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+        }
 
         src1_f16 = src1_f16_alloc.get();
         s11      = ne10;
