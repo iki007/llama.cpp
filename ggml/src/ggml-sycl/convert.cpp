@@ -721,6 +721,41 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
     convert_unary_nc_sycl<src_t>(vx, y, k, 1, 1, 1, k, k, k, queue);
 }
 
+#ifdef GGML_SYCL_HAS_BF16
+// bf16 -> f16 with integer bit ops. The cast through sycl::ext::oneapi::bfloat16 goes via float and is several
+// times slower, which matters when bf16 weights are converted for the f16 GEMM on every call.
+static void convert_bf16_to_f16_sycl(const void * vx, sycl::half * y, const int64_t k, dpct::queue_ptr queue) {
+    if (k > INT_MAX) {
+        convert_unary_sycl<sycl::ext::oneapi::bfloat16>(vx, y, k, queue);
+        return;
+    }
+    const uint16_t * x = (const uint16_t *) vx;
+    uint16_t *       d = (uint16_t *) y;
+    queue->parallel_for(sycl::range<1>(k), [=](sycl::id<1> id) {
+        const uint16_t b    = x[id];
+        const uint16_t sign = b & 0x8000;
+        const int      e    = (b >> 7) & 0xFF;
+        const int      m    = b & 0x7F;
+        const int      e16  = e - 127 + 15;
+        uint16_t       r;
+        if (e == 0xFF) {
+            r = sign | 0x7C00 | (m ? 0x200 : 0);  // inf, nan
+        } else if (e == 0 || e16 < -10) {
+            r = sign;                             // below the smallest f16 subnormal
+        } else if (e16 >= 31) {
+            r = sign | 0x7C00;                    // overflow to inf
+        } else if (e16 > 0) {
+            r = sign | (uint16_t) (e16 << 10) | (uint16_t) (m << 3);
+        } else {
+            // f16 subnormal: shift in the implicit leading one and round to nearest
+            const int shift = 1 - e16;
+            r = sign | (uint16_t) (((0x400 | (m << 3)) + (1 << (shift - 1))) >> shift);
+        }
+        d[id] = r;
+    });
+}
+#endif
+
 
 static bool is_reordered_src0(const ggml_tensor * dst) {
     return dst->src[0]->extra &&
@@ -842,7 +877,7 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
             break;
 #ifdef GGML_SYCL_HAS_BF16
         case GGML_TYPE_BF16:
-            return convert_unary_sycl<sycl::ext::oneapi::bfloat16>;
+            return convert_bf16_to_f16_sycl;
 #endif
         default:
             break;
