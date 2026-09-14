@@ -20,6 +20,14 @@
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Tile-kernel layout tuned on an Arc Pro B70 (Battlemage G31) for long-KV batches of 1-31 query tokens (decode,
+// speculative verify): it runs 3x the work groups that nsm * max_wg_per_cu assumes, and query tiles of at most
+// 16 columns avoid computing padding columns over the whole KV cache. 2x faster attention at 32k-100k KV for
+// grouped-query shapes; batches of 32+ unchanged. Not measured on other Intel GPUs.
+static inline bool ggml_sycl_fattn_tile_tuned_bmg_g31(const int device) {
+    return ggml_sycl_info().devices[device].hw_info.arch == gpu_arch::intel_gpu_bmg_g31;
+}
+
 typedef void (*fattn_kernel_t)(
     const char* Q,
     const char* K,
@@ -1075,7 +1083,7 @@ void launch_fattn(
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
+        const int blocks_per_wave = nsm * max_blocks_per_sm * (ggml_sycl_fattn_tile_tuned_bmg_g31(id) ? 3 : 1);
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
