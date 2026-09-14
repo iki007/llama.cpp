@@ -249,5 +249,15 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return true;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx + 1];
+
+        // the factor folds into the norm's own scale; a bias would need another pass
+        return rms_norm->type == GGML_TYPE_F32 && rms_norm->src[0]->type == GGML_TYPE_F32 &&
+               scale->type == GGML_TYPE_F32 && ggml_get_op_params_f32(scale, 1) == 0.0f &&
+               ggml_are_same_shape(rms_norm, scale);
+    }
+
     return false;
 }
