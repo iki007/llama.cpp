@@ -5771,6 +5771,48 @@ static void mmid_counting_sort_rows(
     }
 }
 
+// P0 benchmark override; normal dispatch does not use this path.
+static bool ggml_sycl_mul_mat_id_tiled_p0(
+        ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_Q4_K || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src1) || src1->ne[0] != src0->ne[0] || src0->ne[0] % MATRIX_ROW_PADDING != 0 ||
+        (src1->ne[1] != 1 && src1->ne[1] != ids->ne[0]) || ids->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
+    opt_for_reorder_id(&ctx, src0);
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra || !extra->optimized_feature.reorder) {
+        return false;
+    }
+    const auto stream = ctx.stream();
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    stream->memcpy(ids_host.data(), ids->data, ids_host.size()).wait_and_throw();
+    std::vector<int64_t> counts, offsets;
+    auto & rows = ctx.mmid_row_mapping_host;
+    mmid_counting_sort_rows(ids, ids_host.data(), ids->ne[0], src0->ne[2], ids->ne[0] * ids->ne[1], counts, offsets, rows);
+    std::vector<mmvq_id_tile> tiles;
+    for (int e = 0; e < src0->ne[2]; ++e) {
+        for (int64_t first = offsets[e]; first < offsets[e + 1]; first += 16) {
+            tiles.push_back({e, (int32_t) first, (int32_t) std::min<int64_t>(16, offsets[e + 1] - first)});
+        }
+    }
+    ggml_sycl_pool_alloc<mmid_row_mapping> rows_dev(ctx.pool(), rows.size());
+    ggml_sycl_pool_alloc<mmvq_id_tile> tiles_dev(ctx.pool(), tiles.size());
+    stream->memcpy(rows_dev.get(), rows.data(), rows.size() * sizeof(mmid_row_mapping));
+    // Drain the local tile vector before it goes out of scope.
+    stream->memcpy(tiles_dev.get(), tiles.data(), tiles.size() * sizeof(mmvq_id_tile)).wait_and_throw();
+    const size_t bytes_per_row = src1->ne[0] * sizeof(block_q8_1) / QK8_1;
+    ggml_sycl_pool_alloc<char> quant(ctx.pool(), src1->ne[1] * src1->ne[2] * bytes_per_row);
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, quant.get(), src1->ne[0], src1->ne[1] * src1->ne[2], src1->ne[0], stream);
+    const mmvq_id_tiled_args args = {tiles_dev.get(), rows_dev.get(), src0->nb[2],
+        src1->ne[1] == 1 ? 0 : bytes_per_row, src1->ne[1] * bytes_per_row, dst->nb[1], dst->nb[2]};
+    ggml_sycl_mul_mat_vec_q4_K_id_tiled(src0->data, quant.get(), (float *) dst->data,
+        src0->ne[0], src0->ne[1], tiles.size(), args, stream);
+    return true;
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -5786,7 +5828,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ggml_sycl_mul_mat_id_prefer_fused(src0, ne12, n_ids)) {
+    static const char * p0_mode = std::getenv("GGML_SYCL_MOE_P0");
+    if (p0_mode && strcmp(p0_mode, "tiled") == 0) {
+        GGML_ASSERT(ggml_sycl_mul_mat_id_tiled_p0(ctx, src0, src1, ids, dst));
+        return;
+    }
+    if (p0_mode ? strcmp(p0_mode, "fused") == 0 : ggml_sycl_mul_mat_id_prefer_fused(src0, ne12, n_ids)) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
