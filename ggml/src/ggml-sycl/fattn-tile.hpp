@@ -1080,7 +1080,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
 
     if (DV < 512 && Q->ne[1] < 32) {
         if constexpr (ncols2 <= 32) {
-            if (Q->ne[1] > 16/ncols2) {
+            if (Q->ne[1] > 16/ncols2 && !ggml_sycl_fattn_tile_tuned_bmg_g31(id)) {
                 constexpr int cols_per_block = 32;
                 const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
                 const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
