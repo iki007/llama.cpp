@@ -5731,9 +5731,18 @@ static bool ggml_sycl_mul_mat_id_tiled_p0(
     return true;
 }
 
+// Reads ids back into pinned host memory and drains the queue, which also completes the previous row mapping upload.
+static const char * ggml_sycl_mul_mat_id_read_ids(ggml_backend_sycl_context & ctx, const ggml_tensor * ids) {
+    const queue_ptr stream   = ctx.stream();
+    void *          ids_host = ctx.mmid_ids_pinned.reserve(*stream, ggml_nbytes(ids));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(ids_host, ids->data, ggml_nbytes(ids))));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    return (const char *) ids_host;
+}
+
 // Batched MUL_MAT_ID through the per-expert loop: sorts the routed rows by expert, gathers src1 once in that order
 // and multiplies it by each of `weights` (same type, shape and ids) into the matching `dst_sorted` buffer. `dst`
-// gives the output shape and precision. `ids_host` is a host copy of ids, read back with the queue drained. Output
+// gives the output shape and precision. `ids_host` comes from ggml_sycl_mul_mat_id_read_ids(). Output
 // rows follow `dev_row_mapping`, which the caller allocates for ids->ne[0]*ids->ne[1] rows and passes to
 // ggml_sycl_mul_mat_id_scatter().
 static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
@@ -5781,8 +5790,11 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
     mmid_counting_sort_rows(ids, ids_host, n_ids, n_as, n_routed_rows,
                             expert_row_counts, expert_row_offsets, routed_row_src);
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-            stream->memcpy(dev_row_mapping, routed_row_src.data(), n_routed_rows*sizeof(mmid_row_mapping))));
+    // async upload from pinned memory: the buffer stays untouched until the next ids readback drains the queue
+    const size_t mapping_nbytes = n_routed_rows*sizeof(mmid_row_mapping);
+    void *       mapping_host   = ctx.mmid_row_mapping_pinned.reserve(*stream, mapping_nbytes);
+    std::memcpy(mapping_host, routed_row_src.data(), mapping_nbytes);
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dev_row_mapping, mapping_host, mapping_nbytes)));
 
     const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
     assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
@@ -5903,8 +5915,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const ggml_tensor *ids = dst->src[2];
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const queue_ptr stream = ctx.stream();
-
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
@@ -5919,14 +5929,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     }
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    const char * ids_dev = (const char *) ids->data;
-
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
-
-    // also ensures ctx.mmid_row_mapping_host is drained before we use it again
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    const char * ids_host = ggml_sycl_mul_mat_id_read_ids(ctx, ids);
 
     ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
@@ -5954,7 +5957,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     if (ne12 == 1) {
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t i02 = *(const int32_t *) (ids_host + iid1*ids->nb[1] + id*ids->nb[0]);
                 GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                 const int64_t i11 = id % ne11;
@@ -5975,7 +5978,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         ggml_sycl_pool_alloc<char>             dst_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
 
-        ggml_sycl_mul_mat_id_sorted(ctx, dst, src1, ids, ids_host.data(), { src0 }, { dst_contiguous.get() },
+        ggml_sycl_mul_mat_id_sorted(ctx, dst, src1, ids, ids_host, { src0 }, { dst_contiguous.get() },
                                     dev_row_mapping.get());
         ggml_sycl_mul_mat_id_scatter(ctx, dst, dst_contiguous.get(), dev_row_mapping.get(), n_routed_rows);
     }
@@ -6004,11 +6007,7 @@ static bool ggml_sycl_mul_mat_id_glu_loop(ggml_backend_sycl_context & ctx, ggml_
 
     const queue_ptr stream = ctx.stream();
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids))));
-
-    // also ensures ctx.mmid_row_mapping_host is drained before we use it again
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    const char * ids_host = ggml_sycl_mul_mat_id_read_ids(ctx, ids);
 
     const int64_t n_routed_rows = ids->ne[0] * ids->ne[1];
     const int64_t ne0           = up->ne[0];
@@ -6016,7 +6015,7 @@ static bool ggml_sycl_mul_mat_id_glu_loop(ggml_backend_sycl_context & ctx, ggml_
     ggml_sycl_pool_alloc<char>             up_sorted(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
     ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
 
-    ggml_sycl_mul_mat_id_sorted(ctx, up, act, ids, ids_host.data(), { gate->src[0], up->src[0] },
+    ggml_sycl_mul_mat_id_sorted(ctx, up, act, ids, ids_host, { gate->src[0], up->src[0] },
                                 { gate_sorted.get(), up_sorted.get() }, dev_row_mapping.get());
 
     // the standalone GLU kernel's element op, glu(gate, up) = op(gate) * up, in place on the sorted up rows
