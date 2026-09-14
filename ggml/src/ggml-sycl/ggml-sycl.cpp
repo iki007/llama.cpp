@@ -3133,17 +3133,14 @@ inline void ggml_sycl_op_mul_mat_sycl(
     }
 #endif
 
-    // dequantize inside the GEMM instead of writing the f16 weights out and reading them back; src1
-    // goes in its own type, so there is no separate conversion pass
-    if (ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
-        ggml_sycl_fused_dequant_gemm(src0->type, src0_dd_i, src1_ddf_i, src1->type, ggml_sycl_src1_prec(dst), dst_dd_i,
-                                     row_diff, src1_ncols, ne10, ldc, ctx.pool(), stream)) {
-        return;
-    }
-
-    // the f16 route converts src1 to f16 [TAG_GGML_PREC]
-    use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
-    if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
+    // bf16 src0 without the oneDNN fast path: converting it to f16 for the half GEMM is several times faster than
+    // the f32 fallback below, which converts it to f32 on every call and runs the slower f32 GEMM
+#ifdef GGML_SYCL_HAS_BF16
+    const bool src0_bf16 = src0->type == GGML_TYPE_BF16;
+#else
+    const bool src0_bf16 = false;
+#endif
+    if ((src0->type == GGML_TYPE_F16 || src0_bf16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
         if (src1->type != GGML_TYPE_F16) {
