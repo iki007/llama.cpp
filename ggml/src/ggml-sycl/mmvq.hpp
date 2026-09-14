@@ -65,6 +65,26 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             ids_token_stride,
     dpct::queue_ptr    stream);
 
+struct mmvq_id_tile {
+    int32_t expert;
+    int32_t first;
+    int32_t count;
+};
+
+struct mmvq_id_tiled_args {
+    const mmvq_id_tile * tiles;
+    const mmid_row_mapping * rows;
+    size_t expert_stride;
+    size_t src_row_stride;
+    size_t src_token_stride;
+    size_t dst_row_stride;
+    size_t dst_token_stride;
+};
+
+void ggml_sycl_mul_mat_vec_q4_K_id_tiled(
+    const void * vx, const void * vy, float * dst, int ncols, int nrows,
+    int ntiles, mmvq_id_tiled_args args, dpct::queue_ptr stream);
+
 // Fused MoE FFN GEMV over reorder (SoA) experts: writes glu(gate . y, up . y) per token and selected expert.
 // vgate_base holds the gate experts with vx_base's type, shape and stride. Returns false if unhandled.
 bool ggml_sycl_mul_mat_vec_q_id_glu_reorder(
