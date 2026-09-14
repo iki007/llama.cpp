@@ -59,6 +59,7 @@
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
+#include "ggml-sycl/moe-weighted-reduction.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -6846,6 +6847,28 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 }
 #endif
 
+// The fused MoE weighted reduction reads the experts and router weights while writing the last ADD of
+// the chain, so they must stay allocated until that node rather than being freed after the first MUL.
+static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
+                                             ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(backend);
+    if (!g_ggml_sycl_enable_fusion) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_moe_weighted_reduction_match match;
+        if (cgraph->nodes[i]->op != GGML_OP_MUL || !ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
+            continue;
+        }
+        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
+        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+        if (match.expert_scale != nullptr) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+        }
+        i += match.node_count - 1;
+    }
+}
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
@@ -6946,7 +6969,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_sycl_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {
