@@ -312,6 +312,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             } else {
                 const size_t ts = ggml_type_size(K->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
+                // nb[] are the physical strides for every layout (heads interleaved within rows, or a view
+                // into a larger cache), so they give the block strides directly
+                const int64_t s01 = (int64_t)K->nb[1] / ts;
+                const int64_t s02 = (int64_t)K->nb[2] / ts;
+                const int64_t s03 = (int64_t)K->nb[3] / ts;
                 to_fp16(K_data, K_ptr,
                         K->ne[0], K->ne[1], K->ne[2], K->ne[3],
                         (int64_t)K->nb[1] / ts, (int64_t)K->nb[2] / ts, (int64_t)K->nb[3] / ts, stream);
@@ -332,6 +337,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             } else {
                 const size_t ts = ggml_type_size(V->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(V->type);
+                // nb[] are the physical strides for every layout (heads interleaved within rows, or a view
+                // into a larger cache), so they give the block strides directly
+                const int64_t s01 = (int64_t)V->nb[1] / ts;
+                const int64_t s02 = (int64_t)V->nb[2] / ts;
+                const int64_t s03 = (int64_t)V->nb[3] / ts;
                 to_fp16(V_data, V_ptr,
                         V->ne[0], V->ne[1], V->ne[2], V->ne[3],
                         (int64_t)V->nb[1] / ts, (int64_t)V->nb[2] / ts, (int64_t)V->nb[3] / ts, stream);

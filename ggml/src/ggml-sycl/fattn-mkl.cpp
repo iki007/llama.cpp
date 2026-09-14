@@ -295,6 +295,8 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
         d.mode = MKL_FA_KV_MODE_QUANT_CONTIG;
     } else {
         d.mode = MKL_FA_KV_MODE_QUANT_NC;
+        // nb[] are the physical strides for every layout (heads interleaved within rows, or a view into a
+        // larger cache), so they give the block strides directly
         d.s01 = d.nb1 / d.ts;
         d.s02 = d.nb2 / d.ts;
     }
