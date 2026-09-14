@@ -3722,6 +3722,85 @@ static void mul_mat_vec_q_moe_reorder(
     }
 }
 
+// Row-paired variant for types whose activation side can be loaded once and applied to several weight rows:
+// each sub-group computes MOE_ROWS_PER_SG rows of one expert, sharing one activation load per block across
+// the rows and, with has_fusion, across the up and gate weights.
+// Four rows beat two on 512- and 2048-row experts, as they do for the dense multi-column kernel.
+static constexpr int MOE_ROWS_PER_SG = 4;
+
+template <typename reorder_vec_dot_q_sycl, bool has_fusion>
+static void mul_mat_vec_q_moe_reorder_rows(
+    const void * __restrict__ vx_base, const void * __restrict__ vgate_base, const void * __restrict__ vy_base,
+    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+    const int ncols, const int nrows,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride, const size_t dst_token_stride,
+    const size_t src1_token_stride, const size_t ids_token_stride,
+    const ggml_glu_op glu_op, const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    static_assert(reorder_vec_dot_shared_activations<reorder_vec_dot_q_sycl::gtype>::value);
+
+    const int token      = item_ct1.get_group(0);
+    const int expert_idx = item_ct1.get_group(1);
+    const int i02        = ids_dev[(size_t) token * ids_token_stride + expert_idx];
+
+    const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+    [[maybe_unused]] const char * vgate = has_fusion ? (const char *) vgate_base + (size_t) i02 * expert_weight_stride : nullptr;
+    const char * vy  = (const char *) vy_base + (size_t) token * src1_token_stride + (size_t) expert_idx * src1_row_stride;
+    float *      dst = (float *) ((char *) dst_base + (size_t) token * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+
+    // row0 is sub-group uniform, so this retires whole sub-groups and the collectives below stay convergent
+    const auto sg   = item_ct1.get_sub_group();
+    const int  row0 = (int) (item_ct1.get_group(2) * sg.get_group_linear_range() + sg.get_group_linear_id()) * MOE_ROWS_PER_SG;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    float                  partial_sum[MOE_ROWS_PER_SG]                     = {};
+    [[maybe_unused]] float partial_gate[has_fusion ? MOE_ROWS_PER_SG : 1] = {};
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int           iby            = i * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int  iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+            const auto a   = reorder_vec_dot_q_sycl::load_activations(q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+#pragma unroll
+            for (int r = 0; r < MOE_ROWS_PER_SG; ++r) {
+                // past the last row, repeat it; its result is not written
+                const int  ibx       = sycl::min(row0 + r, nrows - 1) * blocks_per_row + i;
+                const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+                const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+                partial_sum[r] += reorder_vec_dot_q_sycl::apply(reorder_vec_dot_q_sycl::load(vx, bx_offset, d_offset, iqs), a);
+                if constexpr (has_fusion) {
+                    partial_gate[r] += reorder_vec_dot_q_sycl::apply(reorder_vec_dot_q_sycl::load(vgate, bx_offset, d_offset, iqs), a);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < MOE_ROWS_PER_SG; ++r) {
+        float sum = sycl::reduce_over_group(sg, partial_sum[r], std::plus<>());
+        if constexpr (has_fusion) {
+            const float gate = sycl::reduce_over_group(sg, partial_gate[r], std::plus<>());
+            sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
+        }
+        if (sg.leader() && row0 + r < nrows) {
+            dst[row0 + r] = sum;
+        }
+    }
+}
+
 template <typename reorder_vec_dot_q_sycl, bool has_fusion = false>
 static void launch_mul_mat_vec_q_moe_reorder(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
@@ -3730,6 +3809,24 @@ static void launch_mul_mat_vec_q_moe_reorder(
     const size_t src1_row_stride, const size_t dst_token_stride,
     const size_t src1_token_stride, const size_t ids_token_stride,
     dpct::queue_ptr stream, const void * vgate_base = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_SWIGLU) {
+    if constexpr (reorder_vec_dot_shared_activations<reorder_vec_dot_q_sycl::gtype>::value) {
+        // work groups of WARP_SIZE sub-groups, each computing MOE_ROWS_PER_SG rows
+        constexpr int        num_subgroups = WARP_SIZE;
+        const int            block_num_y   = ceil_div(nrows, num_subgroups * MOE_ROWS_PER_SG);
+        const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
+        const sycl::range<3> block_dims(1, 1, num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_reorder_rows<reorder_vec_dot_q_sycl, has_fusion>(
+                        vx_base, vgate_base, vy, dst_base, ids_dev, ncols, nrows,
+                        expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
+                        src1_token_stride, ids_token_stride, glu_op, item);
+                });
+        });
+        return;
+    }
     const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
