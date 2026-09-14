@@ -5550,7 +5550,8 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
 // (host id sync, a launch and quantize per expert) but shares each expert's weights across its rows. On an Arc
 // Pro B70 the fused kernel wins up to 4 rows per expert while those rows touch at most ~40M weights, and loses
 // from 2 rows per expert on 14336x4096 experts. Q4_K and Q5_K share the weight load across four rows per
-// sub-group, which carries them to 8 rows per expert while those rows touch at most ~16M weights.
+// sub-group, which carries them to 12 rows per expert while those rows touch at most ~16M weights. The limits
+// come from end-to-end prefill: an isolated op overstates the loop, whose host work overlaps queued GPU work.
 static bool ggml_sycl_mul_mat_id_prefer_fused(const ggml_tensor * src0, int64_t n_tokens, int64_t n_ids) {
     const int64_t n_rows    = n_tokens * n_ids;
     const int64_t n_experts = src0->ne[2];
@@ -5561,7 +5562,7 @@ static bool ggml_sycl_mul_mat_id_prefer_fused(const ggml_tensor * src0, int64_t 
     if (n_rows <= 4 * n_experts) {
         return weights_per_expert <= 40000000;
     }
-    return (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) && n_rows <= 8 * n_experts &&
+    return (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) && n_rows <= 12 * n_experts &&
            weights_per_expert <= 16000000;
 }
 
