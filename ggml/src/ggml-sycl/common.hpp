@@ -388,10 +388,37 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
-struct ggml_sycl_gg_tile {
-    int32_t expert;
-    int32_t n0;
-    int32_t n1;
+// Grow-only pinned host buffer. The driver stages copies between the device and pageable host memory, which costs
+// 0.3-0.9 ms per small copy on an Arc Pro B70; copies to and from pinned memory do not pay that.
+struct ggml_sycl_pinned_buffer {
+    sycl::queue * queue = nullptr;
+    void *        ptr   = nullptr;
+    size_t        size  = 0;
+
+    // the caller must have drained every queued copy that still uses the current allocation
+    void * reserve(sycl::queue & q, size_t n) {
+        if (n > size) {
+            release();
+            ptr = sycl::malloc_host(n, q);
+            GGML_ASSERT(ptr != nullptr);
+            queue = &q;
+            size  = n;
+        }
+        return ptr;
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            sycl::free(ptr, *queue);
+            ptr  = nullptr;
+            size = 0;
+        }
+    }
+
+    ggml_sycl_pinned_buffer() = default;
+    ggml_sycl_pinned_buffer(const ggml_sycl_pinned_buffer &) = delete;
+    ggml_sycl_pinned_buffer & operator=(const ggml_sycl_pinned_buffer &) = delete;
+    ~ggml_sycl_pinned_buffer() { release(); }
 };
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
@@ -471,7 +498,10 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
     std::vector<mmid_row_mapping> mmid_row_mapping_host;
-    std::vector<ggml_sycl_gg_tile> mmid_tile_schedule_host;
+    // MUL_MAT_ID loop staging: ids read back, and the row mapping uploaded asynchronously. The mapping buffer is
+    // reused only after the next ids readback has drained the queue.
+    ggml_sycl_pinned_buffer mmid_ids_pinned;
+    ggml_sycl_pinned_buffer mmid_row_mapping_pinned;
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
