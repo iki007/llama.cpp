@@ -3650,15 +3650,17 @@ bool ggml_sycl_mul_mat_vec_q_id(
 // Reorder (SoA) MoE expert GEMV: MoE expert/row/lane indexing (from mul_mat_vec_q_moe) with the
 // dense-reorder per-block reads (from mul_mat_vec_q_reorder). Each expert slice in vx_base is a
 // self-contained SoA, so nblocks = nrows*(ncols/qk) per expert and the constant expert stride holds.
-template <typename reorder_vec_dot_q_sycl>
+// With has_fusion, vgate_base holds gate experts with vx_base's type, shape and layout: one pass
+// computes both dot products and writes glu(gate, up).
+template <typename reorder_vec_dot_q_sycl, bool has_fusion = false>
 static void mul_mat_vec_q_moe_reorder(
-    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    const void * __restrict__ vx_base, const void * __restrict__ vgate_base, const void * __restrict__ vy_base,
     float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
     const int ncols, const int nrows,
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride, const size_t dst_token_stride,
     const size_t src1_token_stride, const size_t ids_token_stride,
-    const sycl::nd_item<3> & item_ct1) {
+    const ggml_glu_op glu_op, const sycl::nd_item<3> & item_ct1) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -3667,6 +3669,7 @@ static void mul_mat_vec_q_moe_reorder(
     const int i02        = ids_dev[(size_t) token * ids_token_stride + expert_idx];
 
     const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+    [[maybe_unused]] const char * vgate = has_fusion ? (const char *) vgate_base + (size_t) i02 * expert_weight_stride : nullptr;
     const char * vy  = (const char *) vy_base + (size_t) token * src1_token_stride + (size_t) expert_idx * src1_row_stride;
     float *      dst = (float *) ((char *) dst_base + (size_t) token * dst_token_stride + (size_t) expert_idx * dst_row_stride);
 
@@ -3685,7 +3688,8 @@ static void mul_mat_vec_q_moe_reorder(
     static_assert(blocks_per_subgroup > 0);
     static_assert(block_elements_per_subgroup > 0);
 
-    float partial_sum = 0.0f;
+    float                  partial_sum  = 0.0f;
+    [[maybe_unused]] float partial_gate = 0.0f;
     for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
         const int ibx = row * blocks_per_row + i;
 
@@ -3700,23 +3704,32 @@ static void mul_mat_vec_q_moe_reorder(
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
             partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            if constexpr (has_fusion) {
+                partial_gate += reorder_vec_dot_q_sycl()(vgate, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            }
         }
     }
 
     auto sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+    if constexpr (has_fusion) {
+        const float gate = sycl::reduce_over_group(sg, partial_gate, std::plus<>());
+
+        // uniform across the launch; the launcher only instantiates SWIGLU and GEGLU
+        sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
+    }
     if (sg.leader()) {
         dst[row] = sum;
     }
 }
 
-template <typename reorder_vec_dot_q_sycl>
+template <typename reorder_vec_dot_q_sycl, bool has_fusion = false>
 static void launch_mul_mat_vec_q_moe_reorder(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
     float * dst_base, const int ncols, const int nrows, const int n_experts_used, const int n_tokens,
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride, const size_t dst_token_stride,
     const size_t src1_token_stride, const size_t ids_token_stride,
-    dpct::queue_ptr stream) {
+    dpct::queue_ptr stream, const void * vgate_base = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_SWIGLU) {
     const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
@@ -3724,10 +3737,10 @@ static void launch_mul_mat_vec_q_moe_reorder(
         cgh.parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl>(
-                    vx_base, vy, dst_base, ids_dev, ncols, nrows,
+                mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl, has_fusion>(
+                    vx_base, vgate_base, vy, dst_base, ids_dev, ncols, nrows,
                     expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
-                    src1_token_stride, ids_token_stride, item);
+                    src1_token_stride, ids_token_stride, glu_op, item);
             });
     });
 }
@@ -3807,6 +3820,53 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
         default:
             return false;
     }
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+    enum ggml_type     src0_type,
+    enum ggml_glu_op   glu_op,
+    const void *       vx_base,
+    const void *       vgate_base,
+    const void *       vy,
+    const int32_t *    ids_dev,
+    float *            dst_base,
+    int                ncols,
+    int                nrows,
+    int                n_experts_used,
+    int                n_tokens,
+    size_t             expert_weight_stride,
+    size_t             dst_row_stride,
+    size_t             src1_row_stride,
+    size_t             dst_token_stride,
+    size_t             src1_token_stride,
+    size_t             ids_token_stride,
+    dpct::queue_ptr    stream) {
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+
+    #define LAUNCH_MOE_GLU(type)                                                                               \
+        launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<type>, /*has_fusion=*/ true>(                   \
+            vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens, expert_weight_stride,        \
+            dst_row_stride, src1_row_stride, dst_token_stride, src1_token_stride, ids_token_stride, stream,     \
+            vgate_base, glu_op);                                                                                \
+        return true
+
+    switch (src0_type) {
+        case GGML_TYPE_Q4_0:   LAUNCH_MOE_GLU(GGML_TYPE_Q4_0);
+        case GGML_TYPE_Q8_0:   LAUNCH_MOE_GLU(GGML_TYPE_Q8_0);
+        case GGML_TYPE_Q2_K:   LAUNCH_MOE_GLU(GGML_TYPE_Q2_K);
+        case GGML_TYPE_Q3_K:   LAUNCH_MOE_GLU(GGML_TYPE_Q3_K);
+        case GGML_TYPE_Q4_K:   LAUNCH_MOE_GLU(GGML_TYPE_Q4_K);
+        case GGML_TYPE_Q5_K:   LAUNCH_MOE_GLU(GGML_TYPE_Q5_K);
+        case GGML_TYPE_Q6_K:   LAUNCH_MOE_GLU(GGML_TYPE_Q6_K);
+        case GGML_TYPE_IQ4_XS: LAUNCH_MOE_GLU(GGML_TYPE_IQ4_XS);
+        case GGML_TYPE_IQ4_NL: LAUNCH_MOE_GLU(GGML_TYPE_IQ4_NL);
+        default:
+            return false;
+    }
+
+    #undef LAUNCH_MOE_GLU
 }
 
 template <typename reorder_vec_dot_q_sycl, int ncols_dst, int rows_per_sg>
