@@ -5607,6 +5607,7 @@ static int ggml_sycl_l2_norm_batch_fused(ggml_backend_sycl_context & ctx, ggml_c
 
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
+    sycl::half *__restrict__ src1_contiguous_f16,
     const mmid_row_mapping *__restrict__ row_mapping,
     int64_t ne11, int64_t ne10, size_t nb11, size_t nb12,
     const sycl::nd_item<3> &item_ct1) {
@@ -5620,11 +5621,18 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
 
     const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
     float * src1_row_contiguous = (float *)(src1_contiguous + src1_row*nb11);
+    // the f16 copy the GEMM experts consume, written in the same pass so the gathered
+    // rows are only read once; null when no expert takes the f16 path
+    sycl::half * src1_row_f16 = src1_contiguous_f16 ? src1_contiguous_f16 + (int64_t) src1_row*ne10 : nullptr;
 
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < ne10;
          i += item_ct1.get_local_range(2)) {
-        src1_row_contiguous[i] = src1_row_original[i];
+        const float v = src1_row_original[i];
+        src1_row_contiguous[i] = v;
+        if (src1_row_f16) {
+            src1_row_f16[i] = sycl::half(v);
+        }
     }
 }
 
@@ -5884,29 +5892,6 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
     std::memcpy(mapping_host, routed_row_src.data(), mapping_nbytes);
     SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dev_row_mapping, mapping_host, mapping_nbytes)));
 
-    const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
-    assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-
-    {
-        sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
-        sycl::range<3> grid_dims(1, 1, n_routed_rows);
-        stream->submit([&](sycl::handler &cgh) {
-            char *__restrict src1_contiguous_get =
-                src1_contiguous.get();
-            const mmid_row_mapping *__restrict dev_row_mapping_get = dev_row_mapping;
-
-            cgh.parallel_for(
-                sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1) {
-                    k_copy_src1_to_contiguous(
-                        src1_original, src1_contiguous_get,
-                        dev_row_mapping_get,
-                        ne11, ne10, nb11, nb12,
-                        item_ct1);
-                });
-        });
-    }
-
     // one expert of a weight: the 2D slice the per-expert mul_mat sees
     auto expert_row = [nb02](const ggml_tensor * weight, int64_t i02) {
         ggml_tensor row = *weight;
@@ -5917,21 +5902,48 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         return row;
     };
 
+    // Decide the f16 activation copy before the gather so it can be produced in the same pass.
     ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
     const int64_t fp16_min_rows = src0->type == GGML_TYPE_F16 ? 1 : MMVQ_MAX_BATCH_SIZE;
 #ifdef GGML_SYCL_F16
-    const bool fp16_weights = src0->type == GGML_TYPE_F16 ||
-                              (ggml_is_quantized(src0->type) && !ggml_sycl_supports_mmq(src0->type));
-    const ggml_tensor src0_expert = expert_row(src0, 0);
-    if (fp16_weights && ggml_is_contiguous(&src0_expert) && dst->op_params[0] == GGML_PREC_DEFAULT &&
-        n_routed_rows >= 2*n_as && std::count_if(expert_row_counts.begin(), expert_row_counts.end(),
-                                              [=](int64_t rows) { return rows > fp16_min_rows; }) > 1) {
-        src1_as_f16.alloc(n_routed_rows*ne10);
-        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
-        GGML_ASSERT(to_fp16_sycl != nullptr);
-        to_fp16_sycl(src1_contiguous.get(), src1_as_f16.get(), n_routed_rows*ne10, stream);
+    {
+        const bool fp16_weights = src0->type == GGML_TYPE_F16 ||
+                                  (ggml_is_quantized(src0->type) && !ggml_sycl_supports_mmq(src0->type));
+        const ggml_tensor src0_expert = expert_row(src0, 0);
+        if (fp16_weights && ggml_is_contiguous(&src0_expert) && dst->op_params[0] == GGML_PREC_DEFAULT &&
+            src1->type == GGML_TYPE_F32 &&
+            n_routed_rows >= 2*n_as && std::count_if(expert_row_counts.begin(), expert_row_counts.end(),
+                                                  [=](int64_t rows) { return rows > fp16_min_rows; }) > 1) {
+            src1_as_f16.alloc(n_routed_rows*ne10);
+        }
     }
 #endif
+
+    const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
+    assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+
+    {
+        sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
+        sycl::range<3> grid_dims(1, 1, n_routed_rows);
+        stream->submit([&](sycl::handler &cgh) {
+            char *__restrict src1_contiguous_get =
+                src1_contiguous.get();
+            sycl::half *__restrict src1_contiguous_f16_get = src1_as_f16.get();
+            const mmid_row_mapping *__restrict dev_row_mapping_get = dev_row_mapping;
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_copy_src1_to_contiguous(
+                        src1_original, src1_contiguous_get,
+                        src1_contiguous_f16_get,
+                        dev_row_mapping_get,
+                        ne11, ne10, nb11, nb12,
+                        item_ct1);
+                });
+        });
+    }
+
 
     for (int64_t i02 = 0; i02 < n_as; i02++) {
         const int64_t num_src1_rows = expert_row_counts[i02];
