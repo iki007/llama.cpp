@@ -261,7 +261,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                 // The tile kernel groups 4, 8 or 16 query heads per KV head. With other ratios (24 query / 4 KV
                 // heads in Qwen3.8-27B) the vector kernel decodes faster on an Arc Pro B70: 2.40 -> 1.46 ms per
                 // layer at 100k KV for GQA 6, 1.75 -> 1.57 ms for GQA 2; multiples of 4 stay on the tile kernel.
-                if (gqa_ratio % 4 != 0 && ggml_sycl_fattn_tile_tuned_bmg_g31(device)) {
+                // Multiples of 6 are the exception: the 6-column tile (launch_fattn_tile_c6) is
+                // 2.0x faster than the vector kernel at 100k KV, so leave those on the tile kernel.
+                if (gqa_ratio % 4 != 0 && gqa_ratio % 6 != 0 && ggml_sycl_fattn_tile_tuned_bmg_g31(device)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
