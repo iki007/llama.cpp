@@ -10966,6 +10966,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (bool kv_view : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 2}, 1024, 33, true, false, 0, 0,
+                GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, kv_view));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {4, 3}, 9216, 33, true, false, 0, 0,
+            GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true));
+    }
+
     // GQA 6: no tile groups 6 query heads per KV head below, so this exercises the dedicated
     // 6-column decode tile and the 2-column tile the larger batches fall back to.
     for (int64_t kv : {512, 4096}) {
