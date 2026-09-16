@@ -518,6 +518,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const float beta  = 0.0f;
 
     for (int ib = 0; ib < n_batch; ib++) {
+        mkl_fa_kv_desc K_batch = K_desc;
+        mkl_fa_kv_desc V_batch = V_desc;
+        K_batch.data += (K->ne[3] == 1 ? 0 : ib) * K->nb[3];
+        V_batch.data += (V->ne[3] == 1 ? 0 : ib) * V->nb[3];
+
         const float * Q_batch = (const float *)Q->data
             + ib * (Q->nb[3] / sizeof(float));
         float * dst_batch = (float *)KQV->data
@@ -555,10 +560,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 // 3a. Dequant this KV chunk to dense fp16 (once per chunk)
                 {
                     MKL_TAKE_TIME(t0);
-                    mkl_fa_dequant_chunk(stream, K_desc, KQV,
+                    mkl_fa_dequant_chunk(stream, K_batch, KQV,
                         K_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     if (!V_is_K_view) {
-                        mkl_fa_dequant_chunk(stream, V_desc, KQV,
+                        mkl_fa_dequant_chunk(stream, V_batch, KQV,
                             V_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     }
                     stream->wait();  // dequant must be ready before MKL GEMM
