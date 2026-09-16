@@ -10704,6 +10704,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA 6: no tile groups 6 query heads per KV head below, so this exercises the dedicated
+    // 6-column decode tile and the 2-column tile the larger batches fall back to.
+    for (int64_t kv : {512, 4096}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8, 33}) {
+            for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -10985,6 +10995,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Qwen3.8-27B attention: head 256, 24 query / 4 KV heads (GQA 6) at long context.
+    // No tile groups 6 query heads per KV head, so decode takes the dedicated 6-column tile.
+    for (int64_t nb : {1, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
