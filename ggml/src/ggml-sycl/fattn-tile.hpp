@@ -252,6 +252,61 @@ static __dpct_inline__ void flash_attn_tile_load_tile(const sycl::half2 * const 
     ggml_sycl_unroll<7>{}(load);
 }
 
+// q8_0 cache: same layout as above, each 8-value chunk is dequantized while it is loaded.
+// col0 is the value index in the row where the tile starts.
+template <int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+static __dpct_inline__ void flash_attn_tile_load_tile(const block_q8_0 * const __restrict__ KV,
+                                                      sycl::half2 * const __restrict__ tile_KV,
+                                                      const int stride_KV,
+                                                      const int i_sup,
+                                                      const int col0) {
+    auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int cpy_nb = ggml_sycl_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    auto load = [&] (const int n) {
+        const int stride_j = warp_size >> n;
+
+        if (stride_j == 0) {
+            return;
+        }
+
+        const int j0_start = stride_j == warp_size ? 0 : ((J/2)/cpy_ne) - ((J/2)/cpy_ne) % (2*stride_j);
+        const int j0_stop  =                             ((J/2)/cpy_ne) - ((J/2)/cpy_ne) % (1*stride_j);
+        const int stride_i = warp_size / stride_j;
+
+        if (j0_start == j0_stop) {
+            return;
+        }
+
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
+            const int i = i0 + item_ct1.get_local_id(1) * stride_i +
+                          (stride_j == warp_size ? 0 : item_ct1.get_local_id(2) / stride_j);
+
+            if (i0 + nwarps*stride_i <= I || i < I) {
+#pragma unroll
+                for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
+                    const int j = j0 * cpy_ne + (stride_j == warp_size ? item_ct1.get_local_id(2) :
+                                                                         item_ct1.get_local_id(2) % stride_j) *
+                                                    cpy_ne;
+
+                    // rows past i_sup read a zero block (d = 0) instead of the cache
+                    const block_q8_0 zero = {};
+                    const bool       in   = !oob_check || i < i_sup;
+                    dequantize_V_q8_0<sycl::half, 2*cpy_ne>(in ? KV + i*stride_KV : &zero,
+                                                            tile_KV + i*(J/2 + J_padding) + j,
+                                                            in ? col0 + 2*j : 0);
+                }
+            }
+        }
+    };
+    static_assert(J % 8 == 0, "bad J");
+    static_assert((J/2) % cpy_ne == 0, "bad J");
+    static_assert(QK8_0 % (2*cpy_ne) == 0, "chunk must not cross a q8_0 block");
+    ggml_sycl_unroll<7>{}(load);
+}
+
 template <int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __dpct_inline__ void flash_attn_tile_load_tile(const sycl::half2 * const __restrict__ KV,
                                                       float * const __restrict__ tile_KV,
@@ -325,9 +380,10 @@ template <int  warp_size,
           int  nbatch_K,
           bool use_logit_softcap,
           bool oob_check,
-          typename T_vec_dot>
+          typename T_vec_dot,
+          typename T_KV>
 static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
-                                                    const sycl::half2 * const __restrict__ K_h2,
+                                                    const T_KV * const __restrict__ K_h2,
                                                     T_vec_dot * const KV_tmp,
                                                     const int         stride_K2,
                                                     const int         k_VKQ_0,
@@ -342,8 +398,13 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
-    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    if constexpr (std::is_same_v<T_KV, block_q8_0>) {
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            (K_h2 + int64_t(k_VKQ_0)*stride_K2, KV_tmp, stride_K2, k_VKQ_sup, k_KQ_0);
+    } else {
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    }
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
 #ifdef SYCL_FAST_FP16
@@ -411,13 +472,14 @@ template <int  warp_size,
           bool oob_check,
           typename T_vec_dot,
           typename T_KQ,
-          typename T_acc>
+          typename T_acc,
+          typename T_KV>
 /*
 The total declared local variable size in device function flash_attn_tile_iter exceeds 128 bytes and may cause high register pressure. Consult with your hardware vendor to find the total register size available and adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
 static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
-                                                 const sycl::half2 * const __restrict__ K_h2,
-                                                 const sycl::half2 * const __restrict__ V_h2,
+                                                 const T_KV * const __restrict__ K_h2,
+                                                 const T_KV * const __restrict__ V_h2,
                                                  const sycl::half * const __restrict__ mask,
                                                  const sycl::uint3 ne01,
                                                  const float       logit_softcap,
@@ -584,8 +646,13 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        if constexpr (std::is_same_v<T_KV, block_q8_0>) {
+            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0, 0);
+        } else {
+            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        }
         item_ct1.barrier(sycl::access::fence_space::local_space);
 
 #ifdef SYCL_FAST_FP16
@@ -658,7 +725,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     }
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size>  // D == head size
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size, int type_KV = GGML_TYPE_F16>  // D == head size
 /*
 The total declared local variable size in device function flash_attn_tile exceeds 128 bytes and may cause high register pressure. Consult with your hardware vendor to find the total register size available and adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
@@ -731,14 +798,16 @@ static void flash_attn_tile(const char *  Q,
     const int           head0     = item_ct1.get_group(0) * ncols2 - sequence * ne02;  // == item_ct1.get_group(0) % (ne02/ncols2)
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const sycl::half2 * K_h2      = (const sycl::half2 *) (K + nb13 * sequence + nb12 * (head0 / gqa_ratio));
-    const sycl::half2 * V_h2 =
-        (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
+    // a q8_0 cache is read in place, one row is ne0/QK8_0 blocks
+    using T_KV = std::conditional_t<type_KV == GGML_TYPE_Q8_0, block_q8_0, sycl::half2>;
+    const T_KV * K_h2      = (const T_KV *) (K + nb13 * sequence + nb12 * (head0 / gqa_ratio));
+    const T_KV * V_h2 =
+        (const T_KV *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
 
     const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
 
-    const int stride_K2   = nb11 / sizeof(sycl::half2);
-    const int stride_V2   = nb21 / sizeof(sycl::half2);
+    const int stride_K2   = nb11 / sizeof(T_KV);
+    const int stride_V2   = nb21 / sizeof(T_KV);
     const int stride_mask = nb31 / sizeof(sycl::half);
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
@@ -1072,12 +1141,33 @@ static void flash_attn_tile(const char *  Q,
 #endif // SYCL_FLASH_ATTN
 }
 
+// Dequantizing a q8_0 row inside the tile costs more than converting it once and copying it, so a
+// q8_0 cache is read in place only when one tile covers all query rows and heads of a KV head.
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size, int type_KV>
+static void launch_fattn_tile(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const int nwarps,
+                              const size_t nbytes_shared, const int nbatch_fa) {
+    if constexpr (type_KV == GGML_TYPE_Q8_0) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        if (Q->ne[1] > ncols1 || Q->ne[2] / K->ne[2] > ncols2) {
+            launch_fattn<DV, ncols1, ncols2, flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size>, warp_size>
+                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            return;
+        }
+        launch_fattn<DV, ncols1, ncols2, flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size, type_KV>, warp_size>
+            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
+        return;
+    }
+    launch_fattn<DV, ncols1, ncols2, flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size>, warp_size>
+        (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+}
+
 // GQA-6 decode: one 6-column tile per KV head, one query row per tile. On an Arc Pro B70 this is
 // 2.0x faster than the vector kernel at 100k KV (1465 -> 727 us per layer); batches of more than one
 // query row are slower than the 2-column tile and are left to launch_fattn_tile_switch_ncols1.
 // Kept out of that function because instantiating it for ncols2 == 6 would also instantiate its
 // 32-column tile, and 32/6 = 5 gives ncols = 30, which has no config case.
-template <int DKQ, int DV, bool use_logit_softcap>
+template <int DKQ, int DV, bool use_logit_softcap, int type_KV>
 static void launch_fattn_tile_c6(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int id        = ggml_sycl_get_device();
     const int cc        = ggml_sycl_info().devices[id].cc;
@@ -1087,11 +1177,10 @@ static void launch_fattn_tile_c6(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, 6, cc) / warp_size;
     const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, 6, cc);
-    launch_fattn<DV, 1, 6, flash_attn_tile<DKQ, DV, 1, 6, use_logit_softcap, warp_size>, warp_size>
-        (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+    launch_fattn_tile<DKQ, DV, 1, 6, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
 }
 
-template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
+template <int DKQ, int DV, int ncols2, bool use_logit_softcap, int type_KV>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
@@ -1107,9 +1196,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
                 constexpr int cols_per_block = 32;
                 const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
                 const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-                launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                    flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
-                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+                launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
                 return;
             }
         }
@@ -1118,9 +1205,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
                 constexpr int cols_per_block = 16;
                 const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
                 const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-                launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                    flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
-                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+                launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
                 return;
             }
         }
@@ -1129,9 +1214,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
                 constexpr int cols_per_block = 8;
                 const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
                 const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-                launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                    flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
-                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+                launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
                 return;
             }
         }
@@ -1142,9 +1225,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
             constexpr int cols_per_block = 4;
             const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-            launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
-                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+            launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
             return;
         }
     }
@@ -1153,9 +1234,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
         constexpr int cols_per_block = 2;
         const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
         const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-        launch_fattn<DV, cols_per_block/ncols2, ncols2,
-            flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
-            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+        launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
         return;
     }
 
@@ -1163,16 +1242,14 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
         constexpr int cols_per_block = ncols2*2;
         const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
         const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-        launch_fattn<DV, cols_per_block/ncols2, ncols2,
-            flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
-            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+        launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
         return;
     }
 
     GGML_ABORT("fatal error");
 }
 
-template <int DKQ, int DV, bool use_logit_softcap>
+template <int DKQ, int DV, bool use_logit_softcap, int type_KV>
 static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
@@ -1193,21 +1270,21 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
 
     if constexpr (DV == 512) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap>(ctx, dst);
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
         // ncols2=2 and ncols2=1 fallbacks only for cases where ncols=2 config exists (DKQ == DV).
         // For DKQ == 576, DV == 512 only GQA-optimized variants are implemented.
         if constexpr (DKQ == DV) {
             if (use_gqa_opt && gqa_ratio % 2 == 0) {
-                launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap>(ctx, dst);
+                launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap, type_KV>(ctx, dst);
                 return;
             }
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
     }
@@ -1218,27 +1295,27 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
             // would otherwise decode on the vector kernel; the 6-column tile is 2.0x faster there.
             if (use_gqa_opt && gqa_ratio % 4 != 0 && gqa_ratio % 6 == 0 && Q->ne[1] == 1 &&
                 ggml_sycl_fattn_tile_tuned_bmg_g31(ggml_sycl_get_device())) {
-                launch_fattn_tile_c6<DKQ, DV, use_logit_softcap>(ctx, dst);
+                launch_fattn_tile_c6<DKQ, DV, use_logit_softcap, type_KV>(ctx, dst);
                 return;
             }
         }
 
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
 
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
 
         if (use_gqa_opt && gqa_ratio % 2 == 0) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap>(ctx, dst);
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
 
-        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
+        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, type_KV>(ctx, dst);
         return;
     }
     GGML_ABORT("fatal error");
@@ -1251,12 +1328,32 @@ void ggml_sycl_flash_attn_ext_tile_case(ggml_backend_sycl_context & ctx, ggml_te
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // Read a q8_0 cache in place instead of converting all of K and V to f16 on every call.
+#ifdef GGML_SYCL_F16
+    constexpr bool q8_0_tile = DKQ == DV && DV % QK8_0 == 0;
+#else
+    constexpr bool q8_0_tile = false;  // dequantize_V_q8_0 has no half path
+#endif // GGML_SYCL_F16
+    const bool q8_0_kv = dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
+
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap>(ctx, dst);
+        if constexpr (q8_0_tile) {
+            if (q8_0_kv) {
+                launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, GGML_TYPE_Q8_0>(ctx, dst);
+                return;
+            }
+        }
+        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, GGML_TYPE_F16>(ctx, dst);
     } else {
         constexpr bool use_logit_softcap = true;
-        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap>(ctx, dst);
+        if constexpr (q8_0_tile) {
+            if (q8_0_kv) {
+                launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, GGML_TYPE_Q8_0>(ctx, dst);
+                return;
+            }
+        }
+        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, GGML_TYPE_F16>(ctx, dst);
     }
 }
 
