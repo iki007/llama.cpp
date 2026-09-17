@@ -54,6 +54,13 @@ void gated_delta_net_sycl(const float *     q,
     constexpr int warp_size = ggml_sycl_get_physical_warp_size() < S_v ? ggml_sycl_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    const auto reduce_sum = [=](float value) {
+        if constexpr (warp_size == ggml_sycl_get_physical_warp_size()) {
+            return sycl::reduce_over_group(item_ct1.get_sub_group(), value, sycl::plus<float>());
+        } else {
+            return warp_reduce_sum<warp_size>(value);
+        }
+    };
     float         s_shard[rows_per_lane];
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
@@ -85,7 +92,7 @@ void gated_delta_net_sycl(const float *     q,
                 const int i = r * warp_size + lane;
                 kv_shard += s_shard[r] * k_t[i];
             }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = reduce_sum(kv_shard);
 
             // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
@@ -100,7 +107,7 @@ void gated_delta_net_sycl(const float *     q,
                 attn_partial += s_shard[r] * q_t[i];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = reduce_sum(attn_partial);
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
@@ -114,7 +121,7 @@ void gated_delta_net_sycl(const float *     q,
                 kv_shard += sycl::native::exp(g_t[i]) * s_shard[r] * k_t[i];
             }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = reduce_sum(kv_shard);
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
@@ -129,7 +136,7 @@ void gated_delta_net_sycl(const float *     q,
                 attn_partial += s_shard[r] * q_t[i];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = reduce_sum(attn_partial);
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
