@@ -10976,7 +10976,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // GQA 6: no tile groups 6 query heads per KV head below, so this exercises the dedicated
-    // 6-column decode tile and the 2-column tile the larger batches fall back to.
+    // 6-head tiles (1 and up to 4 query rows) and the 2-column tile the larger batches fall back to.
     for (int64_t kv : {512, 4096}) {
         for (int64_t nb : {1, 2, 3, 4, 5, 8, 33}) {
             for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
@@ -11275,11 +11275,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // Qwen3.8-27B attention: head 256, 24 query / 4 KV heads (GQA 6) at long context.
-    // No tile groups 6 query heads per KV head, so decode takes the dedicated 6-column tile.
-    for (int64_t nb : {1, 8}) {
+    // No tile groups 6 query heads per KV head, so up to 4 rows (4 = a DFlash n_max 3 verify batch)
+    // take the dedicated 6-head tiles.
+    for (int64_t nb : {1, 4, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
