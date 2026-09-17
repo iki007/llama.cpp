@@ -68,6 +68,8 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
     // 6 query heads per KV head, 1 query row per tile: GQA-6 decode (Qwen3.8-27B)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
+    // 4 query rows x 6 query heads per tile: GQA-6 verify batches of up to 4 tokens
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  64,  64)
 
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
@@ -133,6 +135,8 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp32(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
     // 6 query heads per KV head, 1 query row per tile: GQA-6 decode (Qwen3.8-27B)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32,  64)
+    // 4 query rows x 6 query heads per tile: GQA-6 verify batches of up to 4 tokens
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  32,  64)
 
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  2, 128, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
@@ -1142,14 +1146,16 @@ static void flash_attn_tile(const char *  Q,
 }
 
 // Dequantizing a q8_0 row inside the tile costs more than converting it once and copying it, so a
-// q8_0 cache is read in place only when one tile covers all query rows and heads of a KV head.
+// q8_0 cache is read in place only by a one-row tile that covers all query heads of a KV head. With
+// more query rows the in-place load is slower than the conversion even for one tile per KV head
+// (GQA-6, 4 rows, 100k KV on an Arc Pro B70: 3607 us in place vs 3206 us converted).
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size, int type_KV>
 static void launch_fattn_tile(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const int nwarps,
                               const size_t nbytes_shared, const int nbatch_fa) {
-    if constexpr (type_KV == GGML_TYPE_Q8_0) {
+    if constexpr (type_KV == GGML_TYPE_Q8_0 && ncols1 == 1) {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
-        if (Q->ne[1] > ncols1 || Q->ne[2] / K->ne[2] > ncols2) {
+        if (Q->ne[1] > 1 || Q->ne[2] / K->ne[2] > ncols2) {
             launch_fattn<DV, ncols1, ncols2, flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size>, warp_size>
                 (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
             return;
@@ -1162,9 +1168,10 @@ static void launch_fattn_tile(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
 }
 
-// GQA-6 decode: one 6-column tile per KV head, one query row per tile. On an Arc Pro B70 this is
-// 2.0x faster than the vector kernel at 100k KV (1465 -> 727 us per layer); batches of more than one
-// query row are slower than the 2-column tile and are left to launch_fattn_tile_switch_ncols1.
+// GQA-6 decode and verify: one tile per KV head, with 1 query row (6 columns) or up to 4 rows
+// (24 columns). On an Arc Pro B70 at 100k KV the 1-row tile is 2.0x faster than the vector kernel
+// (1465 -> 727 us per layer) and the 4-row tile beats three 8-column tiles for 4 queries
+// (2062 -> 1597 us). A 2-row, 12-column tile was slower than the 2-column fallback.
 // Kept out of that function because instantiating it for ncols2 == 6 would also instantiate its
 // 32-column tile, and 32/6 = 5 gives ncols = 30, which has no config case.
 template <int DKQ, int DV, bool use_logit_softcap, int type_KV>
@@ -1175,6 +1182,12 @@ static void launch_fattn_tile_c6(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     constexpr size_t nbytes_shared = 0;
 
+    if (dst->src[0]->ne[1] > 1) {
+        const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, 24, cc) / warp_size;
+        const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, 24, cc);
+        launch_fattn_tile<DKQ, DV, 4, 6, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
+        return;
+    }
     const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, 6, cc) / warp_size;
     const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, 6, cc);
     launch_fattn_tile<DKQ, DV, 1, 6, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
@@ -1291,9 +1304,9 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
 
     if constexpr (DV <= 256) {
         if constexpr (DKQ == 256 && DV == 256) {
-            // GQA ratios that are a multiple of 6 but not of 4 have no matching tile below and
-            // would otherwise decode on the vector kernel; the 6-column tile is 2.0x faster there.
-            if (use_gqa_opt && gqa_ratio % 4 != 0 && gqa_ratio % 6 == 0 && Q->ne[1] == 1 &&
+            // GQA ratios that are a multiple of 6 but not of 4 have no matching tile below; up to 4
+            // query rows (decode and DFlash verify) use one 6-head tile per KV head instead.
+            if (use_gqa_opt && gqa_ratio % 4 != 0 && gqa_ratio % 6 == 0 && Q->ne[1] <= 4 &&
                 ggml_sycl_fattn_tile_tuned_bmg_g31(ggml_sycl_get_device())) {
                 launch_fattn_tile_c6<DKQ, DV, use_logit_softcap, type_KV>(ctx, dst);
                 return;
