@@ -19,9 +19,9 @@ constexpr int GGML_SYCL_DMMV_ESIMD_WG_SIZE = 4;
 // reduce and run a lane-0 epilogue.
 //
 // Each K-quant kernel emits exactly 8 chunks of 32 mapping to activation slices
-// 0..7, so the per-block work is captured by esimd_reorder_q_traits<T>::mac_pair,
-// which dequantizes two weight blocks and MACs both against a shared activation
-// vector with the two FMA chains interleaved (co-scheduled to hide FMA latency).
+// 0..7, so the per-block work is captured by esimd_reorder_q_traits<T>::mac_pair_nc,
+// which dequantizes two weight blocks once and MACs both against NC activation
+// columns with the two FMA chains interleaved (co-scheduled to hide FMA latency).
 // The "pair" is the (row0,row1) row pair owned by one work-group, so the
 // layout+dequant is written once per quant type here.
 //
@@ -85,12 +85,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
         return { qs, scales, dm };
     }
 
-    static ESIMD_INLINE void mac_pair(
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
             const ptrs & pa, size_t bia,
             const ptrs & pb, size_t bib, bool has_b,
-            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_a,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
         using namespace sycl::ext::intel::esimd;
 
         simd<uint8_t, 64> qs_a     = block_load<uint8_t, 64>(pa.qs + bia * (QK_K / 4));
@@ -120,7 +122,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
         for (int s = 0; s < 8; ++s) {
             const int     byte_base = 32 * (s / 4);
             const uint8_t shift     = (uint8_t) (2 * (s % 4));
-            simd<float, 32> y_s = y_vec.select<32, 1>(s * 32);
 
             simd<uint8_t, 32> qa = (qs_a.select<32, 1>(byte_base) >> shift) & simd<uint8_t, 32>(3);
             simd<uint8_t, 32> qb = (qs_b.select<32, 1>(byte_base) >> shift) & simd<uint8_t, 32>(3);
@@ -142,8 +143,12 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
             simd<float, 32> deq_a = convert<float>(qa) * scale_vec_a + min_vec_a;
             simd<float, 32> deq_b = convert<float>(qb) * scale_vec_b + min_vec_b;
 
-            acc_a += y_s * deq_a;
-            acc_b += y_s * deq_b;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_s = block_load<float, 32>(y_blk + c * y_stride + s * 32);
+                acc_a[c] += y_s * deq_a;
+                acc_b[c] += y_s * deq_b;
+            }
         }
     }
 };
@@ -211,12 +216,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
         return (convert<float>(code) - 32.0f) * d;
     }
 
-    static ESIMD_INLINE void mac_pair(
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
             const ptrs & pa, size_t bia,
             const ptrs & pb, size_t bib, bool has_b,
-            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_a,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
         using namespace sycl::ext::intel::esimd;
 
         simd<uint8_t, 64> qs_a     = block_load<uint8_t, 64>(pa.qs + bia * (QK_K / 4));
@@ -242,7 +249,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
         for (int s = 0; s < 8; ++s) {
             const int     byte_base = 32 * (s / 4);
             const uint8_t shift     = (uint8_t) (2 * (s % 4));
-            simd<float, 32> y_s = y_vec.select<32, 1>(s * 32);
 
             // 2 low bits from qs, high bit from hmask (bit s of the same 32 bytes);
             // value = (q & 3) + 4*bit - 4  (inverted hmask: subtract 4 when bit clear).
@@ -271,8 +277,12 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
             simd<float, 32> deq_a = qf_a * scale_vec_a;
             simd<float, 32> deq_b = qf_b * scale_vec_b;
 
-            acc_a += y_s * deq_a;
-            acc_b += y_s * deq_b;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_s = block_load<float, 32>(y_blk + c * y_stride + s * 32);
+                acc_a[c] += y_s * deq_a;
+                acc_b[c] += y_s * deq_b;
+            }
         }
     }
 };
@@ -296,12 +306,15 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
         return { qs, scales, dm };
     }
 
-    static ESIMD_INLINE void mac_pair(
+    // NC activation columns share one dequantization of the two weight blocks;
+    // the activation chunks are read per column from y_blk + c * y_stride
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
             const ptrs & pa, size_t bia,
             const ptrs & pb, size_t bib, bool has_b,
-            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_a,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
         using namespace sycl::ext::intel::esimd;
 
         simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
@@ -332,8 +345,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
 #pragma unroll
         for (int sb = 0; sb < 8; sb += 2) {
             const int q_offset = sb * 16;
-            simd<float, 32> y_lo = y_vec.select<32, 1>(sb * 32);
-            simd<float, 32> y_hi = y_vec.select<32, 1>((sb + 1) * 32);
 
             const float scale_a_lo = scale_f_a[sb];
             const float scale_a_hi = scale_f_a[sb + 1];
@@ -354,10 +365,15 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
             simd<float, 32> deq_b_lo = convert<float>(qb_lo) * scale_b_lo + min_b_lo;
             simd<float, 32> deq_b_hi = convert<float>(qb_hi) * scale_b_hi + min_b_hi;
 
-            acc_a += y_lo * deq_a_lo;
-            acc_b += y_lo * deq_b_lo;
-            acc_a += y_hi * deq_a_hi;
-            acc_b += y_hi * deq_b_hi;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_lo = block_load<float, 32>(y_blk + c * y_stride + sb * 32);
+                simd<float, 32> y_hi = block_load<float, 32>(y_blk + c * y_stride + (sb + 1) * 32);
+                acc_a[c] += y_lo * deq_a_lo;
+                acc_b[c] += y_lo * deq_b_lo;
+                acc_a[c] += y_hi * deq_a_hi;
+                acc_b[c] += y_hi * deq_b_hi;
+            }
         }
     }
 };
@@ -404,12 +420,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
         return masked;
     }
 
-    static ESIMD_INLINE void mac_pair(
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
             const ptrs & pa, size_t bia,
             const ptrs & pb, size_t bib, bool has_b,
-            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_a,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
         using namespace sycl::ext::intel::esimd;
 
         simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
@@ -443,8 +461,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
 #pragma unroll
         for (int sb = 0; sb < 8; sb += 2) {
             const int q_offset = sb * 16;
-            simd<float, 32> y_lo = y_vec.select<32, 1>(sb * 32);
-            simd<float, 32> y_hi = y_vec.select<32, 1>((sb + 1) * 32);
 
             const float scale_a_lo = scale_f_a[sb];
             const float scale_a_hi = scale_f_a[sb + 1];
@@ -476,10 +492,15 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             simd<float, 32> deq_b_lo = convert<float>(qb_lo) * scale_b_lo + min_b_lo;
             simd<float, 32> deq_b_hi = convert<float>(qb_hi) * scale_b_hi + min_b_hi;
 
-            acc_a += y_lo * deq_a_lo;
-            acc_b += y_lo * deq_b_lo;
-            acc_a += y_hi * deq_a_hi;
-            acc_b += y_hi * deq_b_hi;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_lo = block_load<float, 32>(y_blk + c * y_stride + sb * 32);
+                simd<float, 32> y_hi = block_load<float, 32>(y_blk + c * y_stride + (sb + 1) * 32);
+                acc_a[c] += y_lo * deq_a_lo;
+                acc_b[c] += y_lo * deq_b_lo;
+                acc_a[c] += y_hi * deq_a_hi;
+                acc_b[c] += y_hi * deq_b_hi;
+            }
         }
     }
 };
@@ -504,12 +525,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
         return { ql, qh, scales, d };
     }
 
-    static ESIMD_INLINE void mac_pair(
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
             const ptrs & pa, size_t bia,
             const ptrs & pb, size_t bib, bool has_b,
-            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_a,
-            sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
         using namespace sycl::ext::intel::esimd;
 
         simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
@@ -543,7 +566,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             // reconstruct each 32-wide 6-bit group (matches dequantize_row_q6_K)
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
-                simd<float, 32> y_g = y_vec.select<32, 1>(32 * (4 * im + g));
 
                 const float scale_a_lo = sc_a[8 * im + 2 * g + 0] * d_a;
                 const float scale_a_hi = sc_a[8 * im + 2 * g + 1] * d_a;
@@ -577,8 +599,12 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
                 simd<float, 32> deq_a = (convert<float>(qa) - 32.0f) * scale_vec_a;
                 simd<float, 32> deq_b = (convert<float>(qb) - 32.0f) * scale_vec_b;
 
-                acc_a += y_g * deq_a;
-                acc_b += y_g * deq_b;
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    simd<float, 32> y_g = block_load<float, 32>(y_blk + c * y_stride + 32 * (4 * im + g));
+                    acc_a[c] += y_g * deq_a;
+                    acc_b[c] += y_g * deq_b;
+                }
             }
         }
     }
