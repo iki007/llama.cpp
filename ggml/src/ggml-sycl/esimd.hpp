@@ -712,6 +712,217 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_IQ4_XS> {
     }
 };
 
+// the 32 magnitudes of one sub-block for each of two rows (IQ3_S / IQ3_XXS): 8 grid entries
+// of 4 bytes per row, gathered by index in one 16-lane gather
+static ESIMD_INLINE void grid_values_pair(
+        const uint32_t * grid,
+        sycl::ext::intel::esimd::simd<uint32_t, 8> idx_a, sycl::ext::intel::esimd::simd<uint32_t, 8> idx_b,
+        sycl::ext::intel::esimd::simd<float, 32> & va, sycl::ext::intel::esimd::simd<float, 32> & vb) {
+    using namespace sycl::ext::intel::esimd;
+    simd<uint32_t, 16> idx;
+    idx.select<8, 1>(0) = idx_a;
+    idx.select<8, 1>(8) = idx_b;
+    simd<uint32_t, 16> g = gather<uint32_t, 16>(grid, idx * (uint32_t) sizeof(uint32_t));
+    simd<uint8_t, 64>  m = g.bit_cast_view<uint8_t>().read();
+    va = convert<float>(simd<uint8_t, 32>(m.select<32, 1>(0)));
+    vb = convert<float>(simd<uint8_t, 32>(m.select<32, 1>(32)));
+}
+
+// negate lane v where bit v of sw is set
+static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32> apply_signs(
+        sycl::ext::intel::esimd::simd<float, 32> v, uint32_t sw) {
+    using namespace sycl::ext::intel::esimd;
+    simd<uint32_t, 32> shift = 31 - simd<uint32_t, 32>(0, 1);
+    simd<uint32_t, 32> neg   = (simd<uint32_t, 32>(sw) << shift) & 0x80000000u;
+    simd<uint32_t, 32> bits  = v.bit_cast_view<uint32_t>().read() ^ neg;
+    return bits.bit_cast_view<float>().read();
+}
+
+// ---------------------------------------------------------------------------
+// IQ3_S, SOA reorder layout produced by reorder_qw_iq3_s:
+//   [qs: nb*(QK_K/4)] [qh: nb*(QK_K/32)] [signs: nb*(QK_K/8)] [scales(4 bytes) + d(half): nb*6]
+// with nb = nrows*num_blocks_per_row.
+//
+// Output chunk s (0..7) is sub-block s: 8 grid indices qs[8s+j] | (bit j of qh[s]) << 8
+// each select a 4-byte entry of the 512-entry iq3s_grid, giving the 32 magnitudes in
+// order; bit v of the s-th 32-bit signs word negates value v; the scale is
+// d * (1 + 2 * sc) with sc the nibble s%2 of scales[s/2]. The grid (an L1-resident
+// 2 KiB table) is read with one 16-lane gather per sub-block for both rows.
+// ---------------------------------------------------------------------------
+template <> struct esimd_reorder_q_traits<GGML_TYPE_IQ3_S> {
+    struct ptrs {
+        const uint8_t * qs;
+        const uint8_t * qh;
+        const uint8_t * signs;
+        const uint8_t * sd;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+        const uint8_t * qs    = (const uint8_t *) vx;
+        const uint8_t * qh    = qs + nb * (QK_K / 4);
+        const uint8_t * signs = qh + nb * (QK_K / 32);
+        const uint8_t * sd    = signs + nb * (QK_K / 8);
+        return { qs, qh, signs, sd };
+    }
+
+    struct block {
+        sycl::ext::intel::esimd::simd<uint8_t, 64> qs;
+        sycl::ext::intel::esimd::simd<uint8_t, 8>  qh;
+        sycl::ext::intel::esimd::simd<uint32_t, 8> signs;
+        sycl::ext::intel::esimd::simd<float, 8>    scale;
+    };
+
+    static ESIMD_INLINE block load(const ptrs & p, size_t bi) {
+        using namespace sycl::ext::intel::esimd;
+        block b;
+        b.qs    = block_load<uint8_t, 64>(p.qs + bi * (QK_K / 4));
+        b.qh    = block_load<uint8_t, 8>(p.qh + bi * (QK_K / 32));
+        b.signs = block_load<uint32_t, 8>((const uint32_t *) (p.signs + bi * (QK_K / 8)));
+        const uint8_t * sd = p.sd + bi * (QK_K / 64 + sizeof(ggml_half));
+        simd<uint16_t, 8> sc;
+#pragma unroll
+        for (int k = 0; k < QK_K / 64; ++k) {
+            sc[2 * k + 0] = sd[k] & 0xF;
+            sc[2 * k + 1] = sd[k] >> 4;
+        }
+        const float d = (float) *(const sycl::half *) (sd + QK_K / 64);
+        b.scale = (convert<float>(sc) * 2.0f + 1.0f) * d;
+        return b;
+    }
+
+
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<uint32_t, 8> indices(block & b, int s) {
+        using namespace sycl::ext::intel::esimd;
+        simd<uint32_t, 8> idx = convert<uint32_t>(simd<uint8_t, 8>(b.qs.select<8, 1>(8 * s)));
+        const uint32_t    qh  = b.qh[s];
+        return idx | (((simd<uint32_t, 8>(qh) >> simd<uint32_t, 8>(0, 1)) & 1) << 8);
+    }
+
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
+        using namespace sycl::ext::intel::esimd;
+
+        block ba = load(pa, bia);
+        block bb;
+        bb.qs    = 0;
+        bb.qh    = 0;
+        bb.signs = 0;
+        bb.scale = 0.0f;
+        if (has_b) {
+            bb = load(pb, bib);
+        }
+
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            simd<float, 32> mag_a;
+            simd<float, 32> mag_b;
+            grid_values_pair(iq3s_grid, indices(ba, sb), indices(bb, sb), mag_a, mag_b);
+            simd<float, 32> deq_a = apply_signs(mag_a * (float) ba.scale[sb], ba.signs[sb]);
+            simd<float, 32> deq_b = apply_signs(mag_b * (float) bb.scale[sb], bb.signs[sb]);
+
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_s = block_load<float, 32>(y_blk + c * y_stride + sb * 32);
+                acc_a[c] += y_s * deq_a;
+                acc_b[c] += y_s * deq_b;
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// IQ3_XXS, SOA reorder layout produced by reorder_qw_iq3_xxs:
+//   [qs: nb*(3*QK_K/8)] [d: nb*half], with nb = nrows*num_blocks_per_row.
+//
+// Per block qs holds 64 grid index bytes and then 8 32-bit words, one per sub-block
+// s (0..7): its 8 indices qs[8s+j] select 4-byte entries of the 256-entry
+// iq3xxs_grid; word s carries the scale d * (0.5 + (w >> 28)) * 0.5 and four 7-bit
+// sign groups (w >> 7g) & 127, each completed to 8 bits by its parity bit (the
+// ksigns_iq2xs table), which negate values 8g..8g+7.
+// ---------------------------------------------------------------------------
+template <> struct esimd_reorder_q_traits<GGML_TYPE_IQ3_XXS> {
+    struct ptrs {
+        const uint8_t *    qs;
+        const sycl::half * d;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+        const uint8_t *    qs = (const uint8_t *) vx;
+        const sycl::half * d  = (const sycl::half *) (qs + nb * (3 * QK_K / 8));
+        return { qs, d };
+    }
+
+    struct block {
+        sycl::ext::intel::esimd::simd<uint8_t, 64> qs;
+        sycl::ext::intel::esimd::simd<uint32_t, 8> signs;
+        sycl::ext::intel::esimd::simd<float, 8>    scale;
+    };
+
+    static ESIMD_INLINE block load(const ptrs & p, size_t bi) {
+        using namespace sycl::ext::intel::esimd;
+        block b;
+        const uint8_t * qs = p.qs + bi * (3 * QK_K / 8);
+        b.qs = block_load<uint8_t, 64>(qs);
+        simd<uint32_t, 8> w = block_load<uint32_t, 8>((const uint32_t *) (qs + QK_K / 4));
+        b.signs = 0;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            simd<uint32_t, 8> s7 = (w >> (7 * g)) & 127;
+            b.signs |= (s7 | ((cbit(s7) & 1) << 7)) << (8 * g);
+        }
+        b.scale = (convert<float>(simd<uint32_t, 8>(w >> 28)) + 0.5f) * (0.5f * (float) p.d[bi]);
+        return b;
+    }
+
+
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<uint32_t, 8> indices(block & b, int s) {
+        using namespace sycl::ext::intel::esimd;
+        return convert<uint32_t>(simd<uint8_t, 8>(b.qs.select<8, 1>(8 * s)));
+    }
+
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
+        using namespace sycl::ext::intel::esimd;
+
+        block ba = load(pa, bia);
+        block bb;
+        bb.qs    = 0;
+        bb.signs = 0;
+        bb.scale = 0.0f;
+        if (has_b) {
+            bb = load(pb, bib);
+        }
+
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            simd<float, 32> mag_a;
+            simd<float, 32> mag_b;
+            grid_values_pair(iq3xxs_grid, indices(ba, sb), indices(bb, sb), mag_a, mag_b);
+            simd<float, 32> deq_a = apply_signs(mag_a * (float) ba.scale[sb], ba.signs[sb]);
+            simd<float, 32> deq_b = apply_signs(mag_b * (float) bb.scale[sb], bb.signs[sb]);
+
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_s = block_load<float, 32>(y_blk + c * y_stride + sb * 32);
+                acc_a[c] += y_s * deq_a;
+                acc_b[c] += y_s * deq_b;
+            }
+        }
+    }
+};
+
 } // namespace ggml_sycl_esimd
 
 #endif // GGML_SYCL_ESIMD_HPP
