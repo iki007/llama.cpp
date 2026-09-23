@@ -4125,6 +4125,7 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ4_XS:
             return true;
         default:
             return false;
@@ -5399,8 +5400,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // dequantizes each weight block once for all columns, where MMVQ re-unpacks it per column.
     // On an Arc Pro B70 at m=4096 k=14336 and 4 columns: q3_K 2.1x, q5_K 1.48x, q6_K 1.26x,
     // q4_K 1.06x faster than MMVQ. It reads the same reorder layout the MMVQ path installs.
+    // IQ4_XS has no DMMV path for its single column, so it takes this one from 1 column, and
+    // only up to 4: its MMVQ shares the unpacked weights across columns and wins from 5 on
+    // (m=4096 k=14336: 1.31x faster at 1 column, 1.05x at 4, 0.92x at 8).
+    const bool    esimd_iq4_xs   = src0->type == GGML_TYPE_IQ4_XS;
+    const int64_t esimd_min_cols = esimd_iq4_xs ? 1 : 2;
+    const int64_t esimd_max_cols = esimd_iq4_xs ? 4 : 8;
     if (!split && use_mul_mat_vec_q && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
-        ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= 2 && src1->ne[1] <= 8 &&
+        ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols &&
+        src1->ne[1] <= esimd_max_cols &&
         ggml_is_contiguous(src1) && should_reorder_tensor(ctx, dst)) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);

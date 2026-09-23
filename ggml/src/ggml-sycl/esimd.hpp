@@ -610,6 +610,108 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
     }
 };
 
+// ---------------------------------------------------------------------------
+// IQ4_XS, SOA reorder layout produced by reorder_qw_iq4_xs:
+//   [qs: nb*(QK_K/2)] [scales_l: nb*(QK_K/64)] [scales_h: nb*uint16] [d: nb*half]
+// with nb = nrows*num_blocks_per_row.
+//
+// Output chunk s (0..7) is sub-block s: the low nibbles of qs[16s..16s+15] give its
+// first 16 values, the high nibbles the last 16, each an index into the 16-entry
+// kvalues_iq4nl codebook. Its scale is d * (ls - 32) with the 6-bit ls taken from
+// nibble s%2 of scales_l[s/2] (low 4 bits) and bits 2s..2s+1 of scales_h (high 2).
+//
+// The codebook is evaluated, not looked up: a register-indirect gather (iselect) per
+// lane made the kernel 2.6x slower than MMVQ, while this degree-4 polynomial rounded
+// to nearest reproduces all 16 entries exactly in float32 (worst error 0.476).
+// ---------------------------------------------------------------------------
+template <> struct esimd_reorder_q_traits<GGML_TYPE_IQ4_XS> {
+    struct ptrs {
+        const uint8_t *    qs;
+        const uint8_t *    scales_l;
+        const uint16_t *   scales_h;
+        const sycl::half * d;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+        const uint8_t *    qs       = (const uint8_t *) vx;
+        const uint8_t *    scales_l = qs + nb * (QK_K / 2);
+        const uint16_t *   scales_h = (const uint16_t *) (scales_l + nb * (QK_K / 64));
+        const sycl::half * d        = (const sycl::half *) (scales_h + nb);
+        return { qs, scales_l, scales_h, d };
+    }
+
+    // the eight sub-block scales d * (ls - 32) of one block
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 8> unpack_scales(const ptrs & p, size_t bi) {
+        using namespace sycl::ext::intel::esimd;
+        simd<uint8_t, 4>   sl8 = block_load<uint8_t, 4>(p.scales_l + bi * (QK_K / 64));
+        simd<uint16_t, 4>  sl  = convert<uint16_t>(sl8);
+        simd<uint16_t, 8>  lo;
+        lo.select<4, 2>(0) = sl & simd<uint16_t, 4>(0x0F);
+        lo.select<4, 2>(1) = sl >> simd<uint16_t, 4>(4);
+        simd<uint16_t, 8>  hi = (simd<uint16_t, 8>(p.scales_h[bi]) >> simd<uint16_t, 8>(0, 2)) & simd<uint16_t, 8>(3);
+        simd<uint16_t, 8>  ls = lo | (hi << simd<uint16_t, 8>(4));
+        return (convert<float>(ls) - 32.0f) * (float) p.d[bi];
+    }
+
+    // kvalues_iq4nl[q] for q = 0..15
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32> codebook(
+            sycl::ext::intel::esimd::simd<float, 32> q) {
+        using namespace sycl::ext::intel::esimd;
+        simd<float, 32> v = q * 0.00132472022f + 0.0412168242f;
+        v = v * q - 1.50018358f;
+        v = v * q + 24.7432461f;
+        v = v * q - 127.043602f;
+        return rnde<float>(v);
+    }
+
+    // NC activation columns share one dequantization of the two weight blocks
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
+        using namespace sycl::ext::intel::esimd;
+
+        simd<uint8_t, 128> qs_a    = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
+        simd<uint8_t, 128> qs_b    = 0;
+        simd<float, 8>     scale_a = unpack_scales(pa, bia);
+        simd<float, 8>     scale_b = 0.0f;
+        if (has_b) {
+            qs_b    = block_load<uint8_t, 128>(pb.qs + bib * (QK_K / 2));
+            scale_b = unpack_scales(pb, bib);
+        }
+
+        simd<uint8_t, 128> qs_lo_a = qs_a & simd<uint8_t, 128>(0x0F);
+        simd<uint8_t, 128> qs_hi_a = qs_a >> simd<uint8_t, 128>(4);
+        simd<uint8_t, 128> qs_lo_b = qs_b & simd<uint8_t, 128>(0x0F);
+        simd<uint8_t, 128> qs_hi_b = qs_b >> simd<uint8_t, 128>(4);
+
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            simd<float, 32> q_a;
+            simd<float, 32> q_b;
+            q_a.select<16, 1>(0)  = convert<float>(simd<uint8_t, 16>(qs_lo_a.select<16, 1>(16 * sb)));
+            q_a.select<16, 1>(16) = convert<float>(simd<uint8_t, 16>(qs_hi_a.select<16, 1>(16 * sb)));
+            q_b.select<16, 1>(0)  = convert<float>(simd<uint8_t, 16>(qs_lo_b.select<16, 1>(16 * sb)));
+            q_b.select<16, 1>(16) = convert<float>(simd<uint8_t, 16>(qs_hi_b.select<16, 1>(16 * sb)));
+
+            const float d_a = scale_a[sb];
+            const float d_b = scale_b[sb];
+            simd<float, 32> deq_a = codebook(q_a) * d_a;
+            simd<float, 32> deq_b = codebook(q_b) * d_b;
+
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                simd<float, 32> y_s = block_load<float, 32>(y_blk + c * y_stride + sb * 32);
+                acc_a[c] += y_s * deq_a;
+                acc_b[c] += y_s * deq_b;
+            }
+        }
+    }
+};
+
 } // namespace ggml_sycl_esimd
 
 #endif // GGML_SYCL_ESIMD_HPP

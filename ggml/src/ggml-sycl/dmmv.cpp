@@ -2047,6 +2047,7 @@ static bool dequantize_mul_mat_vec_reorder_esimd_ncols_sycl(const void * vx, con
                                                            const int64_t y_stride, const int64_t dst_stride,
                                                            dpct::queue_ptr stream) {
     switch (ncols_y) {
+        case 1: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 1>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
         case 2: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 2>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
         case 3: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
         case 4: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
@@ -2121,10 +2122,15 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    if (src1_ncols > 1) {
-        // 2-8 columns of reordered K-quant weights; ggml_sycl_mul_mat only routes those here
+    if (src1_ncols > 1 || src0->type == GGML_TYPE_IQ4_XS) {
+        // 2-8 columns of reordered K-quant weights and 1-4 of reordered IQ4_XS (which has no
+        // single-column kernel of its own here); ggml_sycl_mul_mat only routes those here
         bool ok = false;
         switch (src0->type) {
+            case GGML_TYPE_IQ4_XS:
+                ok = dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_IQ4_XS>(
+                    src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream);
+                break;
             case GGML_TYPE_Q4_K:
                 ok = dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_Q4_K>(
                     src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream);
