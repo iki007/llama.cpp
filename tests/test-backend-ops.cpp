@@ -10095,6 +10095,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The SYCL XMX (DPAS) mat-vec takes 4-8 columns of Q4_K with at least 8M weights; the odd m ends
+    // in a partial 16-row tile.
+    for (int n = 4; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
