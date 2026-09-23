@@ -5698,11 +5698,15 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
         return false;
     }
 
-    // quant pairs the reorder kernel does not serve (mixed gate/up types, q5_K off BMG) take the
-    // standard-layout fused path instead; same-type q4_K / q5_K keep the reorder path below
-    const bool reorder_pair = wg->type == wu->type &&
-        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
-    if (!reorder_pair) {
+    // quant pairs the reorder kernel cannot serve (mixed gate/up types) take the
+    // standard-layout fused path instead; q4_K keeps the reorder path below
+    if (wg->type != GGML_TYPE_Q4_K || wu->type != GGML_TYPE_Q4_K) {
+        // where the unfused path reorders both weights, its MMVQ kernels beat this fused GEMV
+        // (Qwen3.8-27B iq4_xs/q5_K FFN on Arc Pro B70: decode -2.1%, 4-token batch -4.6% fused)
+        if (g_ggml_sycl_enable_optimize && ctx.opt_feature.reorder &&
+            ggml_sycl_supports_reorder_mmvq(wu->type) && ggml_sycl_supports_reorder_mmvq(wg->type)) {
+            return false;
+        }
         return ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, gate, up, wu, wg, act);
     }
 
