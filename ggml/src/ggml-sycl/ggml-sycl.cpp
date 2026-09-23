@@ -5941,31 +5941,13 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
         return false;
     }
 
-    // gate and up of one type the XMX kernel handles, it needs the reorder layout like the unfused mmvq path
-    if (wg->type == wu->type && gate->src[1] == act && act->ne[1] >= ggml_sycl_xmx_min_cols(wu->type) &&
-        act->ne[1] <= g_ggml_sycl_xmx_glu_max_cols) {
-        opt_for_reorder(&ctx, wu, act, up, mul_mat_algo::MMVQ);
-        opt_for_reorder(&ctx, wg, act, gate, mul_mat_algo::MMVQ);
-        if (can_use_xmx_batch(ctx.device, wu, act) && can_use_xmx_batch(ctx.device, wg, act) &&
-            ggml_sycl_mul_mat_glu_xmx(ctx, glu, up, wu, wg, act)) {
-            return true;
-        }
-    }
-
-    // the kernels below take up to MMVQ_MAX_BATCH_SIZE columns, a wider batch got here for the XMX kernel
-    if (act->ne[1] > MMVQ_MAX_BATCH_SIZE) {
-        return false;
-    }
-
-    // quant pairs the reorder kernel does not serve (mixed gate/up types, q5_K off BMG) take the
-    // standard-layout fused path instead; same-type q4_K / q5_K keep the reorder path below
-    const bool reorder_pair = wg->type == wu->type &&
-        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
-    if (!reorder_pair) {
-        const auto is_plain_type = [](ggml_type type) {
-            return type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
-        };
-        if (!is_plain_type(wu->type) || !is_plain_type(wg->type)) {
+    // quant pairs the reorder kernel cannot serve (mixed gate/up types) take the
+    // standard-layout fused path instead; q4_K keeps the reorder path below
+    if (wg->type != GGML_TYPE_Q4_K || wu->type != GGML_TYPE_Q4_K) {
+        // where the unfused path reorders both weights, its MMVQ kernels beat this fused GEMV
+        // (Qwen3.8-27B iq4_xs/q5_K FFN on Arc Pro B70: decode -2.1%, 4-token batch -4.6% fused)
+        if (g_ggml_sycl_enable_optimize && ctx.opt_feature.reorder &&
+            ggml_sycl_supports_reorder_mmvq(wu->type) && ggml_sycl_supports_reorder_mmvq(wg->type)) {
             return false;
         }
         return ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, gate, up, wu, wg, act);
