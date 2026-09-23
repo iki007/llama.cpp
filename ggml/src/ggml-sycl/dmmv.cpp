@@ -10,7 +10,7 @@
     #endif
     #include <sycl/ext/intel/esimd.hpp>
     #include "esimd.hpp"
-    #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+    #include "dpas.hpp"
     #define GGML_SYCL_DMMV_HAS_ESIMD
 #endif
 
@@ -2072,89 +2072,7 @@ static bool dequantize_mul_mat_vec_reorder_esimd_ncols_sycl(const void * vx, con
 // holds k positions (k, k+1) across the 16 rows, which is exactly a VNNI row pair of B.
 // The threads of a work-group split the k blocks and sum through local memory.
 // ---------------------------------------------------------------------------
-constexpr int GGML_SYCL_DMMV_DPAS_ROWS = 16;  // DPAS execution size: output rows per tile
 constexpr int GGML_SYCL_DMMV_DPAS_TPW  = 4;   // threads per work-group splitting the k blocks
-
-template <ggml_type T> struct dmmv_dpas_traits;
-
-// Q4_K / Q5_K chunk scales and mins of the tile's 16 rows (get_scale_min_k4 layout, 12 bytes per
-// row at scales + 12 bi, d and dmin as half2 at dm + 4 bi): sc2[j] / mn2[j] hold each row's
-// d*sc_j / -dmin*m_j twice, for the two k of a VNNI pair.
-static ESIMD_INLINE void dmmv_dpas_scale_min_k4(const uint8_t * scales, const uint8_t * dm,
-                                                sycl::ext::intel::esimd::simd<uint32_t, 16> bi,
-                                                sycl::ext::intel::esimd::simd<sycl::half, 32> (&sc2)[8],
-                                                sycl::ext::intel::esimd::simd<sycl::half, 32> (&mn2)[8]) {
-    using namespace sycl::ext::intel::esimd;
-    // element-major: dword i of all 16 rows at [16 i]
-    simd<uint32_t, 48>   sw   = gather<uint32_t, 48, 3>((const uint32_t *) scales, bi * (uint32_t) K_SCALE_SIZE);
-    simd<uint32_t, 16>   dmw  = gather<uint32_t, 16>((const uint32_t *) dm, bi * 4u);
-    simd<sycl::half, 32> dmh  = dmw.bit_cast_view<sycl::half>().read();
-    simd<float, 16>      dall = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(0)));
-    simd<float, 16>      dmin = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(1)));
-    auto byte_of = [&](int i) -> simd<uint16_t, 16> {
-        return convert<uint16_t>((simd<uint32_t, 16>(sw.select<16, 1>(16 * (i / 4))) >> (8 * (i % 4))) & 0xFF);
-    };
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        simd<uint16_t, 16> a, m;
-        if (j < 4) {
-            a = byte_of(j) & 63;
-            m = byte_of(j + 4) & 63;
-        } else {
-            a = (byte_of(j + 4) & 0xF) | ((byte_of(j - 4) >> 6) << 4);
-            m = (byte_of(j + 4) >> 4) | ((byte_of(j) >> 6) << 4);
-        }
-        simd<sycl::half, 16> sch = convert<sycl::half>(convert<float>(a) * dall);
-        simd<sycl::half, 16> mnh = convert<sycl::half>(convert<float>(m) * (-dmin));
-        sc2[j].select<16, 2>(0) = sch;
-        sc2[j].select<16, 2>(1) = sch;
-        mn2[j].select<16, 2>(0) = mnh;
-        mn2[j].select<16, 2>(1) = mnh;
-    }
-}
-
-// Q4_K, reorder layout [qs: nb*(QK_K/2)] [scales: nb*12] [dm: nb*half2]. Chunk j (32 k)
-// of a block has scale d*sc_j and min -dmin*m_j; chunks 2p and 2p+1 share the 32 qs bytes
-// p*32.. (low and high nibbles).
-template <> struct dmmv_dpas_traits<GGML_TYPE_Q4_K> {
-    // calls fn(k offset in the block, B) for the block's 16 k steps; bi = the rows' block indices
-    template <typename F>
-    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
-        using namespace sycl::ext::intel::esimd;
-        const uint8_t * qs     = (const uint8_t *) vx;
-        const uint8_t * scales = qs + nb * (QK_K / 2);
-        const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
-
-        simd<sycl::half, 32> sc2[8];
-        simd<sycl::half, 32> mn2[8];
-        dmmv_dpas_scale_min_k4(scales, dm, bi, sc2, mn2);
-
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                // 16 qs bytes per row: k 16h.. of chunks 2p (low nibbles) and 2p+1 (high)
-                simd<uint32_t, 64> w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 2) + (p * 32 + h * 16));
-                simd<sycl::half, 256> b_lo;
-                simd<sycl::half, 256> b_hi;
-#pragma unroll
-                for (int g = 0; g < 4; ++g) {
-                    simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
-                    auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
-#pragma unroll
-                    for (int j = 0; j < 4; j += 2) {
-                        simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
-                        const int         kp = (4 * g + j) / 2;
-                        b_lo.select<32, 1>(kp * 32) = convert<sycl::half>(simd<uint8_t, 32>(q & 0x0F)) * sc2[2 * p] + mn2[2 * p];
-                        b_hi.select<32, 1>(kp * 32) = convert<sycl::half>(simd<uint8_t, 32>(q >> 4)) * sc2[2 * p + 1] + mn2[2 * p + 1];
-                    }
-                }
-                fn((2 * p) * 32 + h * 16, b_lo);
-                fn((2 * p + 1) * 32 + h * 16, b_hi);
-            }
-        }
-    }
-};
 
 template <ggml_type T, int NC>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half * y, float * dst, const int ncols,
@@ -2162,8 +2080,8 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
                                               sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx = sycl::ext::intel::esimd::xmx;
-    using traits  = dmmv_dpas_traits<T>;
-    constexpr int ROWS = GGML_SYCL_DMMV_DPAS_ROWS;
+    using traits  = dpas_tile_traits<T>;
+    constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
     constexpr int TPW  = GGML_SYCL_DMMV_DPAS_TPW;
 
     const int    nb_row = ncols / QK_K;
@@ -2221,7 +2139,7 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
                                              const int nrows, const int64_t y_stride, const int64_t dst_stride,
                                              dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    constexpr int ROWS = GGML_SYCL_DMMV_DPAS_ROWS;
+    constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
     constexpr int TPW  = GGML_SYCL_DMMV_DPAS_TPW;
     const int     workgroups = (nrows + ROWS - 1) / ROWS;
     stream->submit([&](sycl::handler & h) {

@@ -5672,7 +5672,8 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     const int64_t i12 = iid1;
 
     const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
-    float * src1_row_contiguous = (float *)(src1_contiguous + src1_row*nb11);
+    // null when every expert reads the f16 copy
+    float * src1_row_contiguous = src1_contiguous ? (float *)(src1_contiguous + src1_row*nb11) : nullptr;
     // the f16 copy the GEMM experts consume, written in the same pass so the gathered
     // rows are only read once; null when no expert takes the f16 path
     sycl::half * src1_row_f16 = src1_contiguous_f16 ? src1_contiguous_f16 + (int64_t) src1_row*ne10 : nullptr;
@@ -5681,7 +5682,9 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     for (int i = item_ct1.get_local_id(2); i < ne10;
          i += item_ct1.get_local_range(2)) {
         const float v = src1_row_original[i];
-        src1_row_contiguous[i] = v;
+        if (src1_row_contiguous) {
+            src1_row_contiguous[i] = v;
+        }
         if (src1_row_f16) {
             src1_row_f16[i] = sycl::half(v);
         }
@@ -5713,9 +5716,16 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
 // from 2 rows per expert on 14336x4096 experts. Q4_K and Q5_K share the weight load across four rows per
 // sub-group, which carries them to 12 rows per expert while those rows touch at most ~16M weights. The limits
 // come from end-to-end prefill: an isolated op overstates the loop, whose host work overlaps queued GPU work.
-static bool ggml_sycl_mul_mat_id_prefer_fused(const ggml_tensor * src0, int64_t n_tokens, int64_t n_ids) {
+static bool ggml_sycl_mul_mat_id_prefer_fused(const ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                              int64_t n_tokens, int64_t n_ids) {
     const int64_t n_rows    = n_tokens * n_ids;
     const int64_t n_experts = src0->ne[2];
+    // With the grouped XMX GEMM behind the per-expert loop, the loop wins from 3/4 of a routed row per
+    // expert on (Qwen3.6-35B-A3B, 256 experts / 8 used, Arc Pro B70, fused vs loop: 16 tokens 490 vs
+    // 461 t/s, 24 tokens 557 vs 556, 32 tokens 648 vs 701, 64 tokens 831 vs 1154).
+    if (ggml_sycl_mul_mat_id_dpas_supported(ctx, src0->type)) {
+        return 4 * n_rows < 3 * n_experts;
+    }
     if (n_rows <= n_experts) {
         return true;
     }
@@ -5938,11 +5948,41 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
     mmid_counting_sort_rows(ids, ids_host, n_ids, n_as, n_routed_rows,
                             expert_row_counts, expert_row_offsets, routed_row_src);
 
+    // one grouped XMX GEMM per weight instead of the per-expert loop (reordered weights of a type it
+    // covers): it reads the expert tiles from a small table uploaded with the row mapping
+    bool use_dpas = src1->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0;
+    for (const ggml_tensor * w : weights) {
+        use_dpas = use_dpas && w->type == src0->type && ggml_sycl_mul_mat_id_dpas_supported(ctx, w->type) &&
+                   w->ne[0] % QK_K == 0 && w->nb[2] == nb02;
+    }
+    if (use_dpas) {
+        for (const ggml_tensor * w : weights) {
+            opt_for_reorder_id(&ctx, w);
+            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+            use_dpas = use_dpas && extra && extra->optimized_feature.reorder;
+        }
+    }
+    std::vector<ggml_sycl_mmid_tile> tiles_host;
+    if (use_dpas) {
+        for (int64_t e = 0; e < n_as; e++) {
+            for (int64_t r = 0; r < expert_row_counts[e]; r += GGML_SYCL_MMID_DPAS_TILE_TOKENS) {
+                tiles_host.push_back({ (int32_t) e, (int32_t) (expert_row_offsets[e] + r),
+                                       (int32_t) std::min<int64_t>(GGML_SYCL_MMID_DPAS_TILE_TOKENS, expert_row_counts[e] - r) });
+            }
+        }
+    }
+    ggml_sycl_pool_alloc<ggml_sycl_mmid_tile> dev_tiles(ctx.pool(), std::max<size_t>(tiles_host.size(), 1));
+
     // async upload from pinned memory: the buffer stays untouched until the next ids readback drains the queue
     const size_t mapping_nbytes = n_routed_rows*sizeof(mmid_row_mapping);
-    void *       mapping_host   = ctx.mmid_row_mapping_pinned.reserve(*stream, mapping_nbytes);
+    const size_t tiles_nbytes   = tiles_host.size()*sizeof(ggml_sycl_mmid_tile);
+    char *       mapping_host   = (char *) ctx.mmid_row_mapping_pinned.reserve(*stream, mapping_nbytes + tiles_nbytes);
     std::memcpy(mapping_host, routed_row_src.data(), mapping_nbytes);
     SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dev_row_mapping, mapping_host, mapping_nbytes)));
+    if (tiles_nbytes > 0) {
+        std::memcpy(mapping_host + mapping_nbytes, tiles_host.data(), tiles_nbytes);
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dev_tiles.get(), mapping_host + mapping_nbytes, tiles_nbytes)));
+    }
 
     // one expert of a weight: the 2D slice the per-expert mul_mat sees
     auto expert_row = [nb02](const ggml_tensor * weight, int64_t i02) {
@@ -5962,10 +6002,10 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         const bool fp16_weights = src0->type == GGML_TYPE_F16 ||
                                   (ggml_is_quantized(src0->type) && !ggml_sycl_supports_mmq(src0->type));
         const ggml_tensor src0_expert = expert_row(src0, 0);
-        if (fp16_weights && ggml_is_contiguous(&src0_expert) && dst->op_params[0] == GGML_PREC_DEFAULT &&
+        if (use_dpas || (fp16_weights && ggml_is_contiguous(&src0_expert) && dst->op_params[0] == GGML_PREC_DEFAULT &&
             src1->type == GGML_TYPE_F32 &&
             n_routed_rows >= 2*n_as && std::count_if(expert_row_counts.begin(), expert_row_counts.end(),
-                                                  [=](int64_t rows) { return rows > fp16_min_rows; }) > 1) {
+                                                  [=](int64_t rows) { return rows > fp16_min_rows; }) > 1)) {
             src1_as_f16.alloc(n_routed_rows*ne10);
         }
     }
@@ -5979,7 +6019,7 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         sycl::range<3> grid_dims(1, 1, n_routed_rows);
         stream->submit([&](sycl::handler &cgh) {
             char *__restrict src1_contiguous_get =
-                src1_contiguous.get();
+                use_dpas ? nullptr : src1_contiguous.get();
             sycl::half *__restrict src1_contiguous_f16_get = src1_as_f16.get();
             const mmid_row_mapping *__restrict dev_row_mapping_get = dev_row_mapping;
 
@@ -5996,6 +6036,17 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         });
     }
 
+
+    if (use_dpas) {
+        GGML_SYCL_DEBUG("%s: grouped XMX expert GEMM, %zu tiles\n", __func__, tiles_host.size());
+        for (size_t w = 0; w < weights.size(); w++) {
+            const ggml_tensor * wt = weights.begin()[w];
+            ggml_sycl_mul_mat_id_dpas(wt->type, wt->data, wt->nb[2], (int) ne00, (int) ne01, src1_as_f16.get(),
+                                      (int) n_routed_rows, (float *) dst_sorted.begin()[w], dev_tiles.get(),
+                                      (int) tiles_host.size(), stream);
+        }
+        return;
+    }
 
     for (int64_t i02 = 0; i02 < n_as; i02++) {
         const int64_t num_src1_rows = expert_row_counts[i02];
@@ -6075,7 +6126,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         GGML_ASSERT(ggml_sycl_mul_mat_id_tiled_p0(ctx, src0, src1, ids, dst));
         return;
     }
-    if (p0_mode ? strcmp(p0_mode, "fused") == 0 : ggml_sycl_mul_mat_id_prefer_fused(src0, ne12, n_ids)) {
+    if (p0_mode ? strcmp(p0_mode, "fused") == 0 : ggml_sycl_mul_mat_id_prefer_fused(ctx, src0, ne12, n_ids)) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -6199,7 +6250,7 @@ static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
     const ggml_tensor * ids  = up->src[2];
 
     // same dispatch as ggml_sycl_mul_mat_id()
-    if (!ggml_sycl_mul_mat_id_prefer_fused(wu, act->ne[2], ids->ne[0])) {
+    if (!ggml_sycl_mul_mat_id_prefer_fused(ctx, wu, act->ne[2], ids->ne[0])) {
         return ggml_sycl_mul_mat_id_glu_loop(ctx, glu);
     }
 
