@@ -30,6 +30,7 @@
 #include "gated_delta_net.hpp"
 #include "gla.hpp"
 #include "im2col.hpp"
+#include "mmid-dpas.hpp"
 #include "mmq.hpp"
 #include "mmvq.hpp"
 #include "norm.hpp"
