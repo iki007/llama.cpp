@@ -7038,6 +7038,9 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 
 // The fused MoE weighted reduction reads the experts and router weights while writing the last ADD of
 // the chain, so they must stay allocated until that node rather than being freed after the first MUL.
+// The fused top-k MoE router reads the logits while writing ids and weights; unless every tensor of the
+// router stays allocated until its last node, a multi-row batch can get outputs placed over the logits
+// and the fusion is declined (port of CUDA #28432).
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
                                              ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
@@ -7045,6 +7048,21 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return;
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const int n_topk = ggml_sycl_topk_moe_node_count(cgraph, i);
+        if (n_topk > 0) {
+            ggml_tensor * last = cgraph->nodes[i + n_topk - 1];
+            for (int j = i; j < i + n_topk - 1; ++j) {
+                params->add_alloc_dep(params->user_data, cgraph->nodes[j], last);
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (cgraph->nodes[j]->src[k]) {
+                        params->add_alloc_dep(params->user_data, cgraph->nodes[j]->src[k], last);
+                    }
+                }
+            }
+            i += n_topk - 1;
+            continue;
+        }
+
         ggml_sycl_moe_weighted_reduction_match match;
         if (cgraph->nodes[i]->op != GGML_OP_MUL || !ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
             continue;
