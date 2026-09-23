@@ -10,6 +10,7 @@
     #endif
     #include <sycl/ext/intel/esimd.hpp>
     #include "esimd.hpp"
+    #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
     #define GGML_SYCL_DMMV_HAS_ESIMD
 #endif
 
@@ -2059,6 +2060,207 @@ static bool dequantize_mul_mat_vec_reorder_esimd_ncols_sycl(const void * vx, con
     }
 }
 
+// ---------------------------------------------------------------------------
+// XMX (DPAS) mat-vec for reordered weights, 4-8 activation columns (speculative verify),
+// Xe2 only (16-wide DPAS); ggml_sycl_dmmv_dpas() says where it is used.
+//
+// One ESIMD thread owns a tile of 16 output rows x NC columns. For each 16 consecutive k
+// it dequantizes the 16 rows' weights into an f16 B operand in VNNI order and runs
+// dpas<8, NC>(acc, B, A), A being the NC columns' activations for the same k in f16, so the
+// per-column multiply-adds run on the systolic array instead of the vector units. The tile's
+// weights are gathered with one lane per row: a 2D byte view of the gathered words then
+// holds k positions (k, k+1) across the 16 rows, which is exactly a VNNI row pair of B.
+// The threads of a work-group split the k blocks and sum through local memory.
+// ---------------------------------------------------------------------------
+constexpr int GGML_SYCL_DMMV_DPAS_ROWS = 16;  // DPAS execution size: output rows per tile
+constexpr int GGML_SYCL_DMMV_DPAS_TPW  = 4;   // threads per work-group splitting the k blocks
+
+template <ggml_type T> struct dmmv_dpas_traits;
+
+// Q4_K / Q5_K chunk scales and mins of the tile's 16 rows (get_scale_min_k4 layout, 12 bytes per
+// row at scales + 12 bi, d and dmin as half2 at dm + 4 bi): sc2[j] / mn2[j] hold each row's
+// d*sc_j / -dmin*m_j twice, for the two k of a VNNI pair.
+static ESIMD_INLINE void dmmv_dpas_scale_min_k4(const uint8_t * scales, const uint8_t * dm,
+                                                sycl::ext::intel::esimd::simd<uint32_t, 16> bi,
+                                                sycl::ext::intel::esimd::simd<sycl::half, 32> (&sc2)[8],
+                                                sycl::ext::intel::esimd::simd<sycl::half, 32> (&mn2)[8]) {
+    using namespace sycl::ext::intel::esimd;
+    // element-major: dword i of all 16 rows at [16 i]
+    simd<uint32_t, 48>   sw   = gather<uint32_t, 48, 3>((const uint32_t *) scales, bi * (uint32_t) K_SCALE_SIZE);
+    simd<uint32_t, 16>   dmw  = gather<uint32_t, 16>((const uint32_t *) dm, bi * 4u);
+    simd<sycl::half, 32> dmh  = dmw.bit_cast_view<sycl::half>().read();
+    simd<float, 16>      dall = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(0)));
+    simd<float, 16>      dmin = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(1)));
+    auto byte_of = [&](int i) -> simd<uint16_t, 16> {
+        return convert<uint16_t>((simd<uint32_t, 16>(sw.select<16, 1>(16 * (i / 4))) >> (8 * (i % 4))) & 0xFF);
+    };
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        simd<uint16_t, 16> a, m;
+        if (j < 4) {
+            a = byte_of(j) & 63;
+            m = byte_of(j + 4) & 63;
+        } else {
+            a = (byte_of(j + 4) & 0xF) | ((byte_of(j - 4) >> 6) << 4);
+            m = (byte_of(j + 4) >> 4) | ((byte_of(j) >> 6) << 4);
+        }
+        simd<sycl::half, 16> sch = convert<sycl::half>(convert<float>(a) * dall);
+        simd<sycl::half, 16> mnh = convert<sycl::half>(convert<float>(m) * (-dmin));
+        sc2[j].select<16, 2>(0) = sch;
+        sc2[j].select<16, 2>(1) = sch;
+        mn2[j].select<16, 2>(0) = mnh;
+        mn2[j].select<16, 2>(1) = mnh;
+    }
+}
+
+// Q4_K, reorder layout [qs: nb*(QK_K/2)] [scales: nb*12] [dm: nb*half2]. Chunk j (32 k)
+// of a block has scale d*sc_j and min -dmin*m_j; chunks 2p and 2p+1 share the 32 qs bytes
+// p*32.. (low and high nibbles).
+template <> struct dmmv_dpas_traits<GGML_TYPE_Q4_K> {
+    // calls fn(k offset in the block, B) for the block's 16 k steps; bi = the rows' block indices
+    template <typename F>
+    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs     = (const uint8_t *) vx;
+        const uint8_t * scales = qs + nb * (QK_K / 2);
+        const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
+
+        simd<sycl::half, 32> sc2[8];
+        simd<sycl::half, 32> mn2[8];
+        dmmv_dpas_scale_min_k4(scales, dm, bi, sc2, mn2);
+
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                // 16 qs bytes per row: k 16h.. of chunks 2p (low nibbles) and 2p+1 (high)
+                simd<uint32_t, 64> w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 2) + (p * 32 + h * 16));
+                simd<sycl::half, 256> b_lo;
+                simd<sycl::half, 256> b_hi;
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
+                    auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                    for (int j = 0; j < 4; j += 2) {
+                        simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
+                        const int         kp = (4 * g + j) / 2;
+                        b_lo.select<32, 1>(kp * 32) = convert<sycl::half>(simd<uint8_t, 32>(q & 0x0F)) * sc2[2 * p] + mn2[2 * p];
+                        b_hi.select<32, 1>(kp * 32) = convert<sycl::half>(simd<uint8_t, 32>(q >> 4)) * sc2[2 * p + 1] + mn2[2 * p + 1];
+                    }
+                }
+                fn((2 * p) * 32 + h * 16, b_lo);
+                fn((2 * p + 1) * 32 + h * 16, b_hi);
+            }
+        }
+    }
+};
+
+template <ggml_type T, int NC>
+ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                              const int nrows, const int64_t y_stride, const int64_t dst_stride,
+                                              sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    using traits  = dmmv_dpas_traits<T>;
+    constexpr int ROWS = GGML_SYCL_DMMV_DPAS_ROWS;
+    constexpr int TPW  = GGML_SYCL_DMMV_DPAS_TPW;
+
+    const int    nb_row = ncols / QK_K;
+    const size_t nb     = (size_t) nrows * nb_row;
+    const int    tid    = it.get_local_id(0);
+    const int    row0   = it.get_group(0) * ROWS;
+
+    // rows past the end read the last row; their sums are not written
+    simd<uint32_t, ROWS> rows(row0, 1);
+    rows.merge(simd<uint32_t, ROWS>(nrows - 1), rows >= (uint32_t) nrows);
+    const simd<uint32_t, ROWS> row_blk = rows * (uint32_t) nb_row;
+
+    // acc[c*16 + n]: column c, row row0 + n
+    simd<float, NC * ROWS> acc = 0.0f;
+    for (int ib = tid; ib < nb_row; ib += TPW) {
+        const sycl::half * yb = y + (size_t) ib * QK_K;
+        traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
+            simd<sycl::half, NC * 16> a;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + c * y_stride + koff);
+            }
+            acc = xmx::dpas<8, NC, float, float>(acc, b, a);
+        });
+    }
+
+#pragma unroll
+    for (int i = 0; i < NC * ROWS; ++i) {
+        lmem[tid * NC * ROWS + i] = acc[i];
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (tid == 0) {
+#pragma unroll
+        for (int t = 1; t < TPW; ++t) {
+#pragma unroll
+            for (int i = 0; i < NC * ROWS; ++i) {
+                acc[i] += lmem[t * NC * ROWS + i];
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (row0 + ROWS <= nrows) {
+                block_store<float, ROWS>(dst + c * dst_stride + row0, acc.template select<ROWS, 1>(c * ROWS).read());
+            } else {
+                for (int n = 0; n < ROWS && row0 + n < nrows; ++n) {
+                    dst[c * dst_stride + row0 + n] = acc[c * ROWS + n];
+                }
+            }
+        }
+    }
+}
+
+template <ggml_type T, int NC>
+static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                             const int nrows, const int64_t y_stride, const int64_t dst_stride,
+                                             dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr int ROWS = GGML_SYCL_DMMV_DPAS_ROWS;
+    constexpr int TPW  = GGML_SYCL_DMMV_DPAS_TPW;
+    const int     workgroups = (nrows + ROWS - 1) / ROWS;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NC * ROWS), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
+                       [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                           dequantize_mul_mat_vec_dpas<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, lmem, it);
+                       });
+    });
+}
+
+template <ggml_type T>
+static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                                   const int nrows, const int ncols_y, const int64_t y_stride,
+                                                   const int64_t dst_stride, dpct::queue_ptr stream) {
+    switch (ncols_y) {
+        case 4: dequantize_mul_mat_vec_dpas_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 5: dequantize_mul_mat_vec_dpas_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 6: dequantize_mul_mat_vec_dpas_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 7: dequantize_mul_mat_vec_dpas_sycl<T, 7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 8: dequantize_mul_mat_vec_dpas_sycl<T, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        default: GGML_ABORT("unsupported column count %d", ncols_y);
+    }
+}
+
+// Where the XMX mat-vec beats the ESIMD one on an Arc Pro B70. It is written for 16-wide DPAS,
+// i.e. Xe2 (Battlemage). With weights streaming from memory both are near bandwidth up to 2
+// columns (q4_K 17408x5120: 0.94x at 1 column), and DPAS pulls ahead from 4 (1.16x at 4, 1.82x
+// at 8; 5120x17408: 1.50x / 2.29x) where ESIMD pays per column in vector FMAs. Below ~8M weights
+// its 16-row tiles leave the card idle (1024x5120: 0.77x at 4 columns). q5_K's extra high-bit
+// unpacking keeps it behind ESIMD below 8 columns.
+static bool ggml_sycl_dmmv_dpas(const ggml_backend_sycl_context & ctx, ggml_type type, int64_t ncols, int64_t nrows,
+                                int64_t ncols_y) {
+    const auto arch = ggml_sycl_info().devices[ctx.device].hw_info.arch;
+    return g_ggml_sycl_enable_esimd && type == GGML_TYPE_Q4_K && ncols_y >= 4 && ncols_y <= 8 &&
+           ncols * nrows >= 8 * 1024 * 1024 &&
+           (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
+}
+
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
@@ -2122,6 +2324,20 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    {
+        // reordered weights where the XMX kernel wins take DPAS
+        const auto * extra0 = static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra);
+        if (extra0 && extra0->optimized_feature.reorder && ggml_sycl_dmmv_dpas(ctx, src0->type, ne00, row_diff, src1_ncols)) {
+            GGML_SYCL_DEBUG("%s: XMX mat-vec, %s, %d columns\n", __func__, ggml_type_name(src0->type), (int) src1_ncols);
+            ggml_sycl_pool_alloc<sycl::half> src1_f16_a(ctx.pool(), src1_ncols * ne00);
+            sycl::half *                     src1_f16 = src1_f16_a.get();
+            ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst)(src1_ddf_i, src1_f16, src1_ncols * ne00, stream);
+            dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q4_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
+                                                                   (int) src1_ncols, ne00, dst->ne[0], stream);
+            return;
+        }
+    }
+
     if (src1_ncols > 1 || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S ||
         src0->type == GGML_TYPE_IQ3_XXS) {
         // 2-8 columns of reordered K-quant weights, or 1-4 of IQ4_XS / IQ3_S and 1-2 of IQ3_XXS
