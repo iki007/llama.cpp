@@ -728,8 +728,43 @@ static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restri
     });
 }
 
+template <typename T> struct alignas(sizeof(T) * 4) cvt_vec4 { T v[4]; };
+
+// contiguous tensors: four elements per work-item, so a sub-group moves four times the bytes per load
+// (port of CUDA #29155)
+template <typename src_t, typename dst_t>
+static void convert_unary_cont_vec4_sycl(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4,
+                                         dpct::queue_ptr queue) {
+    const int64_t num_groups = ceil_div(k4, SYCL_DEQUANTIZE_BLOCK_SIZE);
+
+    queue->parallel_for(sycl::nd_range<1>(num_groups * SYCL_DEQUANTIZE_BLOCK_SIZE, SYCL_DEQUANTIZE_BLOCK_SIZE),
+                        [=](sycl::nd_item<1> item_ct1) {
+                            const int64_t i = item_ct1.get_global_id(0);
+                            if (i >= k4) {
+                                return;
+                            }
+
+                            const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+
+                            cvt_vec4<dst_t> yv;
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                yv.v[j] = static_cast<dst_t>(xv.v[j]);
+                            }
+
+                            ((cvt_vec4<dst_t> *) y)[i] = yv;
+                        });
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr queue) {
+    // the work-item ids must fit in int; larger or unaligned conversions take the strided kernel
+    if (k % 4 == 0 && k / 4 <= INT_MAX - SYCL_DEQUANTIZE_BLOCK_SIZE &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 && (uintptr_t) y % alignof(cvt_vec4<dst_t>) == 0) {
+        dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
+        convert_unary_cont_vec4_sycl<src_t>(vx, y, k / 4, queue);
+        return;
+    }
     convert_unary_nc_sycl<src_t>(vx, y, k, 1, 1, 1, k, k, k, queue);
 }
 
