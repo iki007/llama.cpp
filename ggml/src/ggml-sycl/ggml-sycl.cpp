@@ -4126,6 +4126,8 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
             return true;
         default:
             return false;
@@ -4134,6 +4136,29 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
     GGML_UNUSED(type);
     return false;
 #endif
+}
+
+// Column counts the reordered ESIMD mat-vec takes, where it beats MMVQ on an Arc Pro B70
+// (m=4096 k=14336). The K-quants keep their single column on the DMMV branch (same kernel)
+// and gain from 2 columns on (q5_K 1.48x at 4). The IQ types have no DMMV path, so they
+// start at 1 and stop where MMVQ, which shares its unpacked weights across columns, catches
+// up: iq4_xs 1.31x at 1 / 1.05x at 4, iq3_s 1.48x / 1.10x at 4, iq3_xxs 1.09x / 1.06x at 2.
+static void ggml_sycl_esimd_ncols_range(enum ggml_type type, int64_t & min_cols, int64_t & max_cols) {
+    switch (type) {
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:
+            min_cols = 1;
+            max_cols = 4;
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            min_cols = 1;
+            max_cols = 2;
+            break;
+        default:
+            min_cols = 2;
+            max_cols = 8;
+            break;
+    }
 }
 
 static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
@@ -5396,16 +5421,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = false;
     }
 
-    // 2-8 columns (speculative verify, small batches) of a reordered K-quant: the ESIMD kernel
-    // dequantizes each weight block once for all columns, where MMVQ re-unpacks it per column.
-    // On an Arc Pro B70 at m=4096 k=14336 and 4 columns: q3_K 2.1x, q5_K 1.48x, q6_K 1.26x,
-    // q4_K 1.06x faster than MMVQ. It reads the same reorder layout the MMVQ path installs.
-    // IQ4_XS has no DMMV path for its single column, so it takes this one from 1 column, and
-    // only up to 4: its MMVQ shares the unpacked weights across columns and wins from 5 on
-    // (m=4096 k=14336: 1.31x faster at 1 column, 1.05x at 4, 0.92x at 8).
-    const bool    esimd_iq4_xs   = src0->type == GGML_TYPE_IQ4_XS;
-    const int64_t esimd_min_cols = esimd_iq4_xs ? 1 : 2;
-    const int64_t esimd_max_cols = esimd_iq4_xs ? 4 : 8;
+    // Small column counts (decode, speculative verify) of a reordered ESIMD-capable type: the
+    // ESIMD kernel dequantizes each weight block once for all columns, where MMVQ re-unpacks
+    // it per column. On an Arc Pro B70 at m=4096 k=14336 and 4 columns: q3_K 2.1x, q5_K 1.48x,
+    // q6_K 1.26x, q4_K 1.06x faster than MMVQ; ggml_sycl_esimd_ncols_range() has the per-type
+    // column ranges. It reads the same reorder layout the MMVQ path installs.
+    int64_t esimd_min_cols = 0;
+    int64_t esimd_max_cols = 0;
+    ggml_sycl_esimd_ncols_range(src0->type, esimd_min_cols, esimd_max_cols);
     if (!split && use_mul_mat_vec_q && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
         ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols &&
         src1->ne[1] <= esimd_max_cols &&
