@@ -20,11 +20,12 @@ constexpr int GGML_SYCL_MMID_DPAS_TILE_TOKENS = 32;
 // whether ggml_sycl_mul_mat_id_dpas() can run weights of this type on this device
 bool ggml_sycl_mul_mat_id_dpas_supported(const ggml_backend_sycl_context & ctx, ggml_type type);
 
-// dst[r][0..nrows) = expert(tile of r) weights x y[r] for every sorted row r covered by a tile.
-// weights: n_expert x (nrows x ncols) reordered blocks, expert_bytes apart; y: sorted rows, f16, ncols each;
-// dst: sorted rows, f32, nrows each.
+// out(r)[0..nrows) = expert(tile of r) weights x y[r] for every sorted row r covered by a tile, where out(r) is the
+// f32 row at (char *) dst + row_mapping[r].i1*dst_nb1 + row_mapping[r].i2*dst_nb2.
+// weights: n_expert x (nrows x ncols) reordered blocks, expert_bytes apart; y: sorted rows, f16, ncols each.
 void ggml_sycl_mul_mat_id_dpas(ggml_type type, const void * weights, size_t expert_bytes, int ncols, int nrows,
-                               const sycl::half * y, int y_rows, float * dst, const ggml_sycl_mmid_tile * tiles,
-                               int n_tiles, dpct::queue_ptr stream);
+                               const sycl::half * y, int y_rows, float * dst, size_t dst_nb1, size_t dst_nb2,
+                               const mmid_row_mapping * row_mapping, const ggml_sycl_mmid_tile * tiles, int n_tiles,
+                               dpct::queue_ptr stream);
 
 #endif // GGML_SYCL_MMID_DPAS_HPP
