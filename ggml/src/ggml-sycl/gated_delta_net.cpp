@@ -588,8 +588,9 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     }
 
     // prefill: whole state columns per ESIMD thread
-    const ggml_sycl_gdn_esimd_args esimd_args = { H,   n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3,
-                                                  sv1, sv2,      sv3,    sb1,   sb2, sb3, scale };
+    const ggml_sycl_gdn_esimd_args esimd_args = { H,   n_tokens, n_seqs, neqk1, rq3,   sq1, sq2,
+                                                  sq3, sv1,      sv2,    sv3,   sb1,   sb2, sb3,
+                                                  scale, K, state_slot_stride };
     if (!beta_sigmoid && state_row_idx == nullptr &&
         ggml_sycl_gdn_esimd_supported(ctx, S_v, kda, K, q_d, k_d, v_d, s_d, dst_d, state_d, esimd_args)) {
         ggml_sycl_gdn_esimd(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, esimd_args);

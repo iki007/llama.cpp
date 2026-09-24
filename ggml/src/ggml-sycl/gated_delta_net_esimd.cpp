@@ -71,6 +71,11 @@ static ESIMD_INLINE void gdn_esimd_thread(const float * q, const float * k, cons
     float           bt = bp[0];
     float           gm = 1.0f;  // S = gm * (what the registers hold)
 
+    // the state after each of the last K tokens goes to snapshot slot n_tokens - 1 - t; slot 0 is the final state
+    float *   s1         = state_out + ((s * a.H + h) * SV + col0) * SV;
+    const int first_snap = (int) a.n_tokens - a.K;
+    int       t          = 0;
+
     // one token; the next token's inputs are loaded first so that they arrive during this one
     auto step = [&](const bool next) {
         simd<float, SV> qn, kn;
@@ -133,6 +138,15 @@ static ESIMD_INLINE void gdn_esimd_thread(const float * q, const float * k, cons
             }
         }
 
+        if (t >= first_snap) {
+            float * sd = s1 + (a.n_tokens - 1 - t) * a.slot_stride;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                block_store<float, SV>(sd + c * SV, S.template select<SV, 1>(c * SV) * gm, a16);
+            }
+        }
+        ++t;
+
         op += a.H * SV;
         if (next) {
             qt = qn;
@@ -147,16 +161,10 @@ static ESIMD_INLINE void gdn_esimd_thread(const float * q, const float * k, cons
             bp += a.sb2;
         }
     };
-    for (int64_t t = 1; t < a.n_tokens; ++t) {
+    for (int64_t i = 1; i < a.n_tokens; ++i) {
         step(true);
     }
     step(false);
-
-    float * s1 = state_out + ((s * a.H + h) * SV + col0) * SV;
-#pragma unroll
-    for (int c = 0; c < NC; ++c) {
-        block_store<float, SV>(s1 + c * SV, S.template select<SV, 1>(c * SV) * gm, a16);
-    }
 }
 
 #endif  // GGML_SYCL_HAS_DPAS
@@ -171,10 +179,11 @@ bool ggml_sycl_gdn_esimd_supported(const ggml_backend_sycl_context & ctx, const 
     static const int min_tokens = ggml_sycl_get_env("GGML_SYCL_GDN_ESIMD_MIN", 16);
     const auto       arch       = ggml_sycl_info().devices[ctx.device].hw_info.arch;
     const auto       aligned    = [](const void * p) { return (uintptr_t) p % 16 == 0; };
-    return min_tokens > 0 && a.n_tokens >= min_tokens && S_v == GDN_E_SV && !kda && K == 1 &&
+    return min_tokens > 0 && a.n_tokens >= min_tokens && S_v == GDN_E_SV && !kda && K >= 1 && a.K == K &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) && aligned(q) && aligned(k) &&
            aligned(v) && aligned(state_in) && aligned(attn) && aligned(state_out) && a.sq1 % 4 == 0 &&
-           a.sq2 % 4 == 0 && a.sq3 % 4 == 0 && a.sv1 % 4 == 0 && a.sv2 % 4 == 0 && a.sv3 % 4 == 0;
+           a.sq2 % 4 == 0 && a.sq3 % 4 == 0 && a.sv1 % 4 == 0 && a.sv2 % 4 == 0 && a.sv3 % 4 == 0 &&
+           a.slot_stride % 4 == 0;
 #else
     GGML_UNUSED_VARS(ctx, S_v, kda, K, q, k, v, state_in, attn, state_out, a);
     return false;
