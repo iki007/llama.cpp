@@ -544,16 +544,8 @@ template <typename dst_t>
 static void dequantize_row_iq4_xs_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
                                                dpct::queue_ptr stream) {
     const int64_t nb = (k + QK_K - 1) / QK_K;
-
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32),
-                                           sycl::range<3>(1, 1, 32)),
-                         [=](sycl::nd_item<3> item_ct1) {
-                             dequantize_block_iq4_xs_reorder(vx, y, item_ct1, nb);
-                         });
-    });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_iq4_xs_reorder_wide);
 }
 
 template <typename dst_t>
@@ -567,15 +559,7 @@ static void dequantize_row_iq4_xs_sycl(const void *vx, dst_t *y, const int64_t k
             dpct::has_capability_or_fail(stream->get_device(),
                                          {sycl::aspect::fp16});
 
-            stream->submit([&](sycl::handler &cgh) {
-                  cgh.parallel_for(
-                      sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                            sycl::range<3>(1, 1, 32),
-                                        sycl::range<3>(1, 1, 32)),
-                      [=](sycl::nd_item<3> item_ct1) {
-                            dequantize_block_iq4_xs(vx, y, item_ct1);
-                      });
-            });
+            GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_iq4_xs_wide);
       }
 #endif
 }
