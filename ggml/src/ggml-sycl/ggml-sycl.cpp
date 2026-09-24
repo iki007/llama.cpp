@@ -2975,6 +2975,32 @@ static sycl::half * src1_f16_store(ggml_backend_sycl_context & ctx, const void *
     return c.buf->get();
 }
 
+// Only when the next node is a mul_mat certain to take the f16 GEMM path of ggml_sycl_op_mul_mat_sycl: more
+// columns than any mat-vec path handles, and weights that path converts to f16.
+sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, size_t ne) {
+    if (!ggml_sycl_src1_cache_enabled() || dst == nullptr || dst->type != GGML_TYPE_F32 || dst->data == nullptr) {
+        return nullptr;
+    }
+    const ggml_cgraph * g = ctx.cur_graph;
+    if (g == nullptr || ctx.cur_node < 0 || ctx.cur_node + 1 >= g->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * mm = g->nodes[ctx.cur_node + 1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != dst) {
+        return nullptr;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const bool f16_gemm = (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16 || ggml_is_quantized(w->type)) &&
+                          ggml_is_contiguous(w) && !ggml_backend_buffer_is_sycl_split(w->buffer) &&
+                          mm->op_params[0] == GGML_PREC_DEFAULT &&
+                          ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD;
+    if (!f16_gemm || !ggml_is_contiguous(dst) || dst->ne[1] <= MMVQ_MAX_BATCH_SIZE || dst->ne[2] != 1 ||
+        dst->ne[3] != 1 || (size_t) ggml_nelements(dst) != ne) {
+        return nullptr;
+    }
+    return src1_f16_store(ctx, dst->data, (const void *) ctx.stream(), ne);
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
