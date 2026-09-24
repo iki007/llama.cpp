@@ -129,8 +129,9 @@ bool llama_batch_allocr::init(
                 std::copy(src, src + n_embd, embd_vec.data() + (size_t) i*n_embd);
             }
         }
+        embd_ptr = embd_vec.data();
     } else if (has_embd) {
-        embd_vec = batch_inp.embd;
+        embd_ptr = batch_inp.embd_ext ? batch_inp.embd_ext : batch_inp.embd.data();
     }
 
     if (has_state) {
@@ -229,7 +230,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? const_cast<float *>(embd_ptr) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -837,6 +838,7 @@ void llama_batch_allocr::clear() {
     token_vec   .clear();
     embd_vec    .clear();
     is_embd_vec .clear();
+    embd_ptr = nullptr;
     state_vec   .clear();
     seq_id_data .clear();
     pos         .clear();
@@ -1184,6 +1186,7 @@ llama_batch_ext::llama_batch_ext(
 void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
+    embd_ext = nullptr;
     state .clear();
     n_embd = 0;
 }
@@ -1403,7 +1406,8 @@ bool llama_batch_ext_set_decision_order(llama_batch_ext * batch, int32_t idx, ll
 
 // llama_batch_compat
 
-void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row) {
+void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row,
+                              bool borrow_embd_ok) {
     llama_batch_ext * batch_ext = &dst;
 
     if (n_embd_row == 0) {
@@ -1416,6 +1420,20 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
+
+    // legacy MTP hook batches carry the hidden state next to the token ids: those rows go to the state array
+    const bool embd_is_state = has_embd && has_token && batch_ext->n_embd_state > 0;
+
+    // for one encode/decode call an empty batch borrows the embedding rows instead of copying them (a prompt
+    // ubatch of DFlash features is tens of MB); rows appended to a batch that already has entries are copied
+    const bool borrow_embd = borrow_embd_ok && has_embd && !embd_is_state && batch_ext->tokens.empty() && batch_ext->embd.empty();
+    if (borrow_embd) {
+        batch_ext->embd_ext = batch_inp.embd;
+        batch_ext->n_embd   = n_embd_row;
+    } else if (has_embd && !embd_is_state) {
+        batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
+    }
+    batch_ext->tokens.reserve(batch_ext->tokens.size() + batch_inp.n_tokens);
 
     // auto-generates positions locally when batch_inp.pos is null, continuing from memory
     std::vector<llama_pos> pos_next(batch_ext->n_seq_max);
@@ -1455,12 +1473,14 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             t.id = batch_inp.token[i];
         }
 
-        // legacy MTP hook batches carry the hidden state next to the token ids
-        if (has_embd && has_token && batch_ext->n_embd_state > 0) {
+        if (embd_is_state) {
             t.has_state = true;
             t.state_off = batch_ext->state.size();
             const float * src = batch_inp.embd + (size_t) i * batch_ext->n_embd_state;
             batch_ext->state.insert(batch_ext->state.end(), src, src + batch_ext->n_embd_state);
+        } else if (borrow_embd) {
+            t.has_embd = true;
+            t.embd_off = (size_t) i * n_embd_row;
         } else if (has_embd) {
             t.has_embd = true;
             t.embd_off = batch_ext->embd.size();
@@ -1475,13 +1495,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             ? (batch_inp.logits[i] != 0)
             : (i == batch_inp.n_tokens - 1);
 
-        batch_ext->tokens.push_back(t);
+        batch_ext->tokens.push_back(std::move(t));
     }
 }
 
 llama_batch_compat::llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row) {
     batch_ext = new llama_batch_ext(ctx);
-    init(*batch_ext, batch_inp, n_embd_row);
+    init(*batch_ext, batch_inp, n_embd_row, /*borrow_embd =*/ true);
 }
 
 llama_batch_compat::~llama_batch_compat() {
