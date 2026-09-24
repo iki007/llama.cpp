@@ -177,13 +177,17 @@ static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int
     dpct::has_capability_or_fail(stream->get_device(),
                                     {sycl::aspect::fp16});
 
-    int constexpr WARP_K = WARP_SIZE * QK8_0;
-    const int n_warp = (k + WARP_K - 1) / WARP_K;
     GGML_ASSERT(k % QK8_0 == 0);
-    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-        sycl::range<3>(1, 1, WARP_SIZE),
-        sycl::range<3>(1, 1, WARP_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
+    // One contiguous chunk per work-item, ordinary work-group, no forced sub-group size: the
+    // previous wg=32 + reqd_sub_group_size(32) pairing was the slowest arrangement measured.
+    constexpr int EPT      = GGML_SYCL_Q8_0_DEQ_EPT;
+    constexpr int wg       = 256;
+    const int64_t n_items  = (k + EPT - 1) / EPT;
+    const int64_t n_groups = (n_items + wg - 1) / wg;
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_groups) *
+        sycl::range<3>(1, 1, wg),
+        sycl::range<3>(1, 1, wg)),
+        [=](sycl::nd_item<3> item_ct1) {
             dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
         });
 
@@ -208,91 +212,66 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int64_t k,
 }
 
 
+// Work-group width for the wide K-quant dequant kernels (q4_K/q5_K, both layouts).
+// 16 threads cover one 256-weight block; the launcher packs WG/16 blocks per group.
+// Swept standalone on the hot 5120x17408 shape (see dequantize.hpp): 64 -> 526 GB/s,
+// 128 -> 896, 256 -> 1124, 512 -> 1133. 256 is the default; 512 is within noise of it
+// but halves the group count, which matters for the small tail shapes.
+static inline int deqk_wg() {
+    static const int v = [] {
+        const int w = ggml_sycl_get_env("GGML_SYCL_DEQK_WG", 256);
+        return (w >= 16 && w <= 1024 && w % 16 == 0) ? w : 256;
+    }();
+    return v;
+}
+
+// Elements per thread in the q6_K reorder dequant. 8 measured best (620 GB/s) against the
+// previous shape's 434-465, with 4 within noise of it; see the table on the kernel.
+static inline int q6k_deq_m() {
+    static const int v = [] {
+        const int m = ggml_sycl_get_env("GGML_SYCL_Q6K_DEQ_M", 8);
+        return (m == 2 || m == 4 || m == 8 || m == 16) ? m : 8;
+    }();
+    return v;
+}
+
+#define GGML_SYCL_LAUNCH_DEQK_WIDE(KERNEL)                                                        \
+    do {                                                                                          \
+        const int     wg     = deqk_wg();                                                         \
+        const int64_t groups = (nb * 16 + wg - 1) / wg;                                           \
+        stream->parallel_for(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {       \
+            KERNEL<dst_t>(vx, y, nb, it);                                                         \
+        });                                                                                       \
+    } while (0)
+
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
-    {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
-        stream->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 32),
-                                               sycl::range<3>(1, 1, 32)),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 dequantize_block_q4_K(vx, y, get_pointer(scale_local_acc), item_ct1);
-                             });
-        });
-    }
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q4_K_wide);
 }
 
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
-    const size_t  local_size  = 32;
-    const size_t  global_size = nb * local_size;
-
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
-
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(local_size)),
-                         [=](sycl::nd_item<1> item_ct1) {
-                             dequantize_block_q4_K_reorder(vx, y, get_pointer(scale_local_acc), item_ct1, nb);
-                         });
-    });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q4_K_reorder_wide);
 }
 
 template <typename dst_t>
 static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
-#if QK_K == 256
-    {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
-        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 64),
-                                               sycl::range<3>(1, 1, 64)),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 dequantize_block_q5_K(vx, y, item_ct1);
-                             });
-    }
-#else
-    {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
-        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 32),
-                                               sycl::range<3>(1, 1, 32)),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 dequantize_block_q5_K(vx, y, item_ct1);
-                             });
-    }
-
-#endif
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q5_K_wide);
 }
 
 template <typename dst_t>
 static void dequantize_row_q5_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
-
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(K_SCALE_SIZE), cgh);
-
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
-            [=](sycl::nd_item<3> item_ct1) {
-                dequantize_block_q5_K_reorder(vx, y, get_pointer(scale_local_acc), item_ct1, nb);
-            });
-    });
+    GGML_SYCL_LAUNCH_DEQK_WIDE(dequantize_block_q5_K_reorder_wide);
 }
 
 template <typename dst_t>
@@ -333,9 +312,22 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
 
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
-        [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
+    const auto launch = [&]<int m>() {
+        constexpr int    per_ip = 32 / m;
+        constexpr size_t wg     = 256;
+        const int64_t    chunks = nb * 2 * per_ip;
+        const int64_t    ngroup = (chunks + wg - 1) / wg;
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(ngroup * wg), sycl::range<1>(wg)),
+                             [=](sycl::nd_item<1> item_ct1) {
+                                 dequantize_block_q6_K_reorder<dst_t, m>(vx, y, item_ct1, nb);
+                             });
+    };
+    switch (q6k_deq_m()) {
+        case 2:  launch.template operator()<2>();  break;
+        case 4:  launch.template operator()<4>();  break;
+        case 16: launch.template operator()<16>(); break;
+        default: launch.template operator()<8>();  break;
+    }
 }
 
 template <typename dst_t>
@@ -687,7 +679,12 @@ static void dequantize_block_nc_sycl(const void *    vx,
                              dequantize_block_nc<qk, qr, dequantize_kernel>(vx, y, ne00, ne01, ne02, s01, s02, s03);
                          });
 }
-template <typename src_t, typename dst_t>
+// `w` contiguous elements per work-item. With w == 1 this is the original one-element-per-item
+// grid-stride loop, whose successive iterations are a whole global range apart -- so each item
+// issues one narrow load and one narrow store, and nothing can merge them. Giving an item a
+// contiguous run instead lets the compiler widen the accesses, while a subgroup still covers a
+// contiguous span so coalescing is unchanged. No sycl::vec, so bf16 needs no special case.
+template <typename src_t, typename dst_t, int w>
 static void convert_unary_nc(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
                           const int64_t ne02, const int64_t s01, const int64_t s02, const int64_t s03,
                           const sycl::nd_item<3> & item_ct1) {
@@ -704,19 +701,40 @@ static void convert_unary_nc(const void * __restrict__ vx, dst_t * __restrict__ 
     const int64_t ix = i03 * s03 + i02 * s02 + i01 * s01;
     const int64_t iy = ((i03 * ne02 + i02) * ne01 + i01) * ne00;
 
+    const int64_t stride = work_group_size * item_ct1.get_group_range(2) * w;
+
+    for (int64_t base = global_id * w; base < ne00; base += stride) {
+        if (base + w <= ne00) {
 #pragma unroll
-    for (int64_t i00 = global_id; i00 < ne00; i00 += work_group_size * item_ct1.get_group_range(2)) {
-        y[iy + i00] = static_cast<dst_t>(x[ix + i00]);
+            for (int j = 0; j < w; ++j) {
+                y[iy + base + j] = static_cast<dst_t>(x[ix + base + j]);
+            }
+        } else {
+            // ragged tail: only the last item of the last group can land here
+            for (int64_t i00 = base; i00 < ne00; ++i00) {
+                y[iy + i00] = static_cast<dst_t>(x[ix + i00]);
+            }
+        }
     }
 }
 
-template <typename src_t, typename dst_t>
-static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restrict__ y,
-                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
-                                  const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
-    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
+// Elements per work-item for the unary convert. 1 is the historical kernel, which gives an
+// item a single element and so cannot use a wide access. Measured CONVERT rate on this
+// model, prefill at ub 2048: w=1 340 GB/s, w=2 450, w=4 347, w=8 323 -- so the peak is at 2
+// and it is not monotone, which is why this is a swept knob and not a derived constant.
+static inline int convert_unary_w() {
+    static const int v = [] {
+        const int w = ggml_sycl_get_env("GGML_SYCL_CONVERT_W", 2);
+        return (w == 1 || w == 2 || w == 4 || w == 8) ? w : 2;
+    }();
+    return v;
+}
 
-    sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE));
+template <typename src_t, typename dst_t, int w>
+static void convert_unary_nc_launch(const void * __restrict__ vx, dst_t * __restrict__ y,
+                                    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+                                    const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
+    sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE * (int64_t) w));
 
     // decrease global range when it exceeds the max int
     // TODO: Downsample logic is separated from the kernel, a rewrite is desirable
@@ -724,7 +742,7 @@ static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restri
     sycl::range<3> workgroup_size(1, 1, downsized_workgroup);
 
     queue->parallel_for(sycl::nd_range<3>(global_size * workgroup_size, workgroup_size), [=](sycl::nd_item<3> item_ct1) {
-        convert_unary_nc<src_t>(vx, y, ne00, ne01, ne02, s01, s02, s03, item_ct1);
+        convert_unary_nc<src_t, dst_t, w>(vx, y, ne00, ne01, ne02, s01, s02, s03, item_ct1);
     });
 }
 
@@ -754,6 +772,31 @@ static void convert_unary_cont_vec4_sycl(const void * __restrict__ vx, dst_t * _
 
                             ((cvt_vec4<dst_t> *) y)[i] = yv;
                         });
+}
+
+template <typename src_t, typename dst_t>
+static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restrict__ y,
+                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+                                  const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
+    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
+
+    // A wide access has to be aligned to its own width, and every row start must be too, so
+    // the row strides are part of the condition and not just the row length. Anything that
+    // fails it keeps the one-element-per-item kernel, which has no alignment requirement.
+    const int w = convert_unary_w();
+    const bool aligned = (ne00 % w == 0) && (s01 % w == 0) && (s02 % w == 0) && (s03 % w == 0) &&
+                         (reinterpret_cast<uintptr_t>(vx) % (w * sizeof(src_t)) == 0) &&
+                         (reinterpret_cast<uintptr_t>(y) % (w * sizeof(dst_t)) == 0);
+
+    if (aligned) {
+        switch (w) {
+            case 2: convert_unary_nc_launch<src_t, dst_t, 2>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue); return;
+            case 4: convert_unary_nc_launch<src_t, dst_t, 4>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue); return;
+            case 8: convert_unary_nc_launch<src_t, dst_t, 8>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue); return;
+            default: break;
+        }
+    }
+    convert_unary_nc_launch<src_t, dst_t, 1>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, queue);
 }
 
 template <typename src_t, typename dst_t>
