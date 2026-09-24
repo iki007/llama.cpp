@@ -57,26 +57,32 @@ static ESIMD_INLINE void gdn_esimd_thread(const float * q, const float * k, cons
         S.template select<SV, 1>(c * SV) = block_load<float, SV>(s0 + c * SV, a16);
     }
 
-    const float * qb = q + (s / a.rq3) * a.sq3 + (h % a.neqk1) * a.sq1;
-    const float * kb = k + (s / a.rq3) * a.sq3 + (h % a.neqk1) * a.sq1;
-    const float * vb = v + s * a.sv3 + h * a.sv1 + col0;
-    const float * gb = g + s * a.sb3 + h * a.sb1;
-    const float * bb = beta + s * a.sb3 + h * a.sb1;
-    float *       ob = attn + (s * a.n_tokens * a.H + h) * SV + col0;
+    const float * qp = q + (s / a.rq3) * a.sq3 + (h % a.neqk1) * a.sq1;
+    const float * kp = k + (s / a.rq3) * a.sq3 + (h % a.neqk1) * a.sq1;
+    const float * vp = v + s * a.sv3 + h * a.sv1 + col0;
+    const float * gp = g + s * a.sb3 + h * a.sb1;
+    const float * bp = beta + s * a.sb3 + h * a.sb1;
+    float *       op = attn + (s * a.n_tokens * a.H + h) * SV + col0;
 
-    simd<float, SV> qt = block_load<float, SV>(qb, a16);
-    simd<float, SV> kt = block_load<float, SV>(kb, a16);
-    simd<float, NC> vt = block_load<float, NC>(vb, a16);
-    float           gt = gb[0];
-    float           bt = bb[0];
+    simd<float, SV> qt = block_load<float, SV>(qp, a16);
+    simd<float, SV> kt = block_load<float, SV>(kp, a16);
+    simd<float, NC> vt = block_load<float, NC>(vp, a16);
+    float           gt = gp[0];
+    float           bt = bp[0];
+    float           gm = 1.0f;  // S = gm * (what the registers hold)
 
-    for (int64_t t = 0; t < a.n_tokens; ++t) {
-        const int64_t   tn = t + 1 < a.n_tokens ? t + 1 : t;
-        simd<float, SV> qn = block_load<float, SV>(qb + tn * a.sq2, a16);
-        simd<float, SV> kn = block_load<float, SV>(kb + tn * a.sq2, a16);
-        simd<float, NC> vn = block_load<float, NC>(vb + tn * a.sv2, a16);
-        const float     gn = gb[tn * a.sb2];
-        const float     bn = bb[tn * a.sb2];
+    // one token; the next token's inputs are loaded first so that they arrive during this one
+    auto step = [&](const bool next) {
+        simd<float, SV> qn, kn;
+        simd<float, NC> vn;
+        float           gn = 0.0f, bn = 0.0f;
+        if (next) {
+            qn = block_load<float, SV>(qp + a.sq2, a16);
+            kn = block_load<float, SV>(kp + a.sq2, a16);
+            vn = block_load<float, NC>(vp + a.sv2, a16);
+            gn = gp[a.sb2];
+            bn = bp[a.sb2];
+        }
 
         simd<float, NR * 16> p;
 #pragma unroll
@@ -101,29 +107,55 @@ static ESIMD_INLINE void gdn_esimd_thread(const float * q, const float * k, cons
         }
         simd<float, NR> sums = gdn_row_sums<NR>(p);
 
-        // as gated_delta_net_sycl: delta = (v - g S.k) beta, attn = (g S.q + delta k.q) scale, S = g S + k delta^T
+        // as gated_delta_net_sycl: delta = (v - g S.k) beta, attn = (g S.q + delta k.q) scale, S = g S + k delta^T,
+        // with the registers holding S / gm so that the decay costs one multiply per token instead of one per element
         const float     gd    = sycl::ext::intel::esimd::exp(simd<float, 1>(gt))[0];
-        simd<float, NC> delta = (vt - gd * sums.template select<NC, 1>(0)) * bt;
+        const float     gs    = gm * gd;
+        simd<float, NC> delta = (vt - gs * sums.template select<NC, 1>(0)) * bt;
         const float     kq    = sums[2 * NC];
-        simd<float, NC> o     = (gd * sums.template select<NC, 1>(NC) + delta * kq) * a.scale;
-        block_store<float, NC>(ob + t * a.H * SV, o, a16);
+        simd<float, NC> o     = (gs * sums.template select<NC, 1>(NC) + delta * kq) * a.scale;
+        block_store<float, NC>(op, o, a16);
+        if (gs >= 0x1p-64f) {
+            gm                        = gs;
+            const simd<float, NC> dsc = delta * (1.0f / gs);
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            const float dc          = delta[c];
-            S.template select<SV, 1>(c * SV) = S.template select<SV, 1>(c * SV) * gd + kt * dc;
+            for (int c = 0; c < NC; ++c) {
+                const float dc                   = dsc[c];
+                S.template select<SV, 1>(c * SV) = S.template select<SV, 1>(c * SV) + kt * dc;
+            }
+        } else {
+            // fold the scale back in before it leaves f32 (or when g is 0)
+            gm = 1.0f;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const float dc                   = delta[c];
+                S.template select<SV, 1>(c * SV) = S.template select<SV, 1>(c * SV) * gs + kt * dc;
+            }
         }
 
-        qt = qn;
-        kt = kn;
-        vt = vn;
-        gt = gn;
-        bt = bn;
+        op += a.H * SV;
+        if (next) {
+            qt = qn;
+            kt = kn;
+            vt = vn;
+            gt = gn;
+            bt = bn;
+            qp += a.sq2;
+            kp += a.sq2;
+            vp += a.sv2;
+            gp += a.sb2;
+            bp += a.sb2;
+        }
+    };
+    for (int64_t t = 1; t < a.n_tokens; ++t) {
+        step(true);
     }
+    step(false);
 
     float * s1 = state_out + ((s * a.H + h) * SV + col0) * SV;
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
-        block_store<float, SV>(s1 + c * SV, S.template select<SV, 1>(c * SV).read(), a16);
+        block_store<float, SV>(s1 + c * SV, S.template select<SV, 1>(c * SV) * gm, a16);
     }
 }
 
@@ -134,9 +166,9 @@ bool ggml_sycl_gdn_esimd_supported(const ggml_backend_sycl_context & ctx, const 
                                    const float * state_in, const float * attn, const float * state_out,
                                    const ggml_sycl_gdn_esimd_args & a) {
 #ifdef GGML_SYCL_HAS_DPAS
-    // below this the SIMT kernel wins (B70, 32 / 48 heads: 16 tokens 13.0 / 19.5 us against 14.3 / 18.5, 64 tokens
-    // 49 / 65 against 34 / 48); 0 turns the ESIMD kernel off
-    static const int min_tokens = ggml_sycl_get_env("GGML_SYCL_GDN_ESIMD_MIN", 32);
+    // below this the SIMT kernel wins (B70, 32 / 48 heads: 4 tokens 5.1 / 6.9 us against 9.3 / 10.6, 16 tokens
+    // 13.0 / 19.5 against 12.8 / 16.3); 0 turns the ESIMD kernel off
+    static const int min_tokens = ggml_sycl_get_env("GGML_SYCL_GDN_ESIMD_MIN", 16);
     const auto       arch       = ggml_sycl_info().devices[ctx.device].hw_info.arch;
     const auto       aligned    = [](const void * p) { return (uintptr_t) p % 16 == 0; };
     return min_tokens > 0 && a.n_tokens >= min_tokens && S_v == GDN_E_SV && !kda && K == 1 &&
@@ -154,7 +186,8 @@ void ggml_sycl_gdn_esimd(ggml_backend_sycl_context & ctx, const float * q, const
                          const ggml_sycl_gdn_esimd_args & a) {
 #ifdef GGML_SYCL_HAS_DPAS
     // the fewest columns per thread whose threads fit in one wave of 256-GRF threads (4 per XVE; nsm counts 16 XVEs):
-    // Arc Pro B70, 2048 tokens: 32 heads 960 us at 4 columns, 1111 at 8; 48 heads 1322 at 8, 1933 at 4 (two waves)
+    // Arc Pro B70, 2048 tokens: 32 heads 960 us at 4 columns, 1111 at 8; 48 heads 1322 at 8, 1933 at 4 (two waves),
+    // measured before the pointer walk and the scaled state
     const int64_t wave = (int64_t) ggml_sycl_info().devices[ctx.device].nsm * 16 * 4;
     auto launch = [&](auto ncv) {
         constexpr int           NC = decltype(ncv)::value;
