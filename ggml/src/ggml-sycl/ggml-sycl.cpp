@@ -5917,12 +5917,14 @@ static bool ggml_sycl_mul_mat_id_tiled_p0(
 // and multiplies it by each of `weights` (same type, shape and ids) into the matching `dst_sorted` buffer. `dst`
 // gives the output shape and precision. `ids_host` comes from ggml_sycl_mul_mat_id_read_ids(). Output
 // rows follow `dev_row_mapping`, which the caller allocates for ids->ne[0]*ids->ne[1] rows and passes to
-// ggml_sycl_mul_mat_id_scatter().
-static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+// ggml_sycl_mul_mat_id_scatter(). Returns true if the grouped XMX GEMM ran instead: it writes each weight's rows
+// straight to the matching `dst_final` at their (slot, token) places with the strides of `dst`, so no scatter is needed.
+static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                         const ggml_tensor * src1, const ggml_tensor * ids, const int32_t * ids_host,
                                         std::initializer_list<const ggml_tensor *> weights,
-                                        std::initializer_list<char *> dst_sorted, mmid_row_mapping * dev_row_mapping) {
-    GGML_ASSERT(weights.size() == dst_sorted.size());
+                                        std::initializer_list<char *> dst_sorted, std::initializer_list<char *> dst_final,
+                                        mmid_row_mapping * dev_row_mapping) {
+    GGML_ASSERT(weights.size() == dst_sorted.size() && weights.size() == dst_final.size());
     const ggml_tensor * src0 = weights.begin()[0];
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -6057,10 +6059,10 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         for (size_t w = 0; w < weights.size(); w++) {
             const ggml_tensor * wt = weights.begin()[w];
             ggml_sycl_mul_mat_id_dpas(wt->type, wt->data, wt->nb[2], (int) ne00, (int) ne01, src1_as_f16.get(),
-                                      (int) n_routed_rows, (float *) dst_sorted.begin()[w], dev_tiles.get(),
-                                      (int) tiles_host.size(), stream);
+                                      (int) n_routed_rows, (float *) dst_final.begin()[w], nb1, nb2, dev_row_mapping,
+                                      dev_tiles.get(), (int) tiles_host.size(), stream);
         }
-        return;
+        return true;
     }
 
     for (int64_t i02 = 0; i02 < n_as; i02++) {
@@ -6099,6 +6101,7 @@ static void ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
         }
     }
+    return false;
 }
 
 // Writes the rows of `src_sorted`, in the order of `dev_row_mapping`, back to their (slot, token) places in `dst`.
@@ -6196,9 +6199,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         ggml_sycl_pool_alloc<char>             dst_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
 
-        ggml_sycl_mul_mat_id_sorted(ctx, dst, src1, ids, ids_host, { src0 }, { dst_contiguous.get() },
-                                    dev_row_mapping.get());
-        ggml_sycl_mul_mat_id_scatter(ctx, dst, dst_contiguous.get(), dev_row_mapping.get(), n_routed_rows);
+        if (!ggml_sycl_mul_mat_id_sorted(ctx, dst, src1, ids, ids_host, { src0 }, { dst_contiguous.get() },
+                                         { (char *) dst->data }, dev_row_mapping.get())) {
+            ggml_sycl_mul_mat_id_scatter(ctx, dst, dst_contiguous.get(), dev_row_mapping.get(), n_routed_rows);
+        }
     }
 }
 catch (sycl::exception const &exc) {
@@ -6233,19 +6237,23 @@ static bool ggml_sycl_mul_mat_id_glu_loop(ggml_backend_sycl_context & ctx, ggml_
     ggml_sycl_pool_alloc<char>             up_sorted(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
     ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
 
-    ggml_sycl_mul_mat_id_sorted(ctx, up, act, ids, ids_host, { gate->src[0], up->src[0] },
-                                { gate_sorted.get(), up_sorted.get() }, dev_row_mapping.get());
+    // glu is contiguous with the shape of up, so the grouped XMX GEMM can write gate and up in glu's layout
+    const bool in_place = ggml_sycl_mul_mat_id_sorted(ctx, up, act, ids, ids_host, { gate->src[0], up->src[0] },
+                                                      { gate_sorted.get(), up_sorted.get() },
+                                                      { gate_sorted.get(), (char *) glu->data }, dev_row_mapping.get());
 
-    // the standalone GLU kernel's element op, glu(gate, up) = op(gate) * up, in place on the sorted up rows
+    // the standalone GLU kernel's element op, glu(gate, up) = op(gate) * up, in place on the up rows
     const float * g = (const float *) gate_sorted.get();
-    float *       u = (float *) up_sorted.get();
+    float *       u = in_place ? (float *) glu->data : (float *) up_sorted.get();
     if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
         stream->parallel_for(sycl::range<1>(n_routed_rows*ne0), [=](sycl::id<1> i) { u[i] = op_silu(g[i]) * u[i]; });
     } else {
         stream->parallel_for(sycl::range<1>(n_routed_rows*ne0), [=](sycl::id<1> i) { u[i] = op_gelu(g[i]) * u[i]; });
     }
 
-    ggml_sycl_mul_mat_id_scatter(ctx, glu, up_sorted.get(), dev_row_mapping.get(), n_routed_rows);
+    if (!in_place) {
+        ggml_sycl_mul_mat_id_scatter(ctx, glu, up_sorted.get(), dev_row_mapping.get(), n_routed_rows);
+    }
     return true;
 }
 
