@@ -3,11 +3,14 @@
 
 #ifdef GGML_SYCL_HAS_DPAS
 
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 // A work-group of GGML_SYCL_MMID_DPAS_TPW threads covers 16*TPW rows of one expert x one token tile
 // (NG*8 expert-sorted tokens). Each thread dequantizes its 16 rows once per 16 k and runs NG DPAS,
-// one per 8 tokens, whose A operand is a 2D block load of the sorted f16 activations (rows past
-// the end of the sorted buffer read as zero; tokens past the tile's count are computed, not stored). Each output
-// row goes straight to its (slot, token) place in dst, so no scatter pass follows.
+// one per 8 tokens, whose A operands come from one 2D block load of the tile's sorted f16 activations
+// (rows past the end of the sorted buffer read as zero; tokens past the tile's count are computed, not
+// stored). Each output row goes straight to its (slot, token) place in dst, so no scatter pass follows.
 constexpr int GGML_SYCL_MMID_DPAS_TPW = 4;
 
 template <ggml_type T, int NG>
@@ -16,7 +19,8 @@ ESIMD_INLINE void mul_mat_id_dpas(const void * weights, const size_t expert_byte
                                   const size_t dst_nb2, const mmid_row_mapping * row_mapping,
                                   const ggml_sycl_mmid_tile * tiles, const int n_row_wgs, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
+    namespace xmx     = sycl::ext::intel::esimd::xmx;
+    namespace esimd_x = sycl::ext::intel::experimental::esimd;
     using traits = dpas_tile_traits<T>;
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
 
@@ -39,14 +43,19 @@ ESIMD_INLINE void mul_mat_id_dpas(const void * weights, const size_t expert_byte
     simd<float, NG * 8 * ROWS> acc = 0.0f;
     const unsigned surf_w = (unsigned) ncols * sizeof(sycl::half) - 1;
     const unsigned surf_h = (unsigned) y_rows - 1;
+    // one load per 16 k covers the whole tile; reusing the descriptor and moving only x is cheaper than
+    // building it for every load
+    static_assert(NG * 8 <= 32, "a 2D block load covers at most 32 rows");
+    esimd_x::config_2d_mem_access<sycl::half, 16, NG * 8, 1> a_desc(y, surf_w, surf_h, surf_w, 0, t.row_begin);
     for (int ib = 0; ib < nb_row; ++ib) {
         traits::block(w, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
+            a_desc.set_x(ib * QK_K + koff);
+            simd<sycl::half, NG * 128> a = esimd_x::lsc_load_2d<sycl::half, 16, NG * 8, 1, false, false>(a_desc);
 #pragma unroll
             for (int g = 0; g < NG; ++g) {
-                simd<sycl::half, 128> a = load_2d<sycl::half, 16, 8, 1, false, false>(
-                    y, surf_w, surf_h, surf_w, ib * QK_K + koff, t.row_begin + 8 * g);
                 simd<float, 128> c = acc.template select<128, 1>(g * 128);
-                acc.template select<128, 1>(g * 128) = xmx::dpas<8, 8, float, float>(c, b, a);
+                acc.template select<128, 1>(g * 128) =
+                    xmx::dpas<8, 8, float, float>(c, b, a.template select<128, 1>(g * 128).read());
             }
         });
     }
@@ -67,6 +76,15 @@ ESIMD_INLINE void mul_mat_id_dpas(const void * weights, const size_t expert_byte
     }
 }
 
+// Runs an ESIMD kernel with 256 GRF: half the threads per XVE, but each keeps more loads in flight.
+template <typename F> struct mul_mat_id_dpas_grf256 {
+    F f;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL { f(it); }
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    }
+};
+
 template <ggml_type T, int NG>
 static void mul_mat_id_dpas_sycl(const void * weights, size_t expert_bytes, int ncols, int nrows, const sycl::half * y,
                                  int y_rows, float * dst, size_t dst_nb1, size_t dst_nb2,
@@ -76,11 +94,17 @@ static void mul_mat_id_dpas_sycl(const void * weights, size_t expert_bytes, int 
     constexpr int TPW       = GGML_SYCL_MMID_DPAS_TPW;
     const int     n_row_wgs = (nrows + GGML_SYCL_DPAS_ROWS * TPW - 1) / (GGML_SYCL_DPAS_ROWS * TPW);
     const size_t  wgs       = (size_t) n_tiles * n_row_wgs;
-    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(wgs * TPW), sycl::range<1>(TPW)),
-                         [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                             mul_mat_id_dpas<T, NG>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1,
-                                                    dst_nb2, row_mapping, tiles, n_row_wgs, it);
-                         });
+    const sycl::nd_range<1> range(sycl::range<1>(wgs * TPW), sycl::range<1>(TPW));
+    auto kernel = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
+        mul_mat_id_dpas<T, NG>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping,
+                               tiles, n_row_wgs, it);
+    };
+    // 256 GRF pays off for long k loops (Arc Pro B70: -16% at 2048 k) and loses for short ones (+14% at 512 k)
+    if (ncols >= 1024) {
+        stream->parallel_for(range, mul_mat_id_dpas_grf256<decltype(kernel)>{ kernel });
+    } else {
+        stream->parallel_for(range, [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL { kernel(it); });
+    }
 }
 
 #endif // GGML_SYCL_HAS_DPAS
