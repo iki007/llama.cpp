@@ -1637,31 +1637,31 @@ dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy,
 }
 
 
+// IQ4_NL reorder layout [qs (QK4_NL/2 per block)] [d (half per block)]: two threads per 32-weight block, each
+// taking 8 qs bytes and writing its low- and high-nibble runs as two 16-byte stores
 template <typename dst_t>
-__dpct_inline__ static void
-dequantize_block_iq4_nl_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
-                                const sycl::nd_item<3> & item_ct1, int64_t nblocks) {
-    const int64_t i   = item_ct1.get_group(2);
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t il  = tid / 8;  // 0...3
-    const int64_t ib  = tid % 8;  // 0...7
-
-    dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
-
-    // Reordered layout: [qs (QK4_NL/2 per block)] [d (half per block)]
-    const uint8_t * base = static_cast<const uint8_t *>(vx);
-    const int64_t   blk  = i * (QK_K / QK4_NL) + ib;
-
-    const uint8_t * q4 = base + blk * (QK4_NL / 2) + 4 * il;
-    const ggml_half dv =
-        *reinterpret_cast<const ggml_half *>(base + nblocks * (QK4_NL / 2) + blk * sizeof(ggml_half));
-
-    const float d = (float) dv;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0]  = d * kvalues_iq4nl[q4[j] & 0xf];
-        y[j + 16] = d * kvalues_iq4nl[q4[j] >> 4];
+static void dequantize_block_iq4_nl_reorder_wide(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 int64_t nblocks, const sycl::nd_item<1> & it) {
+    const int64_t g   = it.get_global_id(0);
+    const int64_t blk = g >> 1;
+    if (blk >= nblocks) {
+        return;
     }
+    const int       h    = (int) (g & 1) * 8;
+    const uint8_t * base = static_cast<const uint8_t *>(vx);
+    const float     d    = (float) *reinterpret_cast<const ggml_half *>(base + nblocks * (QK4_NL / 2) + blk * sizeof(ggml_half));
+
+    const sycl::vec<uint8_t, 8> q = vec_aligned_load<uint8_t, 8>(base + blk * (QK4_NL / 2) + h);
+
+    sycl::vec<dst_t, 8> lo, hi;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        lo[l] = d * kvalues_iq4nl[q[l] & 0xf];
+        hi[l] = d * kvalues_iq4nl[q[l] >> 4];
+    }
+    dst_t * yb = yy + blk * QK4_NL + h;
+    *reinterpret_cast<sycl::vec<dst_t, 8> *>(yb + 0)  = lo;
+    *reinterpret_cast<sycl::vec<dst_t, 8> *>(yb + 16) = hi;
 }
 
 // IQ4_XS, 16 threads per 256-weight block like the wide K-quant kernels: a thread owns 8 qs bytes
