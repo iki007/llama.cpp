@@ -752,6 +752,61 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Strided copies without these fall back to one synchronous copy per row. Under -sm tensor the meta backend reads
+// and writes a KV cache split within each row this way, so saving a 133k-token slot to the host prompt cache took
+// 5.5 minutes. Here the device side moves as one copy through a host staging buffer and the rows are strided on
+// the host.
+static void ggml_backend_sycl_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+                                                   void * data, size_t offset, size_t size, size_t n_copies,
+                                                   size_t stride_tensor, size_t stride_data) try {
+    ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
+
+    ggml_sycl_set_device(ctx->device);
+    auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
+
+    // the bytes between the rows are read too, which is harmless
+    const size_t      span = (n_copies - 1) * stride_tensor + size;
+    std::vector<char> host(span);
+    SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy(host.data(), (const char *) tensor->data + offset, span).wait()));
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy((char *) data + i * stride_data, host.data() + i * stride_tensor, size);
+    }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+                                                   const void * data, size_t offset, size_t size, size_t n_copies,
+                                                   size_t stride_tensor, size_t stride_data) try {
+    if (stride_tensor != size) {
+        // one copy would overwrite the bytes between the rows
+        for (size_t i = 0; i < n_copies; i++) {
+            ggml_backend_sycl_buffer_set_tensor(buffer, tensor, (const char *) data + i * stride_data,
+                                                offset + i * stride_tensor, size);
+        }
+        return;
+    }
+    ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
+
+    ggml_sycl_set_device(ctx->device);
+    auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
+    SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+
+    std::vector<char> host(n_copies * size);
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy(host.data() + i * size, (const char *) data + i * stride_data, size);
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy((char *) tensor->data + offset, host.data(), host.size()).wait()));
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 static bool ggml_sycl_is_l0_discrete_gpu(int device) {
     return ggml_sycl_info().devices[device].l0_discrete_gpu;
@@ -939,8 +994,8 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_sycl_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_sycl_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_buffer_get_tensor,
-    /* .set_tensor_2d   = */ NULL,
-    /* .get_tensor_2d   = */ NULL,
+    /* .set_tensor_2d   = */ ggml_backend_sycl_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_sycl_buffer_get_tensor_2d,
     /* .cpy_tensor      = */ ggml_backend_sycl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
     /* .reset           = */ ggml_backend_sycl_buffer_reset,
