@@ -2261,12 +2261,18 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const auto * extra_q8 = static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra);
     const bool   q8_0_esimd = src0->type == GGML_TYPE_Q8_0 && g_ggml_sycl_enable_esimd && ne00 % QK_K == 0 &&
                               extra_q8 && extra_q8->optimized_feature.reorder;
+    // plain F32 weights (e.g. an MoE router) in whole QK_K super-blocks: ggml_sycl_mul_mat routes 1-4 columns here
+    const bool   f32_esimd  = src0->type == GGML_TYPE_F32 && g_ggml_sycl_enable_esimd && ne00 % QK_K == 0;
     if (src1_ncols > 1 || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S ||
-        src0->type == GGML_TYPE_IQ3_XXS || q8_0_esimd) {
+        src0->type == GGML_TYPE_IQ3_XXS || q8_0_esimd || f32_esimd) {
         // 2-8 columns of reordered K-quant weights, or 1-4 of IQ4_XS / IQ3_S and 1-2 of IQ3_XXS
         // (no single-column kernel of their own here); ggml_sycl_mul_mat only routes those here
         bool ok = false;
         switch (src0->type) {
+            case GGML_TYPE_F32:
+                ok = f32_esimd && dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_F32>(
+                    src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream);
+                break;
             case GGML_TYPE_Q8_0:
                 ok = q8_0_esimd && dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_Q8_0>(
                     src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream);

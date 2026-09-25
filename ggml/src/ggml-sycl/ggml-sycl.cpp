@@ -4313,6 +4313,20 @@ static void ggml_sycl_esimd_ncols_range(enum ggml_type type, int64_t & min_cols,
     }
 }
 
+// 1-4 columns against plain F32 weights (e.g. the MoE router ffn_gate_inp) take the ESIMD mat-vec, which reads the
+// rows directly: oneMKL sgemm read them at ~116 GB/s for one column in Qwen3.8-Flash-Next decode
+static bool ggml_sycl_esimd_f32_mat_vec(const ggml_tensor * src0, const ggml_tensor * src1) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    return g_ggml_sycl_enable_esimd && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && src0->ne[0] % QK_K == 0 &&
+           src1->ne[1] >= 1 && src1->ne[1] <= 4;
+#else
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    return false;
+#endif
+}
+
 static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -5593,6 +5607,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
             return;
         }
+    }
+
+    if (!split && ggml_sycl_esimd_f32_mat_vec(src0, src1)) {
+        ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
+        return;
     }
 
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
