@@ -979,6 +979,47 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
     }
 };
 
+// ---------------------------------------------------------------------------
+// F32 weights, plain row-major (no reorder): the super-block of QK_K floats at index bi = row*nb_row + ib is
+// simply x[QK_K*bi..], so the generic kernel walks rows exactly as for the reordered quants. Used only when
+// ncols is a multiple of QK_K (e.g. the MoE router ffn_gate_inp, which oneMKL sgemm read at ~116 GB/s for
+// one column in Qwen3.8-Flash-Next decode).
+// ---------------------------------------------------------------------------
+template <> struct esimd_reorder_q_traits<GGML_TYPE_F32> {
+    struct ptrs {
+        const float * x;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t /* nb */) {
+        return { (const float *) vx };
+    }
+
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
+        using namespace sycl::ext::intel::esimd;
+
+#pragma unroll
+        for (int c = 0; c < QK_K / 32; ++c) {
+            simd<float, 32> w_a = block_load<float, 32>(pa.x + bia * QK_K + c * 32);
+            simd<float, 32> w_b = 0.0f;
+            if (has_b) {
+                w_b = block_load<float, 32>(pb.x + bib * QK_K + c * 32);
+            }
+#pragma unroll
+            for (int n = 0; n < NC; ++n) {
+                simd<float, 32> y = block_load<float, 32>(y_blk + n * y_stride + c * 32);
+                acc_a[n] += y * w_a;
+                acc_b[n] += y * w_b;
+            }
+        }
+    }
+};
+
 } // namespace ggml_sycl_esimd
 
 #endif // GGML_SYCL_ESIMD_HPP
