@@ -781,19 +781,25 @@ catch (sycl::exception const &exc) {
 static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
                                                    const void * data, size_t offset, size_t size, size_t n_copies,
                                                    size_t stride_tensor, size_t stride_data) try {
-    if (stride_tensor != size) {
-        // one copy would overwrite the bytes between the rows
-        for (size_t i = 0; i < n_copies; i++) {
-            ggml_backend_sycl_buffer_set_tensor(buffer, tensor, (const char *) data + i * stride_data,
-                                                offset + i * stride_tensor, size);
-        }
-        return;
-    }
     ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
 
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+
+    if (stride_tensor != size) {
+        // Rows with bytes between them (a -sm tensor weight whose split has several segments per row, loaded one
+        // segment at a time: 1.5 million single-row copies, +17 s to load Qwen3.8-27B): read the span, patch the
+        // rows and write it back. The device is idle, so the bytes between the rows are written back unchanged.
+        const size_t      span = (n_copies - 1) * stride_tensor + size;
+        std::vector<char> host(span);
+        SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy(host.data(), (const char *) tensor->data + offset, span).wait()));
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy(host.data() + i * stride_tensor, (const char *) data + i * stride_data, size);
+        }
+        SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy((char *) tensor->data + offset, host.data(), span).wait()));
+        return;
+    }
 
     std::vector<char> host(n_copies * size);
     for (size_t i = 0; i < n_copies; i++) {
