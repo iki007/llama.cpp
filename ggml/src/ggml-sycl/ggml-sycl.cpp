@@ -4449,6 +4449,11 @@ static void ggml_sycl_esimd_ncols_range(enum ggml_type type, int64_t & min_cols,
             min_cols = 1;
             max_cols = 2;
             break;
+        case GGML_TYPE_Q8_0:
+            // q8_0 at m=4096 k=14336: 1.14x at 1 column, 1.19x at 4, 0.95x at 8
+            min_cols = 1;
+            max_cols = 4;
+            break;
         default:
             min_cols = 2;
             max_cols = 8;
@@ -5752,7 +5757,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) &&
                                           ggml_sycl_supports_reorder_mmvq(src0->type)))) {
-        bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);
+        bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type) &&
+                   (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0);
         // Arc770 get benefit with Q4_0 by skipping MMVQ path
         if (!(ggml_sycl_info().devices[ctx.device].hw_info.arch ==
                     gpu_arch::intel_gpu_acm_g10 &&
@@ -5784,6 +5790,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     ggml_sycl_esimd_ncols_range(src0->type, esimd_min_cols, esimd_max_cols);
     if (!split && use_mul_mat_vec_q && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
         ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols &&
+        (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0) &&
         src1->ne[1] <= esimd_max_cols &&
         ggml_is_contiguous(src1) && should_reorder_tensor(ctx, dst)) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
