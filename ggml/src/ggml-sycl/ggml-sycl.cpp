@@ -8415,9 +8415,12 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
     q1->memcpy(dst1, comm->host_in[1], nbytes);
 }
 
+// A poll of host memory takes ~1 us, so the wait gives up after roughly 15-30 s: a peer whose process died
+// mid-exchange must not leave this kernel spinning until the driver resets the engine (legitimate waits are
+// at most a few hundred ms, e.g. the peer finishing a draft model's prefill first).
 static inline void ggml_sycl_comm_wait_flag(const uint32_t * flag, uint32_t seq) {
     const volatile uint32_t * f = flag;
-    while (*f < seq) {
+    for (uint32_t n = 0; *f < seq && n < (1u << 25); n++) {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
     }
     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
