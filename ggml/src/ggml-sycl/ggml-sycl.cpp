@@ -8121,6 +8121,11 @@ static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t re
 // For non-(N=2 FP32 contiguous) cases, comm_init or comm_allreduce_tensor
 // returns null/false, causing the meta-backend to use its generic
 // butterfly all-reduce fallback.
+//
+// When both queues share one SYCL context (queues built from a bare device
+// use the platform's default context), the paths above are replaced by an
+// exchange through pinned host memory that never blocks the host; see
+// ggml_sycl_comm_allreduce_host.
 // ==========================================================================
 
 struct ggml_backend_sycl_comm_context {
@@ -8131,7 +8136,129 @@ struct ggml_backend_sycl_comm_context {
     std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf0;
     std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf1;
     int64_t buf_nelem = 0;
+
+    // exchange through pinned host memory: per device two mailbox slots used alternately, and a sequence flag on
+    // its own 64-byte line (hflag[16 * device])
+    bool       host_exchange = false;
+    uint8_t *  hbox[2][2]    = {};
+    size_t     hbox_bytes    = 0;
+    int        hslot         = 0;
+    uint32_t * hflag         = nullptr;
+    uint32_t   hseq          = 0;
 };
+
+static inline void ggml_sycl_comm_wait_flag(const uint32_t * flag, uint32_t seq) {
+    const volatile uint32_t * f = flag;
+    while (*f < seq) {
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+    }
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+}
+
+// out[i] += the peer's partial: bf16 (compressed f32), f16 or f32
+static inline void ggml_sycl_comm_add_elem(void * out, const void * in, int64_t i, bool bf16, bool f16) {
+    if (bf16) {
+        ((float *) out)[i] += sycl::bit_cast<float>(((uint32_t) ((const uint16_t *) in)[i]) << 16);
+    } else if (f16) {
+        ((sycl::half *) out)[i] = (sycl::half) ((float) ((sycl::half *) out)[i] + (float) ((const sycl::half *) in)[i]);
+    } else {
+        ((float *) out)[i] += ((const float *) in)[i];
+    }
+}
+
+// The B70s here report no peer access (one sits behind the chipset), so the partials meet in pinned host memory.
+// Each device writes its partial into its own mailbox and raises its sequence flag; the peer waits for the flag on
+// the device and adds the mailbox. Nothing blocks the host, which can queue the next subgraph at once: the blocking
+// path left both cards idle ~200 us per allreduce, ~135 times per decoded token of Qwen3.8-27B (decode 25.3 -> 43.6
+// t/s over two cards, one card 27.4).
+// A device reuses a mailbox slot only after waiting for the peer's next flag, which the peer raises after reading
+// that slot, so two slots suffice. The flags are volatile accesses with system-scope fences: atomic_ref acquire
+// loads of host memory never observed the peer's store on these cards, and cross-device event dependencies abort
+// the default Level Zero adapter.
+static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_ctx, ggml_tensor ** tensors,
+                                          queue_ptr q0, queue_ptr q1, uint8_t * buf0, uint8_t * buf1) {
+    const int64_t nelem    = ggml_nelements(tensors[0]);
+    const bool    f16      = tensors[0]->type == GGML_TYPE_F16;
+    // prefill-sized payloads go through the copy engine: a kernel reading 5 MB of host memory element by element
+    // is ~50x slower; decode-sized ones are written and read by the kernels directly (lowest latency)
+    const bool    big      = nelem >= 32768;
+    const bool    compress = big && !f16;
+    const size_t  xbytes   = compress ? nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
+
+    if (comm_ctx->hbox_bytes < xbytes) {
+        q0->wait();
+        q1->wait();
+        for (auto & dev : comm_ctx->hbox) {
+            for (auto & box : dev) {
+                if (box != nullptr) {
+                    sycl::free(box, q0->get_context());
+                }
+                box = sycl::malloc_host<uint8_t>(xbytes, q0->get_context());
+            }
+        }
+        comm_ctx->hbox_bytes = xbytes;
+    }
+    const int      slot  = comm_ctx->hslot;
+    const uint32_t seq   = ++comm_ctx->hseq;
+    uint32_t *     flags = comm_ctx->hflag;
+    comm_ctx->hslot ^= 1;
+
+    // big path device staging: [0, xbytes) the compressed own partial, [xbytes, 2 xbytes) the peer's partial
+    auto publish = [&](queue_ptr q, int dev, const void * out, uint8_t * stage) {
+        uint8_t * box = comm_ctx->hbox[dev][slot];
+        if (compress) {
+            q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+                ((uint16_t *) stage)[i] = (uint16_t) (sycl::bit_cast<uint32_t>(((const float *) out)[i]) >> 16);
+            });
+            q->memcpy(box, stage, xbytes);
+        } else if (big) {
+            q->memcpy(box, out, xbytes);
+        } else if (f16) {
+            q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+                ((sycl::half *) box)[i] = ((const sycl::half *) out)[i];
+            });
+        } else {
+            q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+                ((float *) box)[i] = ((const float *) out)[i];
+            });
+        }
+        q->single_task([=]() {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            ((volatile uint32_t *) flags)[dev * 16] = seq;
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        });
+    };
+    auto accumulate = [&](queue_ptr q, int dev, void * out, uint8_t * stage) {
+        const uint32_t * flag = flags + (dev ^ 1) * 16;
+        const uint8_t *  box  = comm_ctx->hbox[dev ^ 1][slot];
+        if (big) {
+            uint8_t * in = stage + xbytes;
+            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
+            q->memcpy(in, box, xbytes);
+            q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+                ggml_sycl_comm_add_elem(out, in, i, compress, f16);
+            });
+            return;
+        }
+        // one work-item per work-group waits, then the group reads the host mailbox
+        constexpr int64_t wg  = 256;
+        const int64_t     ngr = std::min<int64_t>((nelem + wg - 1) / wg, 512);
+        q->parallel_for(sycl::nd_range<1>(ngr * wg, wg), [=](sycl::nd_item<1> it) {
+            if (it.get_local_id(0) == 0) {
+                ggml_sycl_comm_wait_flag(flag, seq);
+            }
+            sycl::group_barrier(it.get_group());
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+            for (int64_t i = it.get_global_id(0); i < nelem; i += ngr * wg) {
+                ggml_sycl_comm_add_elem(out, box, i, false, f16);
+            }
+        });
+    };
+    publish(q0, 0, tensors[0]->data, buf0);
+    publish(q1, 1, tensors[1]->data, buf1);
+    accumulate(q0, 0, tensors[0]->data, buf0);
+    accumulate(q1, 1, tensors[1]->data, buf1);
+}
 
 void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends) try {
     for (size_t i = 0; i < n_backends; ++i) {
@@ -8152,6 +8279,12 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
     auto * sctx1 = (ggml_backend_sycl_context *) backends[1]->context;
     ctx->buf0 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx0->pool());
     ctx->buf1 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx1->pool());
+    const sycl::context sycl_ctx = sctx0->stream()->get_context();
+    if (sycl_ctx == sctx1->stream()->get_context()) {
+        ctx->hflag = sycl::malloc_host<uint32_t>(32, sycl_ctx);
+        memset(ctx->hflag, 0, 32 * sizeof(uint32_t));
+        ctx->host_exchange = true;
+    }
     return ctx;
 }
 catch (const sycl::exception &) { return nullptr; }
@@ -8171,6 +8304,17 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
         try {
             sctx0->stream()->wait();
             sctx1->stream()->wait();
+            const sycl::context sycl_ctx = sctx0->stream()->get_context();
+            for (auto & dev : comm_ctx->hbox) {
+                for (auto * box : dev) {
+                    if (box != nullptr) {
+                        sycl::free(box, sycl_ctx);
+                    }
+                }
+            }
+            if (comm_ctx->hflag != nullptr) {
+                sycl::free(comm_ctx->hflag, sycl_ctx);
+            }
         } catch (...) { /* best effort during shutdown */ }
     }
 
@@ -8218,12 +8362,20 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 
     // Grow per-device byte buffers if needed (4 * nelem bytes each).
     if (comm_ctx->buf_nelem < nelem) {
+        // the previous allreduce may still be using them
+        q0->wait();
+        q1->wait();
         comm_ctx->buf0->realloc(nelem * 4);
         comm_ctx->buf1->realloc(nelem * 4);
         comm_ctx->buf_nelem = nelem;
     }
     uint8_t * buf0 = comm_ctx->buf0->get();
     uint8_t * buf1 = comm_ctx->buf1->get();
+
+    if (comm_ctx->host_exchange) {
+        ggml_sycl_comm_allreduce_host(comm_ctx, tensors, q0, q1, buf0, buf1);
+        return true;
+    }
 
     // F16 native path: direct 2-byte cross-device copy + add, skipping the
     // F32 round-trip the meta-backend fallback would force. Cross-device copies
