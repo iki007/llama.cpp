@@ -923,6 +923,62 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_IQ3_XXS> {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Q8_0, SOA reorder layout produced by reorder_qw_q8_0:
+//   [qs: nrows*ncols int8] [d: nrows*ncols/QK8_0 half]
+// in block order, so the super-block of QK_K weights at index bi (8 Q8_0 blocks) is qs[QK_K*bi..] with its 8
+// scales at d[8*bi..]. Used only when ncols is a multiple of QK_K. Output chunk c (0..7) is Q8_0 block c:
+// deq = d[c] * q.
+// ---------------------------------------------------------------------------
+template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
+    static constexpr int blocks_per_sb = QK_K / QK8_0;
+
+    struct ptrs {
+        const int8_t *     qs;
+        const sycl::half * d;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+        const int8_t * qs = (const int8_t *) vx;
+        return { qs, (const sycl::half *) (qs + nb * QK_K) };
+    }
+
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
+        using namespace sycl::ext::intel::esimd;
+
+        simd<int8_t, QK_K>          qs_a = block_load<int8_t, QK_K>(pa.qs + bia * QK_K);
+        simd<int8_t, QK_K>          qs_b = 0;
+        simd<float, blocks_per_sb> d_a  = convert<float>(block_load<sycl::half, blocks_per_sb>(pa.d + bia * blocks_per_sb));
+        simd<float, blocks_per_sb> d_b  = 0.0f;
+        if (has_b) {
+            qs_b = block_load<int8_t, QK_K>(pb.qs + bib * QK_K);
+            d_b  = convert<float>(block_load<sycl::half, blocks_per_sb>(pb.d + bib * blocks_per_sb));
+        }
+
+#pragma unroll
+        for (int c = 0; c < blocks_per_sb; ++c) {
+            simd<int8_t, 32> q_a  = qs_a.select<32, 1>(c * QK8_0);
+            simd<int8_t, 32> q_b  = qs_b.select<32, 1>(c * QK8_0);
+            const float      da    = d_a[c];
+            const float      db    = d_b[c];
+            simd<float, 32>  deq_a = convert<float>(q_a) * da;
+            simd<float, 32>  deq_b = convert<float>(q_b) * db;
+#pragma unroll
+            for (int n = 0; n < NC; ++n) {
+                simd<float, 32> y = block_load<float, 32>(y_blk + n * y_stride + c * QK8_0);
+                acc_a[n] += y * deq_a;
+                acc_b[n] += y * deq_b;
+            }
+        }
+    }
+};
+
 } // namespace ggml_sycl_esimd
 
 #endif // GGML_SYCL_ESIMD_HPP
