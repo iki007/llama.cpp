@@ -3933,6 +3933,24 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
                 expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
                 src1_token_stride, ids_token_stride, stream);
             return true;
+        case GGML_TYPE_IQ3_XXS:
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
+                src1_token_stride, ids_token_stride, stream);
+            return true;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ2_S>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
+                src1_token_stride, ids_token_stride, stream);
+            return true;
+        case GGML_TYPE_IQ3_S:
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
+                src1_token_stride, ids_token_stride, stream);
+            return true;
         case GGML_TYPE_Q4_K:
             launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
@@ -3996,6 +4014,9 @@ bool ggml_sycl_mul_mat_vec_q_id_glu_reorder(
         case GGML_TYPE_Q6_K:   LAUNCH_MOE_GLU(GGML_TYPE_Q6_K);
         case GGML_TYPE_IQ4_XS: LAUNCH_MOE_GLU(GGML_TYPE_IQ4_XS);
         case GGML_TYPE_IQ4_NL: LAUNCH_MOE_GLU(GGML_TYPE_IQ4_NL);
+        case GGML_TYPE_IQ3_XXS: LAUNCH_MOE_GLU(GGML_TYPE_IQ3_XXS);
+        case GGML_TYPE_IQ2_S:   LAUNCH_MOE_GLU(GGML_TYPE_IQ2_S);
+        case GGML_TYPE_IQ3_S:   LAUNCH_MOE_GLU(GGML_TYPE_IQ3_S);
         default:
             return false;
     }
