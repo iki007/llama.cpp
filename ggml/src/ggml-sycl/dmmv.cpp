@@ -2170,22 +2170,36 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
     }
 }
 
-// BF16 rows range from 5 to 160 blocks of 64 (Qwen3.8-Flash-Next: hyper-connection up- and down-projections, the
-// router), where the default 4 threads per row pair leave long rows with too few threads for the GPU (320 rows x
-// 10240) and short ones mostly idle (10240 rows x 320). Threads per row pair scale with the row length instead.
-template <int NC>
-static void dequantize_mul_mat_vec_bf16_esimd_nc_sycl(const void * vx, const float * y, float * dst, const int ncols,
-                                                     const int nrows, const int64_t y_stride, const int64_t dst_stride,
-                                                     dpct::queue_ptr stream) {
+// Types in blocks of 64 weights (BF16, F32) cover rows from 5 to 160 blocks (Qwen3.8-Flash-Next: the
+// hyper-connection up- and down-projections and injections, the router), where a fixed 4 threads per row pair
+// leave long rows with too few threads for the GPU (320 rows x 10240, 4 rows x 10240) and short ones mostly idle
+// (10240 rows x 320). Threads per row pair scale with the row length instead.
+template <ggml_type T, int NC>
+static void dequantize_mul_mat_vec_esimd_nc_by_len_sycl(const void * vx, const float * y, float * dst, const int ncols,
+                                                       const int nrows, const int64_t y_stride, const int64_t dst_stride,
+                                                       dpct::queue_ptr stream) {
+    static_assert(ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value == 64);
     const int nb_row = ncols / 64;
     if (nb_row >= 128) {
-        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<GGML_TYPE_BF16, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
     } else if (nb_row >= 32) {
-        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<GGML_TYPE_BF16, NC, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
     } else if (nb_row >= 8) {
-        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<GGML_TYPE_BF16, NC, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
     } else {
-        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<GGML_TYPE_BF16, NC, 1>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 1>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+    }
+}
+
+// one of the two above, by the type's block size
+template <ggml_type T, int NC>
+static void dequantize_mul_mat_vec_esimd_nc_any_sycl(const void * vx, const float * y, float * dst, const int ncols,
+                                                    const int nrows, const int64_t y_stride, const int64_t dst_stride,
+                                                    dpct::queue_ptr stream) {
+    if constexpr (ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value == 64) {
+        dequantize_mul_mat_vec_esimd_nc_by_len_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+    } else {
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
     }
 }
 
@@ -2196,14 +2210,14 @@ static bool dequantize_mul_mat_vec_reorder_esimd_ncols_sycl(const void * vx, con
                                                            const int64_t y_stride, const int64_t dst_stride,
                                                            dpct::queue_ptr stream) {
     switch (ncols_y) {
-        case 1: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 1>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 2: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 2>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 3: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 4: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 5: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 6: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 7: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
-        case 8: dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 1: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 1>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 2: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 2>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 3: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 4: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 5: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 6: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 7: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
+        case 8: dequantize_mul_mat_vec_esimd_nc_any_sycl<T, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); return true;
         default: return false;
     }
 }
@@ -2426,10 +2440,10 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             case GGML_TYPE_BF16:
                 if (bf16_esimd && src1_ncols >= 1 && src1_ncols <= 4) {
                     switch (src1_ncols) {
-                        case 1: dequantize_mul_mat_vec_bf16_esimd_nc_sycl<1>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                        case 2: dequantize_mul_mat_vec_bf16_esimd_nc_sycl<2>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                        case 3: dequantize_mul_mat_vec_bf16_esimd_nc_sycl<3>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                        case 4: dequantize_mul_mat_vec_bf16_esimd_nc_sycl<4>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
+                        case 1: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 1>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
+                        case 2: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 2>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
+                        case 3: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 3>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
+                        case 4: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 4>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
                     }
                     ok = true;
                 }
