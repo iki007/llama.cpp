@@ -13,7 +13,7 @@
 // stored). Each output row goes straight to its (slot, token) place in dst, so no scatter pass follows.
 constexpr int GGML_SYCL_MMID_DPAS_TPW = 4;
 
-template <ggml_type T, int NG>
+template <typename traits, int NG>
 ESIMD_INLINE void mul_mat_id_dpas(const void * weights, const size_t expert_bytes, const int ncols, const int nrows,
                                   const sycl::half * y, const int y_rows, float * dst, const size_t dst_nb1,
                                   const size_t dst_nb2, const mmid_row_mapping * row_mapping,
@@ -21,7 +21,6 @@ ESIMD_INLINE void mul_mat_id_dpas(const void * weights, const size_t expert_byte
     using namespace sycl::ext::intel::esimd;
     namespace xmx     = sycl::ext::intel::esimd::xmx;
     namespace esimd_x = sycl::ext::intel::experimental::esimd;
-    using traits = dpas_tile_traits<T>;
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
 
     const int wg   = it.get_group(0);
@@ -85,7 +84,7 @@ template <typename F> struct mul_mat_id_dpas_grf256 {
     }
 };
 
-template <ggml_type T, int NG>
+template <typename traits, int NG>
 static void mul_mat_id_dpas_sycl(const void * weights, size_t expert_bytes, int ncols, int nrows, const sycl::half * y,
                                  int y_rows, float * dst, size_t dst_nb1, size_t dst_nb2,
                                  const mmid_row_mapping * row_mapping, const ggml_sycl_mmid_tile * tiles, int n_tiles,
@@ -96,7 +95,7 @@ static void mul_mat_id_dpas_sycl(const void * weights, size_t expert_bytes, int 
     const size_t  wgs       = (size_t) n_tiles * n_row_wgs;
     const sycl::nd_range<1> range(sycl::range<1>(wgs * TPW), sycl::range<1>(TPW));
     auto kernel = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
-        mul_mat_id_dpas<T, NG>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping,
+        mul_mat_id_dpas<traits, NG>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping,
                                tiles, n_row_wgs, it);
     };
     // 256 GRF pays off for long k loops (Arc Pro B70: -16% at 2048 k) and loses for short ones (+14% at 512 k)
@@ -121,7 +120,7 @@ bool ggml_sycl_mul_mat_id_dpas_supported(const ggml_backend_sycl_context & ctx, 
 #endif
 }
 
-void ggml_sycl_mul_mat_id_dpas(ggml_type type, const void * weights, size_t expert_bytes, int ncols, int nrows,
+void ggml_sycl_mul_mat_id_dpas(ggml_type type, bool reordered, const void * weights, size_t expert_bytes, int ncols, int nrows,
                                const sycl::half * y, int y_rows, float * dst, size_t dst_nb1, size_t dst_nb2,
                                const mmid_row_mapping * row_mapping, const ggml_sycl_mmid_tile * tiles, int n_tiles,
                                dpct::queue_ptr stream) {
@@ -129,16 +128,21 @@ void ggml_sycl_mul_mat_id_dpas(ggml_type type, const void * weights, size_t expe
     static_assert(GGML_SYCL_MMID_DPAS_TILE_TOKENS == 4 * 8, "tile tokens must match NG");
     switch (type) {
         case GGML_TYPE_Q4_K:
-            mul_mat_id_dpas_sycl<GGML_TYPE_Q4_K, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
+            if (reordered) {
+                mul_mat_id_dpas_sycl<dpas_tile_traits<GGML_TYPE_Q4_K>, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
+            } else {
+                mul_mat_id_dpas_sycl<dpas_tile_traits_q4_k_plain, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
+            }
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_id_dpas_sycl<GGML_TYPE_Q6_K, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
+            GGML_ASSERT(reordered);
+            mul_mat_id_dpas_sycl<dpas_tile_traits<GGML_TYPE_Q6_K>, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
             break;
         default:
             GGML_ABORT("no XMX mul_mat_id for %s", ggml_type_name(type));
     }
 #else
-    GGML_UNUSED(type); GGML_UNUSED(weights); GGML_UNUSED(expert_bytes); GGML_UNUSED(ncols); GGML_UNUSED(nrows);
+    GGML_UNUSED(type); GGML_UNUSED(reordered); GGML_UNUSED(weights); GGML_UNUSED(expert_bytes); GGML_UNUSED(ncols); GGML_UNUSED(nrows);
     GGML_UNUSED(y); GGML_UNUSED(y_rows); GGML_UNUSED(dst); GGML_UNUSED(dst_nb1); GGML_UNUSED(dst_nb2); GGML_UNUSED(row_mapping);
     GGML_UNUSED(tiles); GGML_UNUSED(n_tiles); GGML_UNUSED(stream);
     GGML_ABORT("ESIMD not available");
