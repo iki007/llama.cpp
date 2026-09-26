@@ -2368,6 +2368,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
+            {
+                // a gather of one or a few rows stays on one thread: waking the others costs more than it saves when
+                // the rest of the model is offloaded. Larger gathers use them all, since their rows can be page faults
+                // into an mmap'd table larger than RAM (qwen4exp's per_layer_token_embd: 16 random rows per token)
+                // that one thread would wait out one at a time.
+                n_tasks = ggml_nrows(node) >= 16 ? n_threads : 1;
+            } break;
         case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
