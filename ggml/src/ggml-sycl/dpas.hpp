@@ -24,16 +24,17 @@ constexpr int GGML_SYCL_DPAS_ROWS = 16;  // DPAS execution size on Xe2: output r
 template <ggml_type T> struct dpas_tile_traits;
 
 // Q4_K / Q5_K chunk scales and mins of the tile's 16 rows (get_scale_min_k4 layout, 12 bytes per
-// row at scales + 12 bi, d and dmin as half2 at dm + 4 bi): sc2[j] / mn2[j] hold each row's
-// d*sc_j / -dmin*m_j twice, for the two k of a VNNI pair.
+// row at scales + SC_STRIDE bi, d and dmin as half2 at dm + DM_STRIDE bi): sc2[j] / mn2[j] hold
+// each row's d*sc_j / -dmin*m_j twice, for the two k of a VNNI pair.
+template <uint32_t SC_STRIDE = K_SCALE_SIZE, uint32_t DM_STRIDE = 4>
 static ESIMD_INLINE void dpas_scale_min_k4(const uint8_t * scales, const uint8_t * dm,
                                                 sycl::ext::intel::esimd::simd<uint32_t, 16> bi,
                                                 sycl::ext::intel::esimd::simd<float, 32> (&sc2)[8],
                                                 sycl::ext::intel::esimd::simd<float, 32> (&mn2)[8]) {
     using namespace sycl::ext::intel::esimd;
     // element-major: dword i of all 16 rows at [16 i]
-    simd<uint32_t, 48>   sw   = gather<uint32_t, 48, 3>((const uint32_t *) scales, bi * (uint32_t) K_SCALE_SIZE);
-    simd<uint32_t, 16>   dmw  = gather<uint32_t, 16>((const uint32_t *) dm, bi * 4u);
+    simd<uint32_t, 48>   sw   = gather<uint32_t, 48, 3>((const uint32_t *) scales, bi * SC_STRIDE);
+    simd<uint32_t, 16>   dmw  = gather<uint32_t, 16>((const uint32_t *) dm, bi * DM_STRIDE);
     simd<sycl::half, 32> dmh  = dmw.bit_cast_view<sycl::half>().read();
     simd<float, 16>      dall = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(0)));
     simd<float, 16>      dmin = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(1)));
@@ -59,48 +60,66 @@ static ESIMD_INLINE void dpas_scale_min_k4(const uint8_t * scales, const uint8_t
     }
 }
 
-// Q4_K, reorder layout [qs: nb*(QK_K/2)] [scales: nb*12] [dm: nb*half2]. Chunk j (32 k)
-// of a block has scale d*sc_j and min -dmin*m_j; chunks 2p and 2p+1 share the 32 qs bytes
-// p*32.. (low and high nibbles).
+// Q4_K block of the tile's 16 rows, the qs, scales and dm of block bi at qs + QS_STRIDE bi,
+// scales + SC_STRIDE bi and dm + DM_STRIDE bi. Chunk j (32 k) of a block has scale d*sc_j and min
+// -dmin*m_j; chunks 2p and 2p+1 share the 32 qs bytes p*32.. (low and high nibbles).
+template <uint32_t QS_STRIDE, uint32_t SC_STRIDE, uint32_t DM_STRIDE, typename F>
+static ESIMD_INLINE void dpas_q4_k_block(const uint8_t * qs, const uint8_t * scales, const uint8_t * dm,
+                                         sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+    using namespace sycl::ext::intel::esimd;
+    simd<float, 32> sc2[8];
+    simd<float, 32> mn2[8];
+    dpas_scale_min_k4<SC_STRIDE, DM_STRIDE>(scales, dm, bi, sc2, mn2);
+
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            // 16 qs bytes per row: k 16h.. of chunks 2p (low nibbles) and 2p+1 (high)
+            simd<uint32_t, 64> w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * QS_STRIDE + (p * 32 + h * 16));
+            simd<sycl::half, 256> b_lo;
+            simd<sycl::half, 256> b_hi;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
+                auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                for (int j = 0; j < 4; j += 2) {
+                    simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
+                    const int         kp = (4 * g + j) / 2;
+                    // f32 math, one rounding to f16 per weight: an f16 min term would carry
+                    // its rounding error into every weight of the chunk
+                    b_lo.select<32, 1>(kp * 32) = convert<sycl::half>(convert<float>(simd<uint8_t, 32>(q & 0x0F)) * sc2[2 * p] + mn2[2 * p]);
+                    b_hi.select<32, 1>(kp * 32) = convert<sycl::half>(convert<float>(simd<uint8_t, 32>(q >> 4)) * sc2[2 * p + 1] + mn2[2 * p + 1]);
+                }
+            }
+            fn((2 * p) * 32 + h * 16, b_lo);
+            fn((2 * p + 1) * 32 + h * 16, b_hi);
+        }
+    }
+}
+
+// Q4_K, reorder layout [qs: nb*(QK_K/2)] [scales: nb*12] [dm: nb*half2].
 template <> struct dpas_tile_traits<GGML_TYPE_Q4_K> {
     // calls fn(k offset in the block, B) for the block's 16 k steps; bi = the rows' block indices
     template <typename F>
     static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
-        using namespace sycl::ext::intel::esimd;
         const uint8_t * qs     = (const uint8_t *) vx;
         const uint8_t * scales = qs + nb * (QK_K / 2);
         const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
+        dpas_q4_k_block<QK_K / 2, K_SCALE_SIZE, 4>(qs, scales, dm, bi, fn);
+    }
+};
 
-        simd<float, 32> sc2[8];
-        simd<float, 32> mn2[8];
-        dpas_scale_min_k4(scales, dm, bi, sc2, mn2);
-
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                // 16 qs bytes per row: k 16h.. of chunks 2p (low nibbles) and 2p+1 (high)
-                simd<uint32_t, 64> w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 2) + (p * 32 + h * 16));
-                simd<sycl::half, 256> b_lo;
-                simd<sycl::half, 256> b_hi;
-#pragma unroll
-                for (int g = 0; g < 4; ++g) {
-                    simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
-                    auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
-#pragma unroll
-                    for (int j = 0; j < 4; j += 2) {
-                        simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
-                        const int         kp = (4 * g + j) / 2;
-                        // f32 math, one rounding to f16 per weight: an f16 min term would carry
-                        // its rounding error into every weight of the chunk
-                        b_lo.select<32, 1>(kp * 32) = convert<sycl::half>(convert<float>(simd<uint8_t, 32>(q & 0x0F)) * sc2[2 * p] + mn2[2 * p]);
-                        b_hi.select<32, 1>(kp * 32) = convert<sycl::half>(convert<float>(simd<uint8_t, 32>(q >> 4)) * sc2[2 * p + 1] + mn2[2 * p + 1]);
-                    }
-                }
-                fn((2 * p) * 32 + h * 16, b_lo);
-                fn((2 * p + 1) * 32 + h * 16, b_hi);
-            }
-        }
+// Q4_K in its plain block_q4_K layout, for weights that are not reordered: an op-offloaded expert
+// tensor is copied from host memory for every batch, where reordering it would cost more than it saves.
+struct dpas_tile_traits_q4_k_plain {
+    template <typename F>
+    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+        GGML_UNUSED(nb);
+        const uint8_t * x = (const uint8_t *) vx;
+        dpas_q4_k_block<sizeof(block_q4_K), sizeof(block_q4_K), sizeof(block_q4_K)>(
+            x + offsetof(block_q4_K, qs), x + offsetof(block_q4_K, scales), x, bi, fn);
     }
 };
 
