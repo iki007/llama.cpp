@@ -1925,8 +1925,7 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
 static __dpct_inline__ float
 vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
                      const block_q8_1 *__restrict__ bq8_1, const int &iqs,
-                     const uint64_t *iq2xxs_grid, const uint8_t *ksigns_iq2xs,
-                     const uint8_t *kmask_iq2xs) {
+                     const uint64_t *iq2xxs_grid, const uint64_t *ksigns64) {
 #if QK_K == 256
     const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq;
 
@@ -1937,11 +1936,12 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
     uint32_t aux32 = q2[2] | (q2[3] << 16);
     int sumi = 0;
     for (int l = 0; l < 4; ++l) {
-        const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
-        const uint8_t  signs = ksigns_iq2xs[aux32 & 127];
-        for (int j = 0; j < 8; ++j) {
-            sumi += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-        }
+        const uint32_t * grid  = (const uint32_t *) (iq2xxs_grid + aux8[l]);
+        const uint32_t * signs = (const uint32_t *) (ksigns64 + (aux32 & 127));
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(grid[0] ^ signs[0], signs[0], std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(grid[1] ^ signs[1], signs[1], std::minus<>());
+        sumi = dpct::dp4a(grid_l, get_int_from_int8_aligned(q8, 0), sumi);
+        sumi = dpct::dp4a(grid_h, get_int_from_int8_aligned(q8, 1), sumi);
         q8 += 8;
         aux32 >>= 7;
     }
