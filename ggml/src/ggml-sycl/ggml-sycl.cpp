@@ -5426,9 +5426,17 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
            dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
+// A tensor in a compute buffer, e.g. an op-offloaded weight the scheduler copies from host memory, is rewritten in its
+// plain layout before every use, while a reused graph keeps the tensor's extra: a reorder flag would outlive the data
+// it describes, and the next batch would read plain blocks as reordered ones (Flash-Next perplexity: -nan from chunk 2).
+static bool ggml_sycl_in_compute_buffer(const ggml_tensor * t) {
+    const ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    return buf && ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+}
+
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
-    if (!should_reorder_tensor(*ctx, dst)) {
+    if (!should_reorder_tensor(*ctx, dst) || ggml_sycl_in_compute_buffer(src0)) {
         return;
     }
 
@@ -5462,7 +5470,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
-    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder || ggml_sycl_in_compute_buffer(src0)) {
         return;
     }
     // Keep in sync with reorder_qw()'s MoE branch and ggml_sycl_mul_mat_vec_q_id_reorder():
@@ -6145,8 +6153,16 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         use_dpas = use_dpas && w->type == src0->type && ggml_sycl_mul_mat_id_dpas_supported(ctx, w->type) &&
                    w->ne[0] % QK_K == 0 && w->nb[2] == nb02;
     }
+    // a Q4_K weight in a compute buffer is never reordered (see ggml_sycl_in_compute_buffer), so the XMX GEMM reads
+    // its plain layout; for op-offloaded experts that also saves redoing a full-tensor reorder for every batch
+    auto dpas_plain = [](const ggml_tensor * w) {
+        return w->type == GGML_TYPE_Q4_K && ggml_sycl_in_compute_buffer(w);
+    };
     if (use_dpas) {
         for (const ggml_tensor * w : weights) {
+            if (dpas_plain(w)) {
+                continue;
+            }
             opt_for_reorder_id(&ctx, w);
             const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
             use_dpas = use_dpas && extra && extra->optimized_feature.reorder;
@@ -6231,7 +6247,7 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         GGML_SYCL_DEBUG("%s: grouped XMX expert GEMM, %zu tiles\n", __func__, tiles_host.size());
         for (size_t w = 0; w < weights.size(); w++) {
             const ggml_tensor * wt = weights.begin()[w];
-            ggml_sycl_mul_mat_id_dpas(wt->type, wt->data, wt->nb[2], (int) ne00, (int) ne01, src1_as_f16.get(),
+            ggml_sycl_mul_mat_id_dpas(wt->type, !dpas_plain(wt), wt->data, wt->nb[2], (int) ne00, (int) ne01, src1_as_f16.get(),
                                       (int) n_routed_rows, (float *) dst_final.begin()[w], nb1, nb2, dev_row_mapping,
                                       dev_tiles.get(), (int) tiles_host.size(), stream);
         }
