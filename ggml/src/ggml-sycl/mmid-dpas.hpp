@@ -22,8 +22,9 @@ bool ggml_sycl_mul_mat_id_dpas_supported(const ggml_backend_sycl_context & ctx, 
 
 // out(r)[0..nrows) = expert(tile of r) weights x y[r] for every sorted row r covered by a tile, where out(r) is the
 // f32 row at (char *) dst + row_mapping[r].i1*dst_nb1 + row_mapping[r].i2*dst_nb2.
-// weights: n_expert x (nrows x ncols) reordered blocks, expert_bytes apart; y: sorted rows, f16, ncols each.
-void ggml_sycl_mul_mat_id_dpas(ggml_type type, const void * weights, size_t expert_bytes, int ncols, int nrows,
+// weights: n_expert x (nrows x ncols) blocks, expert_bytes apart, reordered unless !reordered (plain layout, Q4_K
+// only); y: sorted rows, f16, ncols each.
+void ggml_sycl_mul_mat_id_dpas(ggml_type type, bool reordered, const void * weights, size_t expert_bytes, int ncols, int nrows,
                                const sycl::half * y, int y_rows, float * dst, size_t dst_nb1, size_t dst_nb2,
                                const mmid_row_mapping * row_mapping, const ggml_sycl_mmid_tile * tiles, int n_tiles,
                                dpct::queue_ptr stream);
