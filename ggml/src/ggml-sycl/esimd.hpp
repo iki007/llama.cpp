@@ -28,6 +28,15 @@ constexpr int GGML_SYCL_DMMV_ESIMD_WG_SIZE = 4;
 
 template <ggml_type T> struct esimd_reorder_q_traits;
 
+// Weights per block of the generic kernel: QK_K, unless the traits set block_elems (plain weight types do, so rows
+// that are not a whole number of super-blocks still qualify).
+template <typename Tr, typename = void> struct esimd_block_elems {
+    static constexpr int value = QK_K;
+};
+template <typename Tr> struct esimd_block_elems<Tr, std::void_t<decltype(Tr::block_elems)>> {
+    static constexpr int value = Tr::block_elems;
+};
+
 // build a 32-lane vector whose low 16 lanes are `lo` and high 16 are `hi`
 // (a super-chunk splits into two 16-wide halves with distinct scale/min codes).
 static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32> splat_lo_hi(float lo, float hi) {
@@ -1009,6 +1018,54 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_F32> {
             simd<float, 32> w_b = 0.0f;
             if (has_b) {
                 w_b = block_load<float, 32>(pb.x + bib * QK_K + c * 32);
+            }
+#pragma unroll
+            for (int n = 0; n < NC; ++n) {
+                simd<float, 32> y = block_load<float, 32>(y_blk + n * y_stride + c * 32);
+                acc_a[n] += y * w_a;
+                acc_b[n] += y * w_b;
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// BF16 weights, plain row-major, in blocks of 64 so that rows of 320 qualify (the hyper-connection up-projections of
+// Qwen3.8-Flash-Next); a bf16 widens to f32 exactly by a 16-bit shift. The GSQ-RCO quants of that model keep ~1.4 GB
+// of BF16 weights read every token, which the generic DMMV kernel read 3.7x slower than their size allows.
+// ---------------------------------------------------------------------------
+template <> struct esimd_reorder_q_traits<GGML_TYPE_BF16> {
+    static constexpr int block_elems = 64;
+
+    struct ptrs {
+        const uint16_t * x;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t /* nb */) {
+        return { (const uint16_t *) vx };
+    }
+
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32> widen(sycl::ext::intel::esimd::simd<uint16_t, 32> v) {
+        using namespace sycl::ext::intel::esimd;
+        simd<uint32_t, 32> u = convert<uint32_t>(v) << 16;
+        return u.bit_cast_view<float>().read();
+    }
+
+    template <int NC>
+    static ESIMD_INLINE void mac_pair_nc(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            const float * y_blk, int64_t y_stride,
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_a)[NC],
+            sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
+        using namespace sycl::ext::intel::esimd;
+
+#pragma unroll
+        for (int c = 0; c < block_elems / 32; ++c) {
+            simd<float, 32> w_a = widen(block_load<uint16_t, 32>(pa.x + bia * block_elems + c * 32));
+            simd<float, 32> w_b = 0.0f;
+            if (has_b) {
+                w_b = widen(block_load<uint16_t, 32>(pb.x + bib * block_elems + c * 32));
             }
 #pragma unroll
             for (int n = 0; n < NC; ++n) {
