@@ -10815,6 +10815,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 64, n, 2560, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 17, n, 10240, {1, 1}, {1, 1}));
     }
+    // contiguous F32 and Q8_0 mat-vec, 1-4 columns, odd row counts, rows of 2560 (the router, the shared experts)
+    // and 10240 (the hyper-connection down-projections and injections), where F32 takes 8 and 16 threads per row pair
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, n, 2560, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5, n, 10240, {1, 1}, {1, 1}));
+        }
+    }
 
     // BF16 in src1, as ggml_conv_1d_dw emits it for a BF16 kernel
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {1, 1}, {1, 1}));
