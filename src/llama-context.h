@@ -315,6 +315,9 @@ private:
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
 
+        // backend node count of each sequence's sampler that the last scheduler reserve made room for
+        std::map<llama_seq_id, uint32_t> n_nodes_reserved;
+
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
