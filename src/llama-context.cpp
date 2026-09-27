@@ -628,6 +628,11 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    sampling.n_nodes_reserved.clear();
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        sampling.n_nodes_reserved[seq_id] = llama_sampler_backend_n_nodes(sampler);
+    }
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -1326,9 +1331,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        // every request brings a new chain: when the last reserve made room for one at least this large on this
+        // sequence, the scheduler grows the compute buffers by itself if needed, so only stop reusing graphs built
+        // with an older sampler (freed by now, and the new one may have its address)
+        const auto it = sampling.n_nodes_reserved.find(seq_id);
+        if (it != sampling.n_nodes_reserved.end() && llama_sampler_backend_n_nodes(sampler) <= it->second) {
+            gf_res_prev_active = nullptr;
+        } else {
+            sched_need_reserve = true;
+        }
 
-        sched_need_reserve = true;
+        sampling.samplers[seq_id] = sampler;
 
         return true;
     }
@@ -1347,7 +1360,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    // the room reserved for the removed sampler stays, so the next request's sampler needs no reserve either
+    gf_res_prev_active = nullptr;
 
     return true;
 }
