@@ -11695,6 +11695,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // short query batches at head 256: Qwen3.8-27B (GQA 6) draft verify, Ornith-1.5-35B (16 query / 2 KV heads,
+    // GQA 8) decode and verify, the Qwen3.8-Flash-Next MTP layer (24 / 2, GQA 12) decode
+    for (int nb : { 2, 4, 5, 8 }) {
+        for (int kv : { 512, 4096 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    for (int nb : { 1, 4 }) {
+        for (int kv : { 512, 4096 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    for (int nb : { 1, 5 }) {
+        for (int kv : { 512, 4096 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12044,6 +12062,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t nb : {1, 4}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
+    // Ornith-1.5-35B (GQA 8) decode and DFlash verify, the Qwen3.8-Flash-Next MTP layer (GQA 12) decode
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 100096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 100096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
