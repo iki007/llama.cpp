@@ -17,6 +17,7 @@
 #include "fattn-common.hpp"
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
+#include "fattn-xmx.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
@@ -98,7 +99,7 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 / q8_0 K/V decode on Xe2 XMX
+    BEST_FATTN_KERNEL_XMX      = 120, // DPAS, short GQA query batches (fattn-xmx.cpp)
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
@@ -130,6 +131,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (ggml_sycl_flash_attn_ext_xmx_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMX;
+    }
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
@@ -333,7 +338,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
         if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
         if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
-        if (k == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
+        if (k == BEST_FATTN_KERNEL_XMX)  kname = "XMX";
         int64_t delta = 0;
         if (Dk == 256) {
             delta = cur_nkv - last_nkv_d256;
@@ -366,8 +371,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_VEC:
             ggml_sycl_flash_attn_ext_vec(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_DPAS:
-            ggml_sycl_flash_attn_ext_dpas(ctx, dst);
+        case BEST_FATTN_KERNEL_XMX:
+            ggml_sycl_flash_attn_ext_xmx(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
