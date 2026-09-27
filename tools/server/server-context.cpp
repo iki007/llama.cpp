@@ -502,6 +502,12 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
         }
 
+        // verifying a draft costs more at depth, so a request may draft less past a context length
+        const auto & draft = task->params.speculative.draft;
+        if (draft.n_max_deep > 0 && draft.n_ctx_deep > 0 && prompt.n_tokens() >= draft.n_ctx_deep) {
+            n_draft_max = std::min(n_draft_max, draft.n_max_deep);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;

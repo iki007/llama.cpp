@@ -330,6 +330,11 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // once the context holds n_ctx_deep tokens, draft at most n_max_deep (0 = off): each drafted
+    // token costs more to verify at depth, so a shorter draft can win there
+    int32_t n_max_deep = 0;
+    int32_t n_ctx_deep = 0;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;

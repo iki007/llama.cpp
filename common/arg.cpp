@@ -4150,6 +4150,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-n-max-deep"}, "N",
+        string_format("draft at most N tokens once the context reaches --spec-draft-deep-ctx tokens (default: %d, 0 = off)", params.speculative.draft.n_max_deep),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max_deep = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_DEEP"));
+    add_opt(common_arg(
+        {"--spec-draft-deep-ctx"}, "N",
+        string_format("context length from which --spec-draft-n-max-deep applies (default: %d, 0 = off)", params.speculative.draft.n_ctx_deep),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ctx_deep = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DEEP_CTX"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {
