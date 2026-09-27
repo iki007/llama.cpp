@@ -295,6 +295,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+
+        // optional shortlisted draft head: its row count is whatever the file keeps
+        const std::string draft_head_name = tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il).str();
+        if (const ggml_tensor * meta = ml.get_tensor_meta(draft_head_name.c_str())) {
+            layer.nextn.draft_head      = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD,      "weight", il), { n_embd, meta->ne[1] }, flags);
+            layer.nextn.draft_vocab_map = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_VOCAB_MAP, "weight", il), { n_vocab }, flags);
+        }
     }
 }
 
@@ -684,16 +691,31 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // no res->t_embd: it is n_embd wide, but the context sizes that buffer by n_embd_out.
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    if (head_w == nullptr) {
-        const llama_model & other = qwen4exp_shared_model(cparams, model, "output.weight");
-        head_w = other.output;
-        head_s = other.output_s;
-        GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
-    }
+    if (layer.nextn.draft_head) {
+        GGML_ASSERT(layer.nextn.draft_vocab_map && layer.nextn.draft_vocab_map->type == GGML_TYPE_I32);
 
-    cur = build_lora_mm(head_w, cur, head_s);
+        // score only the kept rows, then scatter them back to the full vocab through the map;
+        // ids outside the shortlist point at an extra -inf row, so the draft never proposes them.
+        // the target still verifies every drafted token, so this changes speed, not output.
+        const int64_t n_out = cur->ne[1];
+        cur = ggml_mul_mat(ctx0, layer.nextn.draft_head, cur);
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        ggml_tensor * ninf = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_out, 1), -INFINITY);
+        cur = ggml_concat(ctx0, cur, ninf, 1);
+        cur = ggml_get_rows(ctx0, cur, layer.nextn.draft_vocab_map);
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+    } else {
+        ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+        ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+        if (head_w == nullptr) {
+            const llama_model & other = qwen4exp_shared_model(cparams, model, "output.weight");
+            head_w = other.output;
+            head_s = other.output_s;
+            GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
+        }
+
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
