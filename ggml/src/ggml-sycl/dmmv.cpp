@@ -2424,9 +2424,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const auto * extra_q8 = static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra);
     const bool   q8_0_esimd = src0->type == GGML_TYPE_Q8_0 && g_ggml_sycl_enable_esimd && ne00 % QK_K == 0 &&
                               extra_q8 && extra_q8->optimized_feature.reorder;
-    // plain F32 weights (e.g. an MoE router) in whole QK_K super-blocks: ggml_sycl_mul_mat routes 1-4 columns here
+    // plain F32 weights (e.g. an MoE router) in whole QK_K super-blocks: ggml_sycl_mul_mat routes 1-8 columns here
     const bool   f32_esimd  = src0->type == GGML_TYPE_F32 && g_ggml_sycl_enable_esimd && ne00 % QK_K == 0;
-    // plain BF16 weights in blocks of 64 (e.g. Qwen3.8-Flash-Next's hyper-connections), 1-4 columns likewise
+    // plain BF16 weights in blocks of 64 (e.g. Qwen3.8-Flash-Next's hyper-connections), 1-8 columns likewise
     const bool   bf16_esimd = src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_esimd && ne00 % 64 == 0;
     if (src1_ncols > 1 || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S ||
         src0->type == GGML_TYPE_IQ3_XXS || q8_0_esimd || f32_esimd || bf16_esimd) {
@@ -2439,15 +2439,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
                     src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream);
                 break;
             case GGML_TYPE_BF16:
-                if (bf16_esimd && src1_ncols >= 1 && src1_ncols <= 4) {
-                    switch (src1_ncols) {
-                        case 1: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 1>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                        case 2: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 2>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                        case 3: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 3>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                        case 4: dequantize_mul_mat_vec_esimd_nc_by_len_sycl<GGML_TYPE_BF16, 4>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, dst->ne[0], stream); break;
-                    }
-                    ok = true;
-                }
+                ok = bf16_esimd && dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_BF16>(
+                    src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream);
                 break;
             case GGML_TYPE_Q8_0:
                 ok = q8_0_esimd && dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_Q8_0>(
