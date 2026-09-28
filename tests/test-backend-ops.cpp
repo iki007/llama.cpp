@@ -11221,7 +11221,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // short query batches at head 256: Qwen3.8-27B (GQA 6) draft verify, Ornith-1.5-35B (16 query / 2 KV heads,
-    // GQA 8) decode and verify, the Qwen3.8-Flash-Next MTP layer (24 / 2, GQA 12) decode
+    // GQA 8) decode and verify, Qwen3.8-Flash-Next (24 / 2, GQA 12) decode and MTP verify on an f16 or q8_0 cache
+    // (7 rows run as two row chunks)
     for (int nb : { 2, 4, 5, 8 }) {
         for (int kv : { 512, 4096 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -11232,9 +11233,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
-    for (int nb : { 1, 5 }) {
+    for (int nb : { 1, 5, 7 }) {
         for (int kv : { 512, 4096 }) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
         }
     }
 

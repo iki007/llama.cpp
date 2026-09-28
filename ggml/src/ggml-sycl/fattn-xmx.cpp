@@ -1,5 +1,7 @@
 #include "fattn-xmx.hpp"
+#include "convert.hpp"
 #include "dpas.hpp"
+#include "fattn.hpp"
 
 #include <cfloat>
 
@@ -19,6 +21,7 @@
 // stored to SLM as f16, and thread t accumulates dims 16t..16t+15 of O += P V (the V block loaded VNNI-
 // transformed). Q is pre-scaled by scale*log2(e) so the softmax uses exp2. Each slice writes its
 // unnormalized O with the row max and sum; a second kernel merges the slices into dst.
+// A q8_0 cache is converted to f16 once per call; batches over 64 rows run as row chunks over that copy.
 
 constexpr int FA_XMX_D  = 256;
 constexpr int FA_XMX_T  = 16;             // threads per work-group; also the 16-dim slices of D
@@ -267,7 +270,11 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(int device, const ggml_tensor * dst)
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
+    // a q8_0 cache is converted to f16 once per call (see ggml_sycl_flash_attn_ext_xmx)
+    const bool f16_kv = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    const bool q8_kv  = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && K->data != V->data &&
+                       K->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && V->nb[0] == ggml_type_size(GGML_TYPE_Q8_0);
+    if (Q->type != GGML_TYPE_F32 || !(f16_kv || q8_kv) || dst->type != GGML_TYPE_F32 ||
         !mask || mask->type != GGML_TYPE_F16 || sinks || max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
@@ -280,13 +287,15 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(int device, const ggml_tensor * dst)
     }
     const int64_t g  = Q->ne[2] / K->ne[2];
     const int64_t nq = Q->ne[1];
-    if (nq > max_q || g * nq > 64 || K->ne[1] % FA_XMX_BK != 0 || mask->ne[0] < K->ne[1] || mask->ne[1] < nq) {
+    // rows beyond 64 / g run as further row chunks, each reading the cache once more
+    if (nq > max_q || g > 64 || K->ne[1] % FA_XMX_BK != 0 || mask->ne[0] < K->ne[1] || mask->ne[1] < nq) {
         return false;
     }
-    // 2D block loads: 64-byte aligned head slices, 16-byte aligned row pitch of at least 64 bytes
+    // 2D block loads: 64-byte aligned head slices, 16-byte aligned row pitch of at least 64 bytes (the f16 copy
+    // of a q8_0 cache is contiguous and meets them)
     for (const ggml_tensor * t : { K, V }) {
-        if ((uintptr_t) t->data % 64 != 0 || t->nb[0] != 2 || t->nb[2] % 64 != 0 || t->nb[1] % 16 != 0 ||
-            t->nb[1] < 64) {
+        if (f16_kv && ((uintptr_t) t->data % 64 != 0 || t->nb[0] != 2 || t->nb[2] % 64 != 0 || t->nb[1] % 16 != 0 ||
+                       t->nb[1] < 64)) {
             return false;
         }
     }
@@ -315,11 +324,36 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int n_kvh = (int) K->ne[2];
     const int g     = (int) (Q->ne[2] / K->ne[2]);
     const int nq    = (int) Q->ne[1];
-    const int M     = g * nq;
-    const int RG    = (M + 7) / 8;
-    const int R8    = RG * 8;
     const int n_kv  = (int) K->ne[1];
     const int nblk  = n_kv / FA_XMX_BK;
+
+    // at most 64 rows (g heads x query rows) per launch; more rows go in balanced chunks
+    const int n_chunks = (nq + 64 / g - 1) / (64 / g);
+    const int nq_chunk = (nq + n_chunks - 1) / n_chunks;
+    const int R8_max   = (g * nq_chunk + 7) / 8 * 8;
+
+    dpct::queue_ptr stream = ctx.stream();
+
+    // a q8_0 cache: convert K and V to contiguous f16 once, then every chunk reads the copy
+    const char * K_data = (const char *) K->data;
+    const char * V_data = (const char *) V->data;
+    size_t       k_nb1 = K->nb[1], k_nb2 = K->nb[2], v_nb1 = V->nb[1], v_nb2 = V->nb[2];
+    ggml_sycl_fattn_alloc K_f16(ctx.fattn_buffers().K);
+    ggml_sycl_fattn_alloc V_f16(ctx.fattn_buffers().V);
+    if (K->type == GGML_TYPE_Q8_0) {
+        const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+        const size_t ts = ggml_type_size(GGML_TYPE_Q8_0);
+        sycl::half * Kh = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr : K_f16.alloc(ggml_nelements(K));
+        sycl::half * Vh = extra.V_buffer_ptr ? (sycl::half *) extra.V_buffer_ptr : V_f16.alloc(ggml_nelements(V));
+        GGML_ASSERT((uintptr_t) Kh % 64 == 0 && (uintptr_t) Vh % 64 == 0);
+        const to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(GGML_TYPE_Q8_0);
+        to_fp16(K->data, Kh, K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1] / ts, K->nb[2] / ts, K->nb[3] / ts, stream);
+        to_fp16(V->data, Vh, V->ne[0], V->ne[1], V->ne[2], V->ne[3], V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts, stream);
+        K_data = (const char *) Kh;
+        V_data = (const char *) Vh;
+        k_nb1  = v_nb1 = FA_XMX_D * sizeof(sycl::half);
+        k_nb2  = v_nb2 = (size_t) n_kv * k_nb1;
+    }
 
     // split the cache so that about GGML_SYCL_FA_XMX_WGS work-groups run
     static const int target_wgs = ggml_sycl_get_env("GGML_SYCL_FA_XMX_WGS", 64);
@@ -327,70 +361,75 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int bps = (nblk + nsplit - 1) / nsplit;
     nsplit        = (nblk + bps - 1) / bps;
 
-    ggml_sycl_pool_alloc<float> part_o(ctx.pool(), (size_t) n_kvh * nsplit * R8 * FA_XMX_D);
-    ggml_sycl_pool_alloc<float> part_ml(ctx.pool(), (size_t) n_kvh * nsplit * R8 * 2);
+    ggml_sycl_pool_alloc<float> part_o(ctx.pool(), (size_t) n_kvh * nsplit * R8_max * FA_XMX_D);
+    ggml_sycl_pool_alloc<float> part_ml(ctx.pool(), (size_t) n_kvh * nsplit * R8_max * 2);
 
     fa_xmx_args a;
-    a.Q       = (const char *) Q->data;
-    a.K       = (const char *) K->data;
-    a.V       = (const char *) V->data;
-    a.mask    = (const char *) mask->data;
+    a.K       = K_data;
+    a.V       = V_data;
     a.part_o  = part_o.get();
     a.part_ml = part_ml.get();
     a.g       = g;
-    a.nq      = nq;
     a.n_kv    = n_kv;
     a.nsplit  = nsplit;
     a.bps     = bps;
     a.q_nb1   = Q->nb[1];
     a.q_nb2   = Q->nb[2];
-    a.k_nb1   = K->nb[1];
-    a.k_nb2   = K->nb[2];
-    a.v_nb1   = V->nb[1];
-    a.v_nb2   = V->nb[2];
+    a.k_nb1   = k_nb1;
+    a.k_nb2   = k_nb2;
+    a.v_nb1   = v_nb1;
+    a.v_nb2   = v_nb2;
     a.m_nb1   = mask->nb[1];
     a.qscale  = scale * 1.44269504088896341f;
 
-    dpct::queue_ptr stream = ctx.stream();
-    switch (RG) {
-        case 1: fa_xmx_launch<1>(a, n_kvh, stream); break;
-        case 2: fa_xmx_launch<2>(a, n_kvh, stream); break;
-        case 3: fa_xmx_launch<3>(a, n_kvh, stream); break;
-        case 4: fa_xmx_launch<4>(a, n_kvh, stream); break;
-        case 5: fa_xmx_launch<5>(a, n_kvh, stream); break;
-        case 6: fa_xmx_launch<6>(a, n_kvh, stream); break;
-        case 7: fa_xmx_launch<7>(a, n_kvh, stream); break;
-        case 8: fa_xmx_launch<8>(a, n_kvh, stream); break;
-        default: GGML_ABORT("XMX flash attention: %d rows", M);
-    }
+    const float * po    = part_o.get();
+    const float * pml   = part_ml.get();
+    const size_t  o_nb1 = dst->nb[1] / sizeof(float);
+    const size_t  o_nb2 = dst->nb[2] / sizeof(float);
+    for (int j0 = 0; j0 < nq; j0 += nq_chunk) {
+        const int nqc = std::min(nq_chunk, nq - j0);
+        const int M   = g * nqc;
+        const int RG  = (M + 7) / 8;
+        const int R8  = RG * 8;
+        a.Q    = (const char *) Q->data + j0 * Q->nb[1];
+        a.mask = (const char *) mask->data + j0 * mask->nb[1];
+        a.nq   = nqc;
+        switch (RG) {
+            case 1: fa_xmx_launch<1>(a, n_kvh, stream); break;
+            case 2: fa_xmx_launch<2>(a, n_kvh, stream); break;
+            case 3: fa_xmx_launch<3>(a, n_kvh, stream); break;
+            case 4: fa_xmx_launch<4>(a, n_kvh, stream); break;
+            case 5: fa_xmx_launch<5>(a, n_kvh, stream); break;
+            case 6: fa_xmx_launch<6>(a, n_kvh, stream); break;
+            case 7: fa_xmx_launch<7>(a, n_kvh, stream); break;
+            case 8: fa_xmx_launch<8>(a, n_kvh, stream); break;
+            default: GGML_ABORT("XMX flash attention: %d rows", M);
+        }
 
-    // merge the slices: dst[j][kvh g + c][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp2(m_s - max_s m_s)
-    const float * po     = part_o.get();
-    const float * pml    = part_ml.get();
-    float *       out    = (float *) dst->data;
-    const size_t  o_nb1  = dst->nb[1] / sizeof(float);
-    const size_t  o_nb2  = dst->nb[2] / sizeof(float);
-    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) n_kvh * M * FA_XMX_D), sycl::range<1>(FA_XMX_D)),
-                         [=](sycl::nd_item<1> it) {
-                             const int row = it.get_group(0);
-                             const int kvh = row / M;
-                             const int r   = row - kvh * M;
-                             const int d   = it.get_local_id(0);
-                             float     mx  = -FLT_MAX;
-                             for (int s = 0; s < nsplit; ++s) {
-                                 mx = sycl::fmax(mx, pml[(((size_t) kvh * nsplit + s) * R8 + r) * 2]);
-                             }
-                             float num = 0.0f, den = 0.0f;
-                             for (int s = 0; s < nsplit; ++s) {
-                                 const size_t i = ((size_t) kvh * nsplit + s) * R8 + r;
-                                 const float  w = sycl::exp2(pml[i * 2] - mx);
-                                 num += w * po[i * FA_XMX_D + d];
-                                 den += w * pml[i * 2 + 1];
-                             }
-                             const int j = r / g;
-                             const int c = r - j * g;
-                             out[j * o_nb2 + (size_t) (kvh * g + c) * o_nb1 + d] = num / den;
-                         });
+        // merge the slices: dst[j][kvh g + c][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp2(m_s - max_s m_s)
+        float * out = (float *) dst->data + j0 * o_nb2;
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) n_kvh * M * FA_XMX_D), sycl::range<1>(FA_XMX_D)),
+                             [=](sycl::nd_item<1> it) {
+                                 const int row = it.get_group(0);
+                                 const int kvh = row / M;
+                                 const int r   = row - kvh * M;
+                                 const int d   = it.get_local_id(0);
+                                 float     mx  = -FLT_MAX;
+                                 for (int s = 0; s < nsplit; ++s) {
+                                     mx = sycl::fmax(mx, pml[(((size_t) kvh * nsplit + s) * R8 + r) * 2]);
+                                 }
+                                 float num = 0.0f, den = 0.0f;
+                                 for (int s = 0; s < nsplit; ++s) {
+                                     const size_t i = ((size_t) kvh * nsplit + s) * R8 + r;
+                                     const float  w = sycl::exp2(pml[i * 2] - mx);
+                                     num += w * po[i * FA_XMX_D + d];
+                                     den += w * pml[i * 2 + 1];
+                                 }
+                                 const int j = r / g;
+                                 const int c = r - j * g;
+                                 out[j * o_nb2 + (size_t) (kvh * g + c) * o_nb1 + d] = num / den;
+                             });
+    }
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
