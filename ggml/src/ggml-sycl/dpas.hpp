@@ -190,6 +190,75 @@ template <> struct dpas_tile_traits<GGML_TYPE_Q6_K> {
     }
 };
 
+// 16-bit values of the tile's 16 rows at base + 2 bi (bi = block indices), loaded through the enclosing dwords: the
+// array may start at any even address
+static ESIMD_INLINE sycl::ext::intel::esimd::simd<uint32_t, 16> dpas_gather_u16(
+        const void * base, sycl::ext::intel::esimd::simd<uint32_t, 16> bi) {
+    using namespace sycl::ext::intel::esimd;
+    const uint32_t     mis = (uint32_t) ((uintptr_t) base & 3);
+    simd<uint32_t, 16> off = bi * 2u + mis;
+    simd<uint32_t, 16> w   = gather<uint32_t, 16>((const uint32_t *) ((const uint8_t *) base - mis), off & ~3u);
+    return (w >> ((off & 2u) * 8u)) & 0xFFFF;
+}
+
+// IQ4_XS, reorder layout [qs: nb*(QK_K/2)] [scales_l: nb*(QK_K/64)] [scales_h: nb*uint16] [d: nb*half] (the ESIMD
+// trait in esimd.hpp reads the same). Sub-block s (32 k): byte 16s + l of the qs holds k 32s + l (low nibble) and
+// 32s + 16 + l (high nibble), indices into kvalues_iq4nl; its scale is d * (ls - 32), ls = nibble s of scales_l
+// (low 4 bits) | bits 2s..2s+1 of scales_h << 4. The codebook is the ESIMD trait's degree-4 polynomial rounded to
+// nearest, exact for all 16 entries in f32.
+template <> struct dpas_tile_traits<GGML_TYPE_IQ4_XS> {
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32> codebook(sycl::ext::intel::esimd::simd<float, 32> q) {
+        using namespace sycl::ext::intel::esimd;
+        simd<float, 32> v = q * 0.00132472022f + 0.0412168242f;
+        v = v * q - 1.50018358f;
+        v = v * q + 24.7432461f;
+        v = v * q - 127.043602f;
+        return rnde<float>(v);
+    }
+
+    template <typename F>
+    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs       = (const uint8_t *) vx;
+        const uint8_t * scales_l = qs + nb * (QK_K / 2);
+        const uint8_t * scales_h = scales_l + nb * (QK_K / 64);
+        const uint8_t * d        = scales_h + nb * sizeof(uint16_t);
+
+        const simd<uint32_t, 16> sl   = gather<uint32_t, 16>((const uint32_t *) scales_l, bi * (uint32_t) (QK_K / 64));
+        const simd<uint32_t, 16> sh   = dpas_gather_u16(scales_h, bi);
+        simd<uint16_t, 16>       dbit = convert<uint16_t>(dpas_gather_u16(d, bi));
+        const simd<float, 16>    drow = convert<float>(simd<sycl::half, 16>(dbit.bit_cast_view<sycl::half>().read()));
+
+#pragma unroll
+        for (int s = 0; s < QK_K / 32; ++s) {
+            const simd<uint32_t, 16> ls = ((sl >> (4 * s)) & 0xF) | (((sh >> (2 * s)) & 3) << 4);
+            const simd<float, 16>    sc = (convert<float>(ls) - 32.0f) * drow;
+            simd<float, 32>          sc2;
+            sc2.select<16, 2>(0) = sc;
+            sc2.select<16, 2>(1) = sc;
+
+            // 16 qs bytes per row: k 32s.. (low nibbles) and 32s + 16.. (high nibbles)
+            simd<uint32_t, 64>    w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 2) + 16 * s);
+            simd<sycl::half, 256> b_lo;
+            simd<sycl::half, 256> b_hi;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
+                auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                for (int j = 0; j < 4; j += 2) {
+                    simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
+                    const int         kp = (4 * g + j) / 2;
+                    b_lo.select<32, 1>(kp * 32) = convert<sycl::half>(codebook(convert<float>(simd<uint8_t, 32>(q & 0x0F))) * sc2);
+                    b_hi.select<32, 1>(kp * 32) = convert<sycl::half>(codebook(convert<float>(simd<uint8_t, 32>(q >> 4))) * sc2);
+                }
+            }
+            fn(32 * s, b_lo);
+            fn(32 * s + 16, b_hi);
+        }
+    }
+};
+
 #endif // __INTEL_LLVM_COMPILER
 
 #endif // GGML_SYCL_DPAS_HPP
