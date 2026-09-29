@@ -1,5 +1,4 @@
 #include "fattn-xmx.hpp"
-#include "convert.hpp"
 #include "dpas.hpp"
 #include "fattn.hpp"
 
@@ -43,6 +42,7 @@ struct fa_xmx_args {
     const char * K;
     const char * V;
     const char * mask;
+    const uint8_t * span_live;  // [n_kv / 16]: 0 = the 16-token span is masked for every query row
     float *      part_o;   // [n_kvh][nsplit][R8][D]
     float *      part_ml;  // [n_kvh][nsplit][R8][2]: row max, row sum
     int          g;        // query heads per KV head
@@ -149,19 +149,28 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
         const int tok0   = blk * FA_XMX_BK;
         const int my_tok = tok0 + t * 16;
 
+        // masked spans add exactly 0 after the softmax, so their K and V are not read; every thread sees the same
+        // flags, so a block without live spans is skipped by all of them
+        const simd<uint8_t, 16> live = block_load<uint8_t, 16>(a.span_live + blk * 16, a16);
+        if (!(live != 0).any()) {
+            continue;
+        }
+
         // 2. S[r][n] = Q[r] . K[my_tok + n] for this thread's 16 tokens
         simd<float, R8 * 16> s = 0.0f;
-        k_desc.set_y(my_tok);
+        if (live[t]) {
+            k_desc.set_y(my_tok);
 #pragma unroll
-        for (int ks = 0; ks < 16; ++ks) {
-            k_desc.set_x(ks * 8);
-            simd<uint32_t, 128>   kb = esimd_x::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(k_desc);
-            simd<sycl::half, 256> b  = kb.template bit_cast_view<sycl::half>().read();
+            for (int ks = 0; ks < 16; ++ks) {
+                k_desc.set_x(ks * 8);
+                simd<uint32_t, 128>   kb = esimd_x::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(k_desc);
+                simd<sycl::half, 256> b  = kb.template bit_cast_view<sycl::half>().read();
 #pragma unroll
-            for (int rg = 0; rg < RG; ++rg) {
-                simd<sycl::half, 128> qa = slm_block_load<sycl::half, 128>(SLM_Q + (ks * R8 + rg * 8) * 32);
-                simd<float, 128>      c  = s.template select<128, 1>(rg * 128);
-                s.template select<128, 1>(rg * 128) = xmx::dpas<8, 8, float, float>(c, b, qa);
+                for (int rg = 0; rg < RG; ++rg) {
+                    simd<sycl::half, 128> qa = slm_block_load<sycl::half, 128>(SLM_Q + (ks * R8 + rg * 8) * 32);
+                    simd<float, 128>      c  = s.template select<128, 1>(rg * 128);
+                    s.template select<128, 1>(rg * 128) = xmx::dpas<8, 8, float, float>(c, b, qa);
+                }
             }
         }
 
@@ -209,8 +218,7 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
         for (int r = 0; r < R8; ++r) {
             o.template select<16, 1>(16 * r) *= alpha[r];
         }
-#pragma unroll
-        for (int ts = 0; ts < T; ++ts) {
+        auto pv = [&](int ts) {
             v_desc.set_y(tok0 + ts * 16);
             simd<sycl::half, 256> vb = esimd_x::lsc_load_2d<sycl::half, 16, 16, 1, false, true>(v_desc);
 #pragma unroll
@@ -218,6 +226,20 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
                 simd<sycl::half, 128> pa = slm_block_load<sycl::half, 128>(SLM_P + (ts * R8 + rg * 8) * 32);
                 simd<float, 128>      c  = o.template select<128, 1>(rg * 128);
                 o.template select<128, 1>(rg * 128) = xmx::dpas<8, 8, float, float>(c, vb, pa);
+            }
+        };
+        // a fully live block keeps the branch-free loop, so dense masks run as fast as without skipping
+        if ((live != 0).all()) {
+#pragma unroll
+            for (int ts = 0; ts < T; ++ts) {
+                pv(ts);
+            }
+        } else {
+#pragma unroll
+            for (int ts = 0; ts < T; ++ts) {
+                if (live[ts]) {
+                    pv(ts);
+                }
             }
         }
         // the next block writes SLM_MAX only after every thread has passed the barrier above, and
@@ -334,7 +356,32 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     dpct::queue_ptr stream = ctx.stream();
 
-    // a q8_0 cache: convert K and V to contiguous f16 once, then every chunk reads the copy
+    // one flag per 16-token span: 1 if any query row of this call attends to it (a mask entry above -inf)
+    static const int skip   = ggml_sycl_get_env("GGML_SYCL_FA_XMX_SKIP", 1);
+    const int        n_span = n_kv / 16;
+    ggml_sycl_pool_alloc<uint8_t> span_live(ctx.pool(), n_span);
+    uint8_t * live = span_live.get();
+    if (skip) {
+        const char * mp    = (const char *) mask->data;
+        const size_t m_nb1 = mask->nb[1];
+        stream->parallel_for(sycl::range<1>(n_span), [=](sycl::id<1> id) {
+            const int s   = id[0];
+            bool      any = false;
+            for (int j = 0; j < nq; ++j) {
+                // two 16-byte loads: mask rows are only known to be 16-byte aligned
+                const sycl::vec<uint16_t, 8> * mv = (const sycl::vec<uint16_t, 8> *) (mp + j * m_nb1) + 2 * s;
+                const sycl::vec<uint16_t, 8>   m0 = mv[0], m1 = mv[1];
+                for (int i = 0; i < 8; ++i) {
+                    any = any || m0[i] != 0xFC00 || m1[i] != 0xFC00;  // f16 -inf
+                }
+            }
+            live[s] = any;
+        });
+    } else {
+        stream->memset(live, 1, n_span);
+    }
+
+    // a q8_0 cache: convert the live spans of K and V to contiguous f16 once, then every chunk reads the copy
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
     size_t       k_nb1 = K->nb[1], k_nb2 = K->nb[2], v_nb1 = V->nb[1], v_nb2 = V->nb[2];
@@ -342,13 +389,31 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     ggml_sycl_fattn_alloc V_f16(ctx.fattn_buffers().V);
     if (K->type == GGML_TYPE_Q8_0) {
         const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
-        const size_t ts = ggml_type_size(GGML_TYPE_Q8_0);
         sycl::half * Kh = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr : K_f16.alloc(ggml_nelements(K));
         sycl::half * Vh = extra.V_buffer_ptr ? (sycl::half *) extra.V_buffer_ptr : V_f16.alloc(ggml_nelements(V));
         GGML_ASSERT((uintptr_t) Kh % 64 == 0 && (uintptr_t) Vh % 64 == 0);
-        const to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(GGML_TYPE_Q8_0);
-        to_fp16(K->data, Kh, K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1] / ts, K->nb[2] / ts, K->nb[3] / ts, stream);
-        to_fp16(V->data, Vh, V->ne[0], V->ne[1], V->ne[2], V->ne[3], V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts, stream);
+        // one work-item per 8 values of a row (head, token, group); rows of masked spans stay stale and are never read
+        for (const ggml_tensor * t : { K, V }) {
+            const char * src = (const char *) t->data;
+            sycl::half * out = t == K ? Kh : Vh;
+            const size_t nb1 = t->nb[1], nb2 = t->nb[2];
+            stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(n_kvh, n_kv, FA_XMX_D / 8), sycl::range<3>(1, 8, FA_XMX_D / 8)),
+                                 [=](sycl::nd_item<3> it) {
+                                     const int h   = it.get_global_id(0);
+                                     const int tok = it.get_global_id(1);
+                                     const int c   = it.get_global_id(2);
+                                     if (!live[tok / 16]) {
+                                         return;
+                                     }
+                                     const block_q8_0 * b = (const block_q8_0 *) (src + h * nb2 + (size_t) tok * nb1) + c / 4;
+                                     const float        d = b->d;
+                                     sycl::vec<sycl::half, 8> v;
+                                     for (int k = 0; k < 8; ++k) {
+                                         v[k] = d * b->qs[(c % 4) * 8 + k];
+                                     }
+                                     *(sycl::vec<sycl::half, 8> *) (out + ((size_t) h * n_kv + tok) * FA_XMX_D + c * 8) = v;
+                                 });
+        }
         K_data = (const char *) Kh;
         V_data = (const char *) Vh;
         k_nb1  = v_nb1 = FA_XMX_D * sizeof(sycl::half);
@@ -365,8 +430,9 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     ggml_sycl_pool_alloc<float> part_ml(ctx.pool(), (size_t) n_kvh * nsplit * R8_max * 2);
 
     fa_xmx_args a;
-    a.K       = K_data;
-    a.V       = V_data;
+    a.K         = K_data;
+    a.V         = V_data;
+    a.span_live = live;
     a.part_o  = part_o.get();
     a.part_ml = part_ml.get();
     a.g       = g;
