@@ -10301,6 +10301,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 4097, n, 2304, { 1, 1 }, { 1, 1 }));
     }
+    // Q6_K likewise from 3 columns
+    for (int n = 2; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4097, n, 2304, { 1, 1 }, { 1, 1 }));
+    }
+    // threads per tile: on a 2048-thread card 4097 x 2304 (257 tiles, 9 blocks) takes 5 (not q6_K), 8705 x 2304
+    // (545 tiles) 3
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
+        for (int n = 3; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 8705, n, 2304, { 1, 1 }, { 1, 1 }));
+        }
+    }
 
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both

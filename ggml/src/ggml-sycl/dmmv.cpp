@@ -2233,11 +2233,10 @@ static bool dequantize_mul_mat_vec_reorder_esimd_ncols_sycl(const void * vx, con
 // per-column multiply-adds run on the systolic array instead of the vector units. The tile's
 // weights are gathered with one lane per row: a 2D byte view of the gathered words then
 // holds k positions (k, k+1) across the 16 rows, which is exactly a VNNI row pair of B.
-// The threads of a work-group split the k blocks and sum through local memory.
+// The TPW threads of a work-group (ggml_sycl_dmmv_dpas_tpw) split the k blocks and sum through
+// local memory.
 // ---------------------------------------------------------------------------
-constexpr int GGML_SYCL_DMMV_DPAS_TPW  = 4;   // threads per work-group splitting the k blocks
-
-template <ggml_type T, int NC>
+template <ggml_type T, int NC, int TPW>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                               const int nrows, const int64_t y_stride, const int64_t dst_stride,
                                               sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
@@ -2245,7 +2244,6 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
     namespace xmx = sycl::ext::intel::esimd::xmx;
     using traits  = dpas_tile_traits<T>;
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
-    constexpr int TPW  = GGML_SYCL_DMMV_DPAS_TPW;
 
     const int    nb_row = ncols / QK_K;
     const size_t nb     = (size_t) nrows * nb_row;
@@ -2297,36 +2295,63 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
     }
 }
 
-template <ggml_type T, int NC>
+template <ggml_type T, int NC, int TPW>
 static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                              const int nrows, const int64_t y_stride, const int64_t dst_stride,
                                              dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
-    constexpr int TPW  = GGML_SYCL_DMMV_DPAS_TPW;
     const int     workgroups = (nrows + ROWS - 1) / ROWS;
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NC * ROWS), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
                        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                           dequantize_mul_mat_vec_dpas<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, lmem, it);
+                           dequantize_mul_mat_vec_dpas<T, NC, TPW>(vx, y, dst, ncols, nrows, y_stride, dst_stride, lmem, it);
                        });
     });
+}
+
+template <ggml_type T, int NC>
+static void dequantize_mul_mat_vec_dpas_tpw_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                                 const int nrows, const int64_t y_stride, const int64_t dst_stride,
+                                                 const int tpw, dpct::queue_ptr stream) {
+    switch (tpw) {
+        case 3: dequantize_mul_mat_vec_dpas_sycl<T, NC, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 5: dequantize_mul_mat_vec_dpas_sycl<T, NC, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        default: dequantize_mul_mat_vec_dpas_sycl<T, NC, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+    }
 }
 
 template <ggml_type T>
 static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
-                                                   const int64_t dst_stride, dpct::queue_ptr stream) {
+                                                   const int64_t dst_stride, const int tpw, dpct::queue_ptr stream) {
     switch (ncols_y) {
-        case 3: dequantize_mul_mat_vec_dpas_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
-        case 4: dequantize_mul_mat_vec_dpas_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
-        case 5: dequantize_mul_mat_vec_dpas_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
-        case 6: dequantize_mul_mat_vec_dpas_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
-        case 7: dequantize_mul_mat_vec_dpas_sycl<T, 7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
-        case 8: dequantize_mul_mat_vec_dpas_sycl<T, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 3: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
+        case 4: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
+        case 5: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
+        case 6: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
+        case 7: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
+        case 8: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
         default: GGML_ABORT("unsupported column count %d", ncols_y);
     }
+}
+
+// Threads per tile, splitting its k blocks. The tiles run in waves of the card's hardware threads
+// (Arc Pro B70: 256 XVEs x 8 = 2048), and a grid just past a full wave pays for a nearly empty second
+// one: 8704 rows (544 tiles, the 27B's gate/up per card) took 1.25x-1.57x longer at 4 threads per
+// tile (2176 threads) than at 3, which fit one wave. So 3 when that fits one wave and 4 does not; 5
+// when it fits and gives each thread fewer blocks than 4 (iq4_xs / q4_K 5120 x 8704 at 8 columns:
+// 1.16x / 1.11x; not q6_K, 0.91x-0.98x); else 4, also for grids that need several waves anyway
+// (124160 rows: 4 and 5 equal to 4% better at 4).
+static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, int64_t nrows) {
+    const int64_t wave  = (int64_t) ggml_sycl_info().devices[device].nsm * 16 * 8;
+    const int64_t tiles = (nrows + GGML_SYCL_DPAS_ROWS - 1) / GGML_SYCL_DPAS_ROWS;
+    const int64_t nb    = ncols / QK_K;
+    if (tiles * 4 > wave) {
+        return tiles * 3 <= wave ? 3 : 4;
+    }
+    return type != GGML_TYPE_Q6_K && tiles * 5 <= wave && (nb + 4) / 5 < (nb + 3) / 4 ? 5 : 4;
 }
 
 // Where the XMX mat-vec beats the ESIMD one on an Arc Pro B70. It is written for 16-wide DPAS,
@@ -2336,10 +2361,12 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
 // its 16-row tiles leave the card idle (1024x5120: 0.77x at 4 columns). q5_K's extra high-bit
 // unpacking keeps it behind ESIMD below 8 columns. iq4_xs, whose codebook costs ALU per column on
 // ESIMD and MMVQ alike, gains from 3 columns against MMVQ (8704x5120 / 5120x8704 / 34816x5120:
-// 1.06x / 1.36x / 1.21x at 3, 1.26x / 1.68x / 1.51x at 8; 0.91x-1.11x at 2).
+// 1.06x / 1.36x / 1.21x at 3, 1.26x / 1.68x / 1.51x at 8; 0.91x-1.11x at 2). q6_K gains from 3
+// columns against ESIMD (124160x5120 / 248320x2048 / 5120x8704 / 8704x5120: 1.03x / 1.19x / 1.04x /
+// 1.08x at 3, 1.61x / 1.66x / 1.48x / 1.53x at 8).
 static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
     const auto arch     = ggml_sycl_info().devices[device].hw_info.arch;
-    const int  min_cols = type == GGML_TYPE_Q4_K ? 4 : type == GGML_TYPE_IQ4_XS ? 3 : 0;
+    const int  min_cols = type == GGML_TYPE_Q4_K ? 4 : type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K ? 3 : 0;
     return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= 8 &&
            ncols * nrows >= 8 * 1024 * 1024 &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
@@ -2425,16 +2452,21 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
         // reordered weights where the XMX kernel wins take DPAS
         const auto * extra0 = static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra);
         if (extra0 && extra0->optimized_feature.reorder && ggml_sycl_dmmv_dpas(ctx.device, src0->type, ne00, row_diff, src1_ncols)) {
-            GGML_SYCL_DEBUG("%s: XMX mat-vec, %s, %d columns\n", __func__, ggml_type_name(src0->type), (int) src1_ncols);
+            const int tpw = ggml_sycl_dmmv_dpas_tpw(ctx.device, src0->type, ne00, row_diff);
+            GGML_SYCL_DEBUG("%s: XMX mat-vec, %s, %d columns, %d threads per tile\n", __func__,
+                            ggml_type_name(src0->type), (int) src1_ncols, tpw);
             ggml_sycl_pool_alloc<sycl::half> src1_f16_a(ctx.pool(), src1_ncols * ne00);
             sycl::half *                     src1_f16 = src1_f16_a.get();
             ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst)(src1_ddf_i, src1_f16, src1_ncols * ne00, stream);
             if (src0->type == GGML_TYPE_IQ4_XS) {
                 dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_IQ4_XS>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
-                                                                         (int) src1_ncols, ne00, dst->ne[0], stream);
+                                                                         (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
+            } else if (src0->type == GGML_TYPE_Q6_K) {
+                dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q6_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
             } else {
                 dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q4_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
-                                                                       (int) src1_ncols, ne00, dst->ne[0], stream);
+                                                                       (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
             }
             return;
         }
