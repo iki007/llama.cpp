@@ -4452,9 +4452,10 @@ static void ggml_sycl_esimd_ncols_range(enum ggml_type type, int64_t & min_cols,
             max_cols = 2;
             break;
         case GGML_TYPE_Q8_0:
-            // q8_0 at m=4096 k=14336: 1.14x at 1 column, 1.19x at 4, 0.95x at 8
+            // q8_0 at m=4096 k=14336: 1.14x at 1 column, 1.19x at 4, 0.95x at 8; out of L2 (62-214 MB, k 2560 /
+            // 6144 / 14336) against MMVQ: 1.10-1.24x at 5 columns, 1.10-1.25x at 6, 1.01-1.20x at 7, 0.94-1.13x at 8
             min_cols = 1;
-            max_cols = 4;
+            max_cols = 7;
             break;
         default:
             min_cols = 2;
