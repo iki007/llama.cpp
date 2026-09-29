@@ -85,7 +85,8 @@ static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, R> fa_xmx_row_sum(
     return s2.template select<R, 2>(0) + s2.template select<R, 2>(1);
 }
 
-template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<1> & it) {
+// SKIP: skip the KV spans that span_live marks dead; without it the kernel reads every span
+template <int RG, bool SKIP> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx     = sycl::ext::intel::esimd::xmx;
     namespace esimd_x = sycl::ext::intel::experimental::esimd;
@@ -151,14 +152,17 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
 
         // masked spans add exactly 0 after the softmax, so their K and V are not read; every thread sees the same
         // flags, so a block without live spans is skipped by all of them
-        const simd<uint8_t, 16> live = block_load<uint8_t, 16>(a.span_live + blk * 16, a16);
-        if (!(live != 0).any()) {
-            continue;
+        simd<uint8_t, 16> live = 1;
+        if constexpr (SKIP) {
+            live = block_load<uint8_t, 16>(a.span_live + blk * 16, a16);
+            if (!(live != 0).any()) {
+                continue;
+            }
         }
 
         // 2. S[r][n] = Q[r] . K[my_tok + n] for this thread's 16 tokens
         simd<float, R8 * 16> s = 0.0f;
-        if (live[t]) {
+        auto score = [&]() {
             k_desc.set_y(my_tok);
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks) {
@@ -172,6 +176,13 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
                     s.template select<128, 1>(rg * 128) = xmx::dpas<8, 8, float, float>(c, b, qa);
                 }
             }
+        };
+        if constexpr (SKIP) {
+            if (live[t]) {
+                score();
+            }
+        } else {
+            score();
         }
 
         // 3. mask (log2 domain), per query row j
@@ -229,17 +240,24 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
             }
         };
         // a fully live block keeps the branch-free loop, so dense masks run as fast as without skipping
-        if ((live != 0).all()) {
+        if constexpr (SKIP) {
+            if ((live != 0).all()) {
 #pragma unroll
-            for (int ts = 0; ts < T; ++ts) {
-                pv(ts);
+                for (int ts = 0; ts < T; ++ts) {
+                    pv(ts);
+                }
+            } else {
+#pragma unroll
+                for (int ts = 0; ts < T; ++ts) {
+                    if (live[ts]) {
+                        pv(ts);
+                    }
+                }
             }
         } else {
 #pragma unroll
             for (int ts = 0; ts < T; ++ts) {
-                if (live[ts]) {
-                    pv(ts);
-                }
+                pv(ts);
             }
         }
         // the next block writes SLM_MAX only after every thread has passed the barrier above, and
@@ -263,10 +281,24 @@ template <int RG> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, co
     }
 }
 
-template <int RG> static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, dpct::queue_ptr stream) {
+template <int RG, bool SKIP> static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, dpct::queue_ptr stream) {
     const sycl::nd_range<1> range(sycl::range<1>((size_t) n_kvh * a.nsplit * FA_XMX_T), sycl::range<1>(FA_XMX_T));
-    auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<RG>(a, it); };
+    auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<RG, SKIP>(a, it); };
     stream->parallel_for(range, fa_xmx_grf256<decltype(kern)>{ kern });
+}
+
+template <bool SKIP> static void fa_xmx_launch_rg(int RG, const fa_xmx_args & a, int n_kvh, dpct::queue_ptr stream) {
+    switch (RG) {
+        case 1: fa_xmx_launch<1, SKIP>(a, n_kvh, stream); break;
+        case 2: fa_xmx_launch<2, SKIP>(a, n_kvh, stream); break;
+        case 3: fa_xmx_launch<3, SKIP>(a, n_kvh, stream); break;
+        case 4: fa_xmx_launch<4, SKIP>(a, n_kvh, stream); break;
+        case 5: fa_xmx_launch<5, SKIP>(a, n_kvh, stream); break;
+        case 6: fa_xmx_launch<6, SKIP>(a, n_kvh, stream); break;
+        case 7: fa_xmx_launch<7, SKIP>(a, n_kvh, stream); break;
+        case 8: fa_xmx_launch<8, SKIP>(a, n_kvh, stream); break;
+        default: GGML_ABORT("XMX flash attention: %d row groups", RG);
+    }
 }
 
 #endif // GGML_SYCL_HAS_DPAS
@@ -356,12 +388,16 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     dpct::queue_ptr stream = ctx.stream();
 
-    // one flag per 16-token span: 1 if any query row of this call attends to it (a mask entry above -inf)
+    // one flag per 16-token span: 1 if any query row of this call attends to it (a mask entry above -inf). Only a
+    // q8_0 cache takes them: QSA's sparse masks (Qwen3.8-Flash-Next) come with one, and f16 caches keep the kernel
+    // that reads every span, since the skipping build changed greedy outputs of f16 models at short context even
+    // with skipping off (cause not found)
     static const int skip   = ggml_sycl_get_env("GGML_SYCL_FA_XMX_SKIP", 1);
+    const bool       q8     = K->type == GGML_TYPE_Q8_0;
     const int        n_span = n_kv / 16;
-    ggml_sycl_pool_alloc<uint8_t> span_live(ctx.pool(), n_span);
-    uint8_t * live = span_live.get();
-    if (skip) {
+    ggml_sycl_pool_alloc<uint8_t> span_live(ctx.pool());
+    uint8_t * live = q8 ? span_live.alloc(n_span) : nullptr;
+    if (q8 && skip) {
         const char * mp    = (const char *) mask->data;
         const size_t m_nb1 = mask->nb[1];
         stream->parallel_for(sycl::range<1>(n_span), [=](sycl::id<1> id) {
@@ -377,7 +413,7 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
             }
             live[s] = any;
         });
-    } else {
+    } else if (q8) {
         stream->memset(live, 1, n_span);
     }
 
@@ -387,7 +423,7 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     size_t       k_nb1 = K->nb[1], k_nb2 = K->nb[2], v_nb1 = V->nb[1], v_nb2 = V->nb[2];
     ggml_sycl_fattn_alloc K_f16(ctx.fattn_buffers().K);
     ggml_sycl_fattn_alloc V_f16(ctx.fattn_buffers().V);
-    if (K->type == GGML_TYPE_Q8_0) {
+    if (q8) {
         const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
         sycl::half * Kh = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr : K_f16.alloc(ggml_nelements(K));
         sycl::half * Vh = extra.V_buffer_ptr ? (sycl::half *) extra.V_buffer_ptr : V_f16.alloc(ggml_nelements(V));
@@ -460,16 +496,10 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
         a.Q    = (const char *) Q->data + j0 * Q->nb[1];
         a.mask = (const char *) mask->data + j0 * mask->nb[1];
         a.nq   = nqc;
-        switch (RG) {
-            case 1: fa_xmx_launch<1>(a, n_kvh, stream); break;
-            case 2: fa_xmx_launch<2>(a, n_kvh, stream); break;
-            case 3: fa_xmx_launch<3>(a, n_kvh, stream); break;
-            case 4: fa_xmx_launch<4>(a, n_kvh, stream); break;
-            case 5: fa_xmx_launch<5>(a, n_kvh, stream); break;
-            case 6: fa_xmx_launch<6>(a, n_kvh, stream); break;
-            case 7: fa_xmx_launch<7>(a, n_kvh, stream); break;
-            case 8: fa_xmx_launch<8>(a, n_kvh, stream); break;
-            default: GGML_ABORT("XMX flash attention: %d rows", M);
+        if (q8) {
+            fa_xmx_launch_rg<true>(RG, a, n_kvh, stream);
+        } else {
+            fa_xmx_launch_rg<false>(RG, a, n_kvh, stream);
         }
 
         // merge the slices: dst[j][kvh g + c][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp2(m_s - max_s m_s)
