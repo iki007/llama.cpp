@@ -11715,6 +11715,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // sparse masks (n_kv_max live tokens per row): XMX skips 16-token spans and 256-token blocks masked for
+    // every row of the call; 16 live tokens leave about a third of the blocks dead at one row
+    for (int nb : { 1, 5, 7 }) {
+        for (int n_kv_max : { 16, 1000 }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV,
+                                                                {0, 1, 2, 3}, true, false, n_kv_max));
+            }
+        }
+    }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
