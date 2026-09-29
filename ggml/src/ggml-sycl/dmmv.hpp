@@ -24,4 +24,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// true where the XMX (DPAS) mat-vec takes ncols_y activation columns of reordered weights of this type and shape
+bool ggml_sycl_dmmv_dpas_supported(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y);
+
 #endif // GGML_SYCL_DMMV_HPP

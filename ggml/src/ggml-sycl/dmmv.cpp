@@ -2319,6 +2319,7 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
                                                    const int64_t dst_stride, dpct::queue_ptr stream) {
     switch (ncols_y) {
+        case 3: dequantize_mul_mat_vec_dpas_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
         case 4: dequantize_mul_mat_vec_dpas_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
         case 5: dequantize_mul_mat_vec_dpas_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
         case 6: dequantize_mul_mat_vec_dpas_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
@@ -2333,11 +2334,13 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
 // columns (q4_K 17408x5120: 0.94x at 1 column), and DPAS pulls ahead from 4 (1.16x at 4, 1.82x
 // at 8; 5120x17408: 1.50x / 2.29x) where ESIMD pays per column in vector FMAs. Below ~8M weights
 // its 16-row tiles leave the card idle (1024x5120: 0.77x at 4 columns). q5_K's extra high-bit
-// unpacking keeps it behind ESIMD below 8 columns.
-static bool ggml_sycl_dmmv_dpas(const ggml_backend_sycl_context & ctx, ggml_type type, int64_t ncols, int64_t nrows,
-                                int64_t ncols_y) {
-    const auto arch = ggml_sycl_info().devices[ctx.device].hw_info.arch;
-    return g_ggml_sycl_enable_esimd && type == GGML_TYPE_Q4_K && ncols_y >= 4 && ncols_y <= 8 &&
+// unpacking keeps it behind ESIMD below 8 columns. iq4_xs, whose codebook costs ALU per column on
+// ESIMD and MMVQ alike, gains from 3 columns against MMVQ (8704x5120 / 5120x8704 / 34816x5120:
+// 1.06x / 1.36x / 1.21x at 3, 1.26x / 1.68x / 1.51x at 8; 0.91x-1.11x at 2).
+static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
+    const auto arch     = ggml_sycl_info().devices[device].hw_info.arch;
+    const int  min_cols = type == GGML_TYPE_Q4_K ? 4 : type == GGML_TYPE_IQ4_XS ? 3 : 0;
+    return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= 8 &&
            ncols * nrows >= 8 * 1024 * 1024 &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
 }
@@ -2392,6 +2395,19 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder(const void *vx, const float
         });
 }
 
+bool ggml_sycl_dmmv_dpas_supported(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    return ggml_sycl_dmmv_dpas(device, type, ncols, nrows, ncols_y);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(type);
+    GGML_UNUSED(ncols);
+    GGML_UNUSED(nrows);
+    GGML_UNUSED(ncols_y);
+    return false;
+#endif
+}
+
 void ggml_sycl_op_dequantize_mul_mat_vec(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2408,13 +2424,18 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     {
         // reordered weights where the XMX kernel wins take DPAS
         const auto * extra0 = static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra);
-        if (extra0 && extra0->optimized_feature.reorder && ggml_sycl_dmmv_dpas(ctx, src0->type, ne00, row_diff, src1_ncols)) {
+        if (extra0 && extra0->optimized_feature.reorder && ggml_sycl_dmmv_dpas(ctx.device, src0->type, ne00, row_diff, src1_ncols)) {
             GGML_SYCL_DEBUG("%s: XMX mat-vec, %s, %d columns\n", __func__, ggml_type_name(src0->type), (int) src1_ncols);
             ggml_sycl_pool_alloc<sycl::half> src1_f16_a(ctx.pool(), src1_ncols * ne00);
             sycl::half *                     src1_f16 = src1_f16_a.get();
             ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst)(src1_ddf_i, src1_f16, src1_ncols * ne00, stream);
-            dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q4_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
-                                                                   (int) src1_ncols, ne00, dst->ne[0], stream);
+            if (src0->type == GGML_TYPE_IQ4_XS) {
+                dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_IQ4_XS>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
+                                                                         (int) src1_ncols, ne00, dst->ne[0], stream);
+            } else {
+                dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q4_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, ne00, dst->ne[0], stream);
+            }
             return;
         }
     }
