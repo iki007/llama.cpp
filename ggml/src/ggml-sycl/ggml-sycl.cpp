@@ -5814,7 +5814,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     if (!split && use_mul_mat_vec_q && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
         ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols &&
         (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0) &&
-        src1->ne[1] <= esimd_max_cols &&
+        // past the ESIMD range only where the XMX mat-vec takes over (e.g. iq4_xs at 5-8 columns)
+        (src1->ne[1] <= esimd_max_cols ||
+         ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], src1->ne[1])) &&
         ggml_is_contiguous(src1) && should_reorder_tensor(ctx, dst)) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
