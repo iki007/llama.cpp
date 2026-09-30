@@ -52,6 +52,13 @@ struct fa_xmx_args {
     int          bps;      // blocks per split
     size_t       q_nb1, q_nb2, k_nb1, k_nb2, v_nb1, v_nb2, m_nb1;
     float        qscale;   // scale * log2(e)
+    // row chunks of fa_xmx_list_kernel: chunk c holds query rows [c nq_chunk, (c + 1) nq_chunk) and reads only
+    // the spans in its list
+    const int32_t * span_list;   // [n_chunks][list_stride]: live 16-token spans of the chunk, ascending
+    const int32_t * span_count;  // [n_chunks]
+    int             list_stride;
+    int             nq_chunk;
+    int             n_kvh;
 };
 
 // row maxima of an [R][16] block
@@ -281,6 +288,186 @@ template <int RG, bool SKIP> static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx
     }
 }
 
+// Prefill over a sparse mask: work-group (chunk, KV head, split) walks the list of 16-token spans that the chunk's
+// rows attend to, 16 spans per step (one per thread), so the work follows the live share of the mask, not n_kv.
+// Same math as fa_xmx_kernel; a thread without a span in the step contributes -inf scores.
+template <int RG> static ESIMD_INLINE void fa_xmx_list_kernel(const fa_xmx_args a, const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+    namespace xmx     = sycl::ext::intel::esimd::xmx;
+    namespace esimd_x = sycl::ext::intel::experimental::esimd;
+    constexpr int R8 = RG * 8;
+    constexpr int T  = FA_XMX_T;
+    constexpr uint32_t SLM_Q   = 0;
+    constexpr uint32_t SLM_P   = SLM_Q + 16 * R8 * 32;
+    constexpr uint32_t SLM_MAX = SLM_P + T * R8 * 32;
+    constexpr uint32_t SLM_SUM = SLM_MAX + T * R8 * 4;
+    constexpr uint32_t SLM_END = SLM_SUM + T * R8 * 4;
+    slm_init<SLM_END>();
+
+    const properties a16{ alignment<16> };
+
+    const int t     = it.get_local_id(0);
+    const int wg    = it.get_group(0);
+    const int split = wg % a.nsplit;
+    const int kvh   = (wg / a.nsplit) % a.n_kvh;
+    const int chunk = wg / (a.nsplit * a.n_kvh);
+    const int j0    = chunk * a.nq_chunk;
+    const int nq    = a.nq - j0 < a.nq_chunk ? a.nq - j0 : a.nq_chunk;
+    const int M     = a.g * nq;
+    const char * Qc = a.Q + (size_t) j0 * a.q_nb1;
+    const char * Mc = a.mask + (size_t) j0 * a.m_nb1;
+
+    for (int r = t; r < R8; r += T) {
+        simd<float, FA_XMX_D> q = 0.0f;
+        if (r < M) {
+            const int     j  = r / a.g;
+            const int     c  = r - j * a.g;
+            const float * qp = (const float *) (Qc + j * a.q_nb1 + (size_t) (kvh * a.g + c) * a.q_nb2);
+#pragma unroll
+            for (int i = 0; i < FA_XMX_D / 64; ++i) {
+                q.template select<64, 1>(64 * i) = block_load<float, 64>(qp + 64 * i, a16);
+            }
+            q *= a.qscale;
+        }
+        simd<sycl::half, FA_XMX_D> qh = convert<sycl::half>(q);
+#pragma unroll
+        for (int ks = 0; ks < 16; ++ks) {
+            slm_block_store<sycl::half, 16>(SLM_Q + (ks * R8 + r) * 32, qh.template select<16, 1>(16 * ks));
+        }
+    }
+    barrier();
+
+    simd<float, R8>      m = -FLT_MAX;
+    simd<float, R8>      l = 0.0f;
+    simd<float, R8 * 16> o = 0.0f;
+
+    const uint32_t *   Kh     = (const uint32_t *) (a.K + (size_t) kvh * a.k_nb2);
+    const sycl::half * Vh     = (const sycl::half *) (a.V + (size_t) kvh * a.v_nb2);
+    const unsigned     surf_w = FA_XMX_D * sizeof(sycl::half) - 1;
+    const unsigned     surf_h = (unsigned) a.n_kv - 1;
+    esimd_x::config_2d_mem_access<uint32_t, 8, 16, 1>    k_desc(Kh, surf_w, surf_h, (unsigned) a.k_nb1 - 1, 0, 0);
+    esimd_x::config_2d_mem_access<sycl::half, 16, 16, 1> v_desc(Vh, surf_w, surf_h, (unsigned) a.v_nb1 - 1, t * 16, 0);
+
+    const int32_t * list   = a.span_list + (size_t) chunk * a.list_stride;
+    const int       n_live = a.span_count[chunk];
+    const int       n_grp  = (n_live + T - 1) / T;
+    const int       gps    = (n_grp + a.nsplit - 1) / a.nsplit;
+    const int       g0     = split * gps;
+    const int       g1     = g0 + gps < n_grp ? g0 + gps : n_grp;
+    const simd<int32_t, T> lane(0, 1);
+    for (int gi = g0; gi < g1; ++gi) {
+        // the list rows are padded to whole steps, so the last step reads past n_live inside its own row
+        const simd<int32_t, T> sl    = block_load<int32_t, T>(list + gi * T, a16);
+        const simd_mask<T>     valid = (lane + gi * T) < n_live;
+        const bool             mine  = gi * T + t < n_live;
+        const int              my_tok = mine ? (int) sl[t] * 16 : 0;
+
+        simd<float, R8 * 16> s = -INFINITY;
+        if (mine) {
+            s = 0.0f;
+            k_desc.set_y(my_tok);
+#pragma unroll
+            for (int ks = 0; ks < 16; ++ks) {
+                k_desc.set_x(ks * 8);
+                simd<uint32_t, 128>   kb = esimd_x::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(k_desc);
+                simd<sycl::half, 256> b  = kb.template bit_cast_view<sycl::half>().read();
+#pragma unroll
+                for (int rg = 0; rg < RG; ++rg) {
+                    simd<sycl::half, 128> qa = slm_block_load<sycl::half, 128>(SLM_Q + (ks * R8 + rg * 8) * 32);
+                    simd<float, 128>      c  = s.template select<128, 1>(rg * 128);
+                    s.template select<128, 1>(rg * 128) = xmx::dpas<8, 8, float, float>(c, b, qa);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R8; ++r) {
+                if (r < M) {
+                    const sycl::half * mp = (const sycl::half *) (Mc + (r / a.g) * a.m_nb1) + my_tok;
+                    simd<float, 16>    mk = convert<float>(block_load<sycl::half, 16>(mp, a16));
+                    s.template select<16, 1>(16 * r) += mk * 1.44269504088896341f;
+                }
+            }
+        }
+
+        slm_block_store<float, R8>(SLM_MAX + t * R8 * 4, fa_xmx_row_max<R8>(s));
+        barrier();
+        simd<float, R8> bm = -FLT_MAX;
+#pragma unroll
+        for (int tt = 0; tt < T; ++tt) {
+            bm = max(bm, slm_block_load<float, R8>(SLM_MAX + tt * R8 * 4));
+        }
+        const simd<float, R8> m_new = max(m, bm);
+        const simd<float, R8> alpha = exp2(m - m_new);
+        m                           = m_new;
+#pragma unroll
+        for (int r = 0; r < R8; ++r) {
+            s.template select<16, 1>(16 * r) = exp2(s.template select<16, 1>(16 * r) - m_new[r]);
+        }
+        slm_block_store<float, R8>(SLM_SUM + t * R8 * 4, fa_xmx_row_sum<R8>(s));
+        simd<sycl::half, R8 * 16> ph = convert<sycl::half>(s);
+#pragma unroll
+        for (int rg = 0; rg < RG; ++rg) {
+            slm_block_store<sycl::half, 128>(SLM_P + (t * R8 + rg * 8) * 32, ph.template select<128, 1>(rg * 128));
+        }
+        barrier();
+
+        simd<float, R8> bs = 0.0f;
+#pragma unroll
+        for (int tt = 0; tt < T; ++tt) {
+            bs += slm_block_load<float, R8>(SLM_SUM + tt * R8 * 4);
+        }
+        l = l * alpha + bs;
+#pragma unroll
+        for (int r = 0; r < R8; ++r) {
+            o.template select<16, 1>(16 * r) *= alpha[r];
+        }
+        auto pv = [&](int ts) {
+            v_desc.set_y((int) sl[ts] * 16);
+            simd<sycl::half, 256> vb = esimd_x::lsc_load_2d<sycl::half, 16, 16, 1, false, true>(v_desc);
+#pragma unroll
+            for (int rg = 0; rg < RG; ++rg) {
+                simd<sycl::half, 128> pa = slm_block_load<sycl::half, 128>(SLM_P + (ts * R8 + rg * 8) * 32);
+                simd<float, 128>      c  = o.template select<128, 1>(rg * 128);
+                o.template select<128, 1>(rg * 128) = xmx::dpas<8, 8, float, float>(c, vb, pa);
+            }
+        };
+        if (valid.all()) {
+#pragma unroll
+            for (int ts = 0; ts < T; ++ts) {
+                pv(ts);
+            }
+        } else {
+#pragma unroll
+            for (int ts = 0; ts < T; ++ts) {
+                if (valid[ts]) {
+                    pv(ts);
+                }
+            }
+        }
+    }
+
+    const size_t slice = ((size_t) chunk * a.n_kvh + kvh) * a.nsplit + split;
+#pragma unroll
+    for (int r = 0; r < R8; ++r) {
+        block_store<float, 16>(a.part_o + (slice * R8 + r) * FA_XMX_D + t * 16, o.template select<16, 1>(16 * r));
+    }
+    if (t == 0) {
+        simd<float, R8 * 2> ml;
+        ml.template select<R8, 2>(0) = m;
+        ml.template select<R8, 2>(1) = l;
+#pragma unroll
+        for (int i = 0; i < R8 * 2 / 16; ++i) {
+            block_store<float, 16>(a.part_ml + slice * R8 * 2 + 16 * i, ml.template select<16, 1>(16 * i));
+        }
+    }
+}
+
+template <int RG> static void fa_xmx_list_launch(const fa_xmx_args & a, int n_chunks, dpct::queue_ptr stream) {
+    const sycl::nd_range<1> range(sycl::range<1>((size_t) n_chunks * a.n_kvh * a.nsplit * FA_XMX_T),
+                                  sycl::range<1>(FA_XMX_T));
+    auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_list_kernel<RG>(a, it); };
+    stream->parallel_for(range, fa_xmx_grf256<decltype(kern)>{ kern });
+}
+
 template <int RG, bool SKIP> static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, dpct::queue_ptr stream) {
     const sycl::nd_range<1> range(sycl::range<1>((size_t) n_kvh * a.nsplit * FA_XMX_T), sycl::range<1>(FA_XMX_T));
     auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<RG, SKIP>(a, it); };
@@ -299,6 +486,67 @@ template <bool SKIP> static void fa_xmx_launch_rg(int RG, const fa_xmx_args & a,
         case 8: fa_xmx_launch<8, SKIP>(a, n_kvh, stream); break;
         default: GGML_ABORT("XMX flash attention: %d row groups", RG);
     }
+}
+
+static void fa_xmx_list_launch_rg(int RG, const fa_xmx_args & a, int n_chunks, dpct::queue_ptr stream) {
+    switch (RG) {
+        case 1: fa_xmx_list_launch<1>(a, n_chunks, stream); break;
+        case 2: fa_xmx_list_launch<2>(a, n_chunks, stream); break;
+        case 3: fa_xmx_list_launch<3>(a, n_chunks, stream); break;
+        case 4: fa_xmx_list_launch<4>(a, n_chunks, stream); break;
+        case 5: fa_xmx_list_launch<5>(a, n_chunks, stream); break;
+        case 6: fa_xmx_list_launch<6>(a, n_chunks, stream); break;
+        case 7: fa_xmx_list_launch<7>(a, n_chunks, stream); break;
+        case 8: fa_xmx_list_launch<8>(a, n_chunks, stream); break;
+        default: GGML_ABORT("XMX flash attention: %d row groups", RG);
+    }
+}
+
+// the 16-token spans that any row of each chunk attends to (a mask entry above -inf), ascending; one work-group per
+// chunk scans its rows in steps of WG spans and compacts the live ones
+static void fa_xmx_span_lists(const char * mask, size_t m_nb1, int nq, int nq_chunk, int n_chunks, int n_span,
+                              int list_stride, int32_t * list, int32_t * count, dpct::queue_ptr stream) {
+    constexpr int WG = 256;
+    stream->parallel_for(sycl::nd_range<1>((size_t) n_chunks * WG, WG), [=](sycl::nd_item<1> it) {
+        const int c   = it.get_group(0);
+        const int tid = it.get_local_id(0);
+        const int j0  = c * nq_chunk;
+        const int nqc = sycl::min(nq_chunk, nq - j0);
+        int       n   = 0;
+        for (int s0 = 0; s0 < n_span; s0 += WG) {
+            const int s    = s0 + tid;
+            int       live = 0;
+            if (s < n_span) {
+                for (int j = 0; j < nqc && !live; ++j) {
+                    // two 16-byte loads: mask rows are only known to be 16-byte aligned
+                    const sycl::vec<uint16_t, 8> * mv = (const sycl::vec<uint16_t, 8> *) (mask + (size_t) (j0 + j) * m_nb1) + 2 * s;
+                    const sycl::vec<uint16_t, 8>   m0 = mv[0], m1 = mv[1];
+                    for (int i = 0; i < 8; ++i) {
+                        live |= m0[i] != 0xFC00 || m1[i] != 0xFC00;  // f16 -inf
+                    }
+                }
+            }
+            const int pos = sycl::exclusive_scan_over_group(it.get_group(), live, sycl::plus<int>());
+            if (live) {
+                list[(size_t) c * list_stride + n + pos] = s;
+            }
+            n += sycl::reduce_over_group(it.get_group(), live, sycl::plus<int>());
+        }
+        if (tid == 0) {
+            count[c] = n;
+        }
+    });
+}
+
+// prefill-sized batches (more rows than GGML_SYCL_FA_XMX_MAX_Q) over a q8_0 cache with a sparse mask (QSA sets the
+// n_kv_max hint) and at least GGML_SYCL_FA_XMX_LIST_MIN_KV cells: row chunks walk their own live spans
+static bool fa_xmx_use_list(const ggml_tensor * dst, int max_q) {
+    static const int min_kv = ggml_sycl_get_env("GGML_SYCL_FA_XMX_LIST_MIN_KV", 32768);
+    static const int skip   = ggml_sycl_get_env("GGML_SYCL_FA_XMX_SKIP", 1);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    return skip && min_kv > 0 && K->type == GGML_TYPE_Q8_0 && Q->ne[1] > max_q &&
+           ggml_get_op_params_i32(dst, 4) > 0 && K->ne[1] >= min_kv;
 }
 
 #endif // GGML_SYCL_HAS_DPAS
@@ -342,7 +590,8 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(int device, const ggml_tensor * dst)
     const int64_t g  = Q->ne[2] / K->ne[2];
     const int64_t nq = Q->ne[1];
     // rows beyond 64 / g run as further row chunks, each reading the cache once more
-    if (nq > max_q || g > 64 || K->ne[1] % FA_XMX_BK != 0 || mask->ne[0] < K->ne[1] || mask->ne[1] < nq) {
+    if ((nq > max_q && !fa_xmx_use_list(dst, max_q)) || g > 64 || K->ne[1] % FA_XMX_BK != 0 || mask->ne[0] < K->ne[1] ||
+        mask->ne[1] < nq) {
         return false;
     }
     // 2D block loads: 64-byte aligned head slices, 16-byte aligned row pitch of at least 64 bytes (the f16 copy
@@ -393,11 +642,15 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     // that reads every span, since the skipping build changed greedy outputs of f16 models at short context even
     // with skipping off (cause not found)
     static const int skip   = ggml_sycl_get_env("GGML_SYCL_FA_XMX_SKIP", 1);
+    static const int max_q  = ggml_sycl_get_env("GGML_SYCL_FA_XMX_MAX_Q", 8);
     const bool       q8     = K->type == GGML_TYPE_Q8_0;
     const int        n_span = n_kv / 16;
+    // prefill: each row chunk walks its own list of live spans; the chunks together touch nearly every span, so the
+    // whole cache is converted
+    const bool list = q8 && fa_xmx_use_list(dst, max_q);
     ggml_sycl_pool_alloc<uint8_t> span_live(ctx.pool());
     uint8_t * live = q8 ? span_live.alloc(n_span) : nullptr;
-    if (q8 && skip) {
+    if (q8 && skip && !list) {
         const char * mp    = (const char *) mask->data;
         const size_t m_nb1 = mask->nb[1];
         stream->parallel_for(sycl::range<1>(n_span), [=](sycl::id<1> id) {
@@ -456,8 +709,84 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
         k_nb2  = v_nb2 = (size_t) n_kv * k_nb1;
     }
 
-    // split the cache so that about GGML_SYCL_FA_XMX_WGS work-groups run
     static const int target_wgs = ggml_sycl_get_env("GGML_SYCL_FA_XMX_WGS", 64);
+    const size_t     o_nb1      = dst->nb[1] / sizeof(float);
+    const size_t     o_nb2      = dst->nb[2] / sizeof(float);
+
+    if (list) {
+        const int list_stride = (n_span + FA_XMX_T - 1) / FA_XMX_T * FA_XMX_T;
+        ggml_sycl_pool_alloc<int32_t> span_list(ctx.pool(), (size_t) n_chunks * list_stride);
+        ggml_sycl_pool_alloc<int32_t> span_count(ctx.pool(), n_chunks);
+        fa_xmx_span_lists((const char *) mask->data, mask->nb[1], nq, nq_chunk, n_chunks, n_span, list_stride,
+                          span_list.get(), span_count.get(), stream);
+
+        // enough work-groups from the chunks alone: split a chunk's list only when there are few chunks
+        const int ns = std::max(1, target_wgs / (n_kvh * n_chunks));
+        const int R8 = R8_max;
+        ggml_sycl_pool_alloc<float> lpart_o(ctx.pool(), (size_t) n_chunks * n_kvh * ns * R8 * FA_XMX_D);
+        ggml_sycl_pool_alloc<float> lpart_ml(ctx.pool(), (size_t) n_chunks * n_kvh * ns * R8 * 2);
+
+        fa_xmx_args a = {};
+        a.Q           = (const char *) Q->data;
+        a.K           = K_data;
+        a.V           = V_data;
+        a.mask        = (const char *) mask->data;
+        a.part_o      = lpart_o.get();
+        a.part_ml     = lpart_ml.get();
+        a.g           = g;
+        a.nq          = nq;
+        a.n_kv        = n_kv;
+        a.nsplit      = ns;
+        a.q_nb1       = Q->nb[1];
+        a.q_nb2       = Q->nb[2];
+        a.k_nb1       = k_nb1;
+        a.k_nb2       = k_nb2;
+        a.v_nb1       = v_nb1;
+        a.v_nb2       = v_nb2;
+        a.m_nb1       = mask->nb[1];
+        a.qscale      = scale * 1.44269504088896341f;
+        a.span_list   = span_list.get();
+        a.span_count  = span_count.get();
+        a.list_stride = list_stride;
+        a.nq_chunk    = nq_chunk;
+        a.n_kvh       = n_kvh;
+        fa_xmx_list_launch_rg(R8 / 8, a, n_chunks, stream);
+
+        const float * po = lpart_o.get();
+        const float * pml = lpart_ml.get();
+        float *       out = (float *) dst->data;
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) n_chunks * n_kvh * R8 * FA_XMX_D), sycl::range<1>(FA_XMX_D)),
+            [=](sycl::nd_item<1> it) {
+                const int row = it.get_group(0);
+                const int r   = row % R8;
+                const int kvh = (row / R8) % n_kvh;
+                const int c   = row / (R8 * n_kvh);
+                const int j0  = c * nq_chunk;
+                if (r >= g * sycl::min(nq_chunk, nq - j0)) {
+                    return;
+                }
+                const int    d    = it.get_local_id(0);
+                const size_t base = ((size_t) c * n_kvh + kvh) * ns;
+                float        mx   = -FLT_MAX;
+                for (int s = 0; s < ns; ++s) {
+                    mx = sycl::fmax(mx, pml[((base + s) * R8 + r) * 2]);
+                }
+                float num = 0.0f, den = 0.0f;
+                for (int s = 0; s < ns; ++s) {
+                    const size_t i = (base + s) * R8 + r;
+                    const float  w = sycl::exp2(pml[i * 2] - mx);
+                    num += w * po[i * FA_XMX_D + d];
+                    den += w * pml[i * 2 + 1];
+                }
+                const int j = r / g;
+                const int h = r - j * g;
+                out[(size_t) (j0 + j) * o_nb2 + (size_t) (kvh * g + h) * o_nb1 + d] = num / den;
+            });
+        return;
+    }
+
+    // split the cache so that about GGML_SYCL_FA_XMX_WGS work-groups run
     int nsplit = std::max(1, std::min(nblk, (target_wgs + n_kvh - 1) / n_kvh));
     const int bps = (nblk + nsplit - 1) / nsplit;
     nsplit        = (nblk + bps - 1) / bps;
@@ -486,8 +815,6 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     const float * po    = part_o.get();
     const float * pml   = part_ml.get();
-    const size_t  o_nb1 = dst->nb[1] / sizeof(float);
-    const size_t  o_nb2 = dst->nb[2] / sizeof(float);
     for (int j0 = 0; j0 < nq; j0 += nq_chunk) {
         const int nqc = std::min(nq_chunk, nq - j0);
         const int M   = g * nqc;
