@@ -11747,6 +11747,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // prefill-sized batches over a sparse q8_0 cache: row chunks walk their own lists of live spans (SYCL takes them
+    // from GGML_SYCL_FA_XMX_LIST_MIN_KV cells; lower it to reach these sizes)
+    for (int nb : { 9, 64, 100, 512 }) {
+        for (int n_kv_max : { 16, 1000 }) {
+            for (int kv : { 4096, 4352 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                                {0, 1, 2, 3}, true, false, n_kv_max));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {16, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                        {0, 1, 2, 3}, true, false, 100));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                        {0, 2, 1, 3}, true, false, 100));
+    }
     // the KV cache's layout: K and V heads interleaved per token (permute 0,2,1,3)
     for (int nb : { 1, 5 }) {
         for (int kv : { 512, 4096 }) {
