@@ -61,6 +61,10 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 2,  64,  64)
 
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(192, 128,  8, 256, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(192, 128, 16, 256, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(192, 128, 32, 256, 2,  64,  64)
+
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
@@ -70,6 +74,8 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
     // 4 query rows x 6 query heads per tile: GQA-6 verify batches of up to 4 tokens
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  64,  64)
+
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2,  64,  64)
 
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
@@ -128,6 +134,10 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp32(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 16, 128, 3,  32, 128)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 2,  64,  64)
 
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(192, 128,  8, 256, 2,  32,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(192, 128, 16, 256, 2,  32,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(192, 128, 32, 256, 2,  32,  64)
+
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  32,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
@@ -137,6 +147,8 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp32(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32,  64)
     // 4 query rows x 6 query heads per tile: GQA-6 verify batches of up to 4 tokens
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 2,  32,  64)
+
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2,  32,  64)
 
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  2, 128, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
@@ -1252,7 +1264,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
     }
 
     {
-        constexpr int cols_per_block = ncols2*2;
+        // there is no config with 64 columns: a 32-head tile holds one query row
+        constexpr int cols_per_block = ncols2 == 32 ? 32 : ncols2*2;
         const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
         const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
         launch_fattn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, warp_size, type_KV>(ctx, dst, nwarps, nbytes_shared, nbatch_fa);
@@ -1306,7 +1319,27 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
         }
     }
 
-    if constexpr (DV <= 256) {
+    if constexpr (DKQ == 192) { // MiMo-V2.5: GQA 8 or 16
+        if (use_gqa_opt && gqa_ratio % 16 == 0) {
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
+            return;
+        }
+        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
+            return;
+        }
+        GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
+    }
+
+    if constexpr (DKQ == 320) { // Mistral Small 4: GQA 32
+        if (use_gqa_opt && gqa_ratio % 32 == 0) {
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 32, use_logit_softcap, type_KV>(ctx, dst);
+            return;
+        }
+        GGML_ABORT("flash-attn tile (320/256): expected GQA ratio multiple of 32");
+    }
+
+    if constexpr (DV <= 256 && DKQ == DV) {
         if constexpr (DKQ == 256 && DV == 256) {
             // GQA ratios that are a multiple of 6 but not of 4 have no matching tile below; up to 4
             // query rows (decode and DFlash verify) use one 6-head tile per KV head instead.
@@ -1387,7 +1420,9 @@ extern DECL_FATTN_TILE_CASE( 80,  80);
 extern DECL_FATTN_TILE_CASE( 96,  96);
 extern DECL_FATTN_TILE_CASE(112, 112);
 extern DECL_FATTN_TILE_CASE(128, 128);
+extern DECL_FATTN_TILE_CASE(192, 128);
 extern DECL_FATTN_TILE_CASE(256, 256);
+extern DECL_FATTN_TILE_CASE(320, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
 
