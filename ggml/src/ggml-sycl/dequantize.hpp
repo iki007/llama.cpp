@@ -1616,7 +1616,7 @@ dequantize_block_iq1_m(const void *__restrict__ vx, dst_t *__restrict__ yy,
 
 template <typename dst_t>
 __dpct_inline__ static void
-dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy,
+dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy, int64_t nb32,
                         const sycl::nd_item<3> &item_ct1) {
 
     const int64_t i = item_ct1.get_group(2);
@@ -1625,6 +1625,10 @@ dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy,
     const int64_t tid = item_ct1.get_local_id(2);
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
+    // the last group can be shorter than QK_K
+    if (8*i + ib >= nb32) {
+        return;
+    }
     dst_t * y = yy + i*QK_K + 32*ib + 4*il;
     const uint8_t  * q4 = x[ib].qs + 4*il;
     const float d = (float)x[ib].d;
@@ -1822,7 +1826,7 @@ static void dequantize_block_iq3_s_reorder(const void * __restrict__ vx, dst_t *
 }
 
 template<typename dst_t>
-static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                    const sycl::nd_item<3> &item_ct1) {
     // auto                item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t       i        = item_ct1.get_group(2);
@@ -1831,6 +1835,10 @@ static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restr
     const int64_t    tid = item_ct1.get_local_id(2);
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
+    // the last group can be shorter than QK_K
+    if (8*i + ib >= nb32) {
+        return;
+    }
     dst_t * y = yy + i*QK_K + 32*ib + 4*il;
     const uint8_t  * q4 = x[ib].qs + 4*il;
     const float d = ggml_sycl_e8m0_to_fp32(x[ib].e);

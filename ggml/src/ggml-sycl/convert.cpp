@@ -564,6 +564,7 @@ static void dequantize_row_iq4_xs_sycl(const void *vx, dst_t *y, const int64_t k
 template <typename dst_t>
 static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k,
                                        dpct::queue_ptr stream) {
+    const int64_t nb32 = k / QK4_NL;
     const int64_t nb = (k + QK_K - 1) / QK_K;
       {
             dpct::has_capability_or_fail(stream->get_device(),
@@ -575,7 +576,7 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
                                             sycl::range<3>(1, 1, 32),
                                         sycl::range<3>(1, 1, 32)),
                       [=](sycl::nd_item<3> item_ct1) {
-                            dequantize_block_iq4_nl(vx, y, item_ct1);
+                            dequantize_block_iq4_nl(vx, y, nb32, item_ct1);
                       });
             });
       }
@@ -583,11 +584,12 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
 
 template <typename dst_t>
 static void dequantize_row_mxfp4_sycl(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    const int64_t nb32 = k / QK_MXFP4;
     const int nb = (k + QK_K - 1) / QK_K;
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
         [=](sycl::nd_item<3> item_ct1) {
-            dequantize_block_mxfp4(vx, y, item_ct1);
+            dequantize_block_mxfp4(vx, y, nb32, item_ct1);
         });
 }
 
