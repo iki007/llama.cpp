@@ -205,6 +205,16 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+        case 192:
+            if (V->ne[0] != 128 || !gqa_opt_applies || gqa_ratio % 8 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
+        case 320:
+            if (V->ne[0] != 256 || !gqa_opt_applies || gqa_ratio % 32 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
         case 576:
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
@@ -248,8 +258,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes.
     // BF16 is excluded: the VEC kernel has no BF16 template (it needs GGML_SYCL_FA_ALL_QUANTS for non-F16/Q4_0/Q8_0).
     const bool has_bf16 = (K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16);
+    // The VEC kernel has no instance with different K and V head sizes (192/128, 320/256) either.
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0
-        && !has_bf16;
+        && !has_bf16 && K->ne[0] == V->ne[0];
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
