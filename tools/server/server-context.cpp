@@ -3632,6 +3632,10 @@ private:
                         }
                     }
 
+                    if (slot.can_speculate()) {
+                        common_speculative_set_pos_end(spec.get(), slot.id, input_tokens.pos_next());
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be

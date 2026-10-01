@@ -87,6 +87,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// optionally call before the prompt is processed: pos_end is the position that follows the prompt
+// an implementation can then skip the prompt rows that its draft never reads
+void common_speculative_set_pos_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 

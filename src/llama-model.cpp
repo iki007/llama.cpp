@@ -2986,6 +2986,19 @@ int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
 
+int32_t llama_model_n_swa_all(const llama_model * model) {
+    const auto & hparams = model->hparams;
+    if (hparams.swa_type == LLAMA_SWA_TYPE_NONE) {
+        return 0;
+    }
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (!hparams.is_swa(il)) {
+            return 0;
+        }
+    }
+    return (int32_t) hparams.n_swa;
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }
