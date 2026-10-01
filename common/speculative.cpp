@@ -204,6 +204,9 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    // (optional) position that follows the prompt, known before process() sees the prompt
+    virtual void set_pos_end(llama_seq_id /*seq_id*/, llama_pos /*pos_end*/) {}
+
     virtual bool process(const common_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
@@ -1015,6 +1018,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // window of a draft whose layers all use sliding-window attention, else 0
+    int32_t n_swa_all = 0;
+    // per seq: prompt rows before this position are not injected (the draft never reads them)
+    std::vector<llama_pos> pos_inject;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1051,6 +1059,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // the DSpark ring cache is not handled here
+        n_swa_all = is_dspark ? 0 : llama_model_n_swa_all(model_dft);
+        pos_inject.assign(n_seq, 0);
+
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
@@ -1069,6 +1081,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        LOG_INF("%s: - prompt rows injected: %s\n", __func__,
+                n_swa_all > 0 ? ("last " + std::to_string(n_swa_all + block_size)).c_str() : "all");
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1141,6 +1155,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // the limit is for prompt rows only (a context shift moves later rows below it)
+        pos_inject[seq_id] = 0;
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1152,6 +1169,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    void set_pos_end(llama_seq_id seq_id, llama_pos pos_end) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        // the first draft block starts at pos_end and its layers read at most n_swa_all cells back
+        pos_inject[seq_id] = n_swa_all > 0 ? pos_end - n_swa_all - block_size : 0;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -1203,7 +1228,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            int32_t offset = 0;
+            while (offset < n_rows && batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0] < pos_inject[seq_id]) {
+                offset++;
+            }
+
+            for (; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather target features per extract layer; the fused decode encodes and
@@ -2865,6 +2895,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_pos_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_pos_end(seq_id, pos_end);
     }
 }
 
