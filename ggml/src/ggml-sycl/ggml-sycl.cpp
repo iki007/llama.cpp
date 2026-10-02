@@ -5900,6 +5900,26 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
     int64_t min_compute_capability = INT_MAX;
 
+    // [k, n, b] activations against one 2D weight are b independent groups of columns. As one [k, n*b] batch they
+    // take a single launch of the multi-column kernels instead of one per group (the recurrent layers with several
+    // sequences decoding together: Qwen3.8-27B ssm_out, 4 x 8 columns, 258 us in 4 launches).
+    if (!split && dst->op == GGML_OP_MUL_MAT && src1->ne[2] > 1 && src1->ne[3] == 1 && src1->ne[1] * src1->ne[2] <= 32 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && dst->ne[1] == src1->ne[1] &&
+        dst->ne[2] == src1->ne[2] && dst->ne[3] == 1) {
+        ggml_tensor src1_f = *src1;
+        src1_f.ne[1] = src1->ne[1] * src1->ne[2];
+        src1_f.ne[2] = 1;
+        src1_f.nb[2] = src1_f.nb[3] = src1_f.ne[1] * src1->nb[1];
+        ggml_tensor dst_f = *dst;
+        dst_f.ne[1]  = dst->ne[1] * dst->ne[2];
+        dst_f.ne[2]  = 1;
+        dst_f.nb[2]  = dst_f.nb[3] = dst_f.ne[1] * dst->nb[1];
+        dst_f.src[1] = &src1_f;
+        ggml_sycl_mul_mat(ctx, src0, &src1_f, &dst_f);
+        return;
+    }
+
     // 17 to 32 columns of a type with no wide XMX kernel: chunks of 8 columns keep the decode kernels, where
     // dequantize + GEMM costs 2-30x more per call (several sequences decoding together). Qwen3.8-27B with 4
     // sessions, per call: a q4_0 draft head 23.9 ms -> 4 x 0.7, q3_K 0.81 ms -> 4 x 0.11, iq3_s 1.34 -> 4 x 0.13.
