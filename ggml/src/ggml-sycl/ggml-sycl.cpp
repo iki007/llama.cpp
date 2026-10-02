@@ -781,7 +781,8 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_IQ3_XXS:
-            case GGML_TYPE_IQ2_S:{
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_MXFP4:{
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
@@ -5847,6 +5848,12 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_S:
+            break;
+        case GGML_TYPE_MXFP4:
+            // The MXFP4 reorder kernels use 8-byte vector loads, so every expert slice must stay aligned.
+            if (src0->nb[2] % 16 != 0 || (uintptr_t) src0->data % 16 != 0) {
+                return;
+            }
             break;
         default:
             return;
