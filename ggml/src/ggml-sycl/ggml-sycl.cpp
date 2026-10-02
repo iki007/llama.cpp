@@ -5796,10 +5796,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // where MMVQ is plainly faster. On an Arc Pro B70 at k=17408 m=5120, one column costs
     // 220.5 us through DMMV against 129.8 us through MMVQ for Q5_1, and 184.7 against
     // 107.6 for Q4_1 - in both cases slower at one column than the same weights cost at
-    // two. Q5_0 is left on DMMV: it gains only 8-11% and MMVQ's q8_1 activations push
-    // test-backend-ops past its 5e-4 threshold on the single-block k=32 case.
-    if (!g_ggml_sycl_prioritize_dmmv && use_mul_mat_vec_q && src0->type != GGML_TYPE_Q5_0 &&
-        !ggml_sycl_supports_reorder_mmvq(src0->type)) {
+    // two. Q5_0 is left on DMMV: it gains only 8-11%.
+    // With one column the error of the offset term is the same in every row, so this route
+    // quantizes with the CPU's block sum (quantize_q8_1_qsum).
+    const bool mmvq_single_col = !g_ggml_sycl_prioritize_dmmv && use_dequantize_mul_mat_vec && use_mul_mat_vec_q &&
+        src0->type != GGML_TYPE_Q5_0 && !ggml_sycl_supports_reorder_mmvq(src0->type);
+    if (mmvq_single_col) {
         use_dequantize_mul_mat_vec = false;
     }
 
@@ -5855,6 +5857,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+        } else if (mmvq_single_col) {
+            ggml_sycl_op_mul_mat<quantize_q8_1_qsum>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
