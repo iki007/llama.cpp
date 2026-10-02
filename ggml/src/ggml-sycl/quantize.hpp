@@ -117,6 +117,40 @@ template <int ElementsPerWI> struct quantize_q8_1 {
     }
 };
 
+// quantize_q8_1 with the block sum the CPU stores, d * sum(qs): it cancels the activation rounding in the offset term of q4_1 and q5_1
+template <int ElementsPerWI> struct quantize_q8_1_qsum {
+    __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int kx_padded,
+                                    const sycl::nd_item<1> & it) const {
+        auto subgroup_id = it.get_group(0);
+        auto wi_id       = it.get_local_id(0);
+
+        const int num_blocks_per_row = kx / QK8_1;
+        auto      row                = subgroup_id / num_blocks_per_row;
+        const int pitch              = kx_padded / QK8_1;
+
+        sycl::vec<int8_t, ElementsPerWI> quantized_values;
+        float                            d   = 0.0f;
+        float                            sum = 0.0f;
+        quantize_q8_1_impl<ElementsPerWI>(x, quantized_values, d, sum, it);
+
+        int isum = 0;
+#pragma unroll(ElementsPerWI)
+        for (int i = 0; i < ElementsPerWI; i++) {
+            isum += quantized_values[i];
+        }
+        sum = d * sycl::reduce_over_group(it.get_sub_group(), isum, sycl::plus<int>());
+
+        block_q8_1 * quant_ptr = (block_q8_1 *) q8_tensor;
+        auto         block_id  = subgroup_id % num_blocks_per_row + row * pitch;
+
+        int8_t * qs                                               = &(quant_ptr[block_id].qs[wi_id * ElementsPerWI]);
+        *reinterpret_cast<sycl::vec<int8_t, ElementsPerWI> *>(qs) = quantized_values;
+        if (wi_id == 0) {
+            quant_ptr[block_id].ds = sycl::half2(sycl::half(d), sycl::half(sum));
+        }
+    }
+};
+
 template <template <int> typename quantize_f>
 void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int ky, const int kx_padded,
                             dpct::queue_ptr stream) {
