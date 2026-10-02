@@ -20,6 +20,7 @@
 #define GGML_SYCL_HAS_DPAS
 
 constexpr int GGML_SYCL_DPAS_ROWS = 16;  // DPAS execution size on Xe2: output rows per tile
+constexpr int GGML_SYCL_DPAS_MAX_COLS = 32;  // mat-vec columns per launch: 4 DPAS groups of 8
 
 template <ggml_type T> struct dpas_tile_traits;
 
