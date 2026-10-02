@@ -5900,6 +5900,33 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
     int64_t min_compute_capability = INT_MAX;
 
+    // 17 to 32 columns of a type with no wide XMX kernel: chunks of 8 columns keep the decode kernels, where
+    // dequantize + GEMM costs 2-30x more per call (several sequences decoding together). Qwen3.8-27B with 4
+    // sessions, per call: a q4_0 draft head 23.9 ms -> 4 x 0.7, q3_K 0.81 ms -> 4 x 0.11, iq3_s 1.34 -> 4 x 0.13.
+    const int64_t ncols_y = src1->ne[1];
+    if (!split && !g_ggml_sycl_prioritize_dmmv && dst->op == GGML_OP_MUL_MAT && ncols_y > MMVQ_MAX_BATCH_SIZE &&
+        ncols_y <= 32 && ggml_sycl_supports_reorder_mmvq(src0->type) && should_reorder_tensor(ctx, dst, ncols_y) &&
+        !ggml_sycl_in_compute_buffer(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+        ggml_is_contiguous(dst) && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        ggml_get_op_params_i32(dst, 0) == GGML_PREC_DEFAULT &&
+        !ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], ncols_y)) {
+        for (int64_t c0 = 0; c0 < ncols_y; c0 += 8) {
+            const int64_t nc = std::min<int64_t>(8, ncols_y - c0);
+            ggml_tensor src1_c = *src1;
+            src1_c.ne[1] = nc;
+            src1_c.nb[2] = src1_c.nb[3] = nc * src1->nb[1];
+            src1_c.data  = (char *) src1->data + c0 * src1->nb[1];
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[1]  = nc;
+            dst_c.nb[2]  = dst_c.nb[3] = nc * dst->nb[1];
+            dst_c.data   = (char *) dst->data + c0 * dst->nb[1];
+            dst_c.src[1] = &src1_c;
+            ggml_sycl_mul_mat(ctx, src0, &src1_c, &dst_c);
+        }
+        return;
+    }
+
     if (split) {
         ggml_backend_sycl_split_buffer_type_context * buft_ctx =
             (ggml_backend_sycl_split_buffer_type_context *) src0->buffer->buft->context;
