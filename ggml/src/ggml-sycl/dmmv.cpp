@@ -2311,6 +2311,115 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
     });
 }
 
+// More than 8 columns: DPAS repeats over at most 8 A rows, so one dequantized B operand feeds NG dpas<8, 8> calls,
+// one per group of 8 columns. A column past ncols_y repeats the last one; its sums are not written.
+template <ggml_type T, int NG, int TPW>
+ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                                   const int nrows, const int ncols_y, const int64_t y_stride,
+                                                   const int64_t dst_stride, sycl::local_accessor<float, 1> lmem,
+                                                   const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    using traits  = dpas_tile_traits<T>;
+    constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
+    constexpr int NC   = 8;
+
+    const int    nb_row = ncols / QK_K;
+    const size_t nb     = (size_t) nrows * nb_row;
+    const int    tid    = it.get_local_id(0);
+    const int    row0   = it.get_group(0) * ROWS;
+
+    // rows past the end read the last row; their sums are not written
+    simd<uint32_t, ROWS> rows(row0, 1);
+    rows.merge(simd<uint32_t, ROWS>(nrows - 1), rows >= (uint32_t) nrows);
+    const simd<uint32_t, ROWS> row_blk = rows * (uint32_t) nb_row;
+
+    // acc[g][c*16 + n]: column g*8 + c, row row0 + n
+    simd<float, NC * ROWS> acc[NG];
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        acc[g] = 0.0f;
+    }
+    for (int ib = tid; ib < nb_row; ib += TPW) {
+        const sycl::half * yb = y + (size_t) ib * QK_K;
+        traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
+#pragma unroll
+            for (int g = 0; g < NG; ++g) {
+                simd<sycl::half, NC * 16> a;
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    const int col = g * NC + c < ncols_y ? g * NC + c : ncols_y - 1;
+                    a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + col * y_stride + koff);
+                }
+                acc[g] = xmx::dpas<8, NC, float, float>(acc[g], b, a);
+            }
+        });
+    }
+
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+#pragma unroll
+        for (int i = 0; i < NC * ROWS; ++i) {
+            lmem[(tid * NG + g) * NC * ROWS + i] = acc[g][i];
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (tid == 0) {
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+#pragma unroll
+            for (int t = 1; t < TPW; ++t) {
+#pragma unroll
+                for (int i = 0; i < NC * ROWS; ++i) {
+                    acc[g][i] += lmem[(t * NG + g) * NC * ROWS + i];
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const int col = g * NC + c;
+                if (col >= ncols_y) {
+                    continue;
+                }
+                if (row0 + ROWS <= nrows) {
+                    block_store<float, ROWS>(dst + col * dst_stride + row0, acc[g].template select<ROWS, 1>(c * ROWS).read());
+                } else {
+                    for (int n = 0; n < ROWS && row0 + n < nrows; ++n) {
+                        dst[col * dst_stride + row0 + n] = acc[g][c * ROWS + n];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <ggml_type T, int NG, int TPW>
+static void dequantize_mul_mat_vec_dpas_wide_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                                  const int nrows, const int ncols_y, const int64_t y_stride,
+                                                  const int64_t dst_stride, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
+    const int     workgroups = (nrows + ROWS - 1) / ROWS;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NG * 8 * ROWS), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
+                       [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                           dequantize_mul_mat_vec_dpas_wide<T, NG, TPW>(vx, y, dst, ncols, nrows, ncols_y, y_stride,
+                                                                        dst_stride, lmem, it);
+                       });
+    });
+}
+
+template <ggml_type T, int NG>
+static void dequantize_mul_mat_vec_dpas_wide_tpw_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
+                                                      const int nrows, const int ncols_y, const int64_t y_stride,
+                                                      const int64_t dst_stride, const int tpw, dpct::queue_ptr stream) {
+    switch (tpw) {
+        case 3: dequantize_mul_mat_vec_dpas_wide_sycl<T, NG, 3>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, stream); break;
+        case 5: dequantize_mul_mat_vec_dpas_wide_sycl<T, NG, 5>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, stream); break;
+        default: dequantize_mul_mat_vec_dpas_wide_sycl<T, NG, 4>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, stream); break;
+    }
+}
+
 template <ggml_type T, int NC>
 static void dequantize_mul_mat_vec_dpas_tpw_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                  const int nrows, const int64_t y_stride, const int64_t dst_stride,
@@ -2333,7 +2442,13 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
         case 6: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
         case 7: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
         case 8: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
-        default: GGML_ABORT("unsupported column count %d", ncols_y);
+        default:
+            switch ((ncols_y + 7) / 8) {
+                case 2: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 2>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                case 3: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 3>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                case 4: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 4>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                default: GGML_ABORT("unsupported column count %d", ncols_y);
+            }
     }
 }
 
@@ -2370,7 +2485,7 @@ static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64
     const auto arch     = ggml_sycl_info().devices[device].hw_info.arch;
     const int  min_cols = type == GGML_TYPE_Q4_K ? 4 : type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K ? 3 :
                           type == GGML_TYPE_Q5_K ? 5 : 0;
-    return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= 8 &&
+    return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= GGML_SYCL_DPAS_MAX_COLS &&
            ncols * nrows >= 8 * 1024 * 1024 &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
 }
