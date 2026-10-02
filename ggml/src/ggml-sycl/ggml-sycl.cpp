@@ -5676,13 +5676,13 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
-static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
+static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst, int64_t max_cols = 8) {
     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
            dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
            // ne[1] <= 8 so multi-column decode (spec / MTP verify) also bootstraps the reorder;
-           // all reorderable types have a _switch_ncols kernel.
-           dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+           // all reorderable types have a _switch_ncols kernel. the XMX mat-vec raises max_cols.
+           dst->src[1]->ne[1] <= max_cols && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
 // A tensor in a compute buffer, e.g. an op-offloaded weight the scheduler copies from host memory, is rewritten in its
@@ -5694,8 +5694,8 @@ static bool ggml_sycl_in_compute_buffer(const ggml_tensor * t) {
 }
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
-                            ggml_tensor * dst, mul_mat_algo mm_algorithm) {
-    if (!should_reorder_tensor(*ctx, dst) || ggml_sycl_in_compute_buffer(src0)) {
+                            ggml_tensor * dst, mul_mat_algo mm_algorithm, int64_t max_cols = 8) {
+    if (!should_reorder_tensor(*ctx, dst, max_cols) || ggml_sycl_in_compute_buffer(src0)) {
         return;
     }
 
@@ -5874,14 +5874,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     int64_t esimd_min_cols = 0;
     int64_t esimd_max_cols = 0;
     ggml_sycl_esimd_ncols_range(src0->type, esimd_min_cols, esimd_max_cols);
-    if (!split && use_mul_mat_vec_q && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
+    // the XMX mat-vec also takes batches past MMVQ's column range (several sequences decoding together)
+    const bool    dpas_cols    = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                                 ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], src1->ne[1]);
+    const int64_t reorder_cols = dpas_cols ? std::max<int64_t>(8, src1->ne[1]) : 8;
+    if (!split && (use_mul_mat_vec_q || dpas_cols) && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
         ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols &&
         (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0) &&
         // past the ESIMD range only where the XMX mat-vec takes over (e.g. iq4_xs at 5-8 columns)
-        (src1->ne[1] <= esimd_max_cols ||
-         ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], src1->ne[1])) &&
-        ggml_is_contiguous(src1) && should_reorder_tensor(ctx, dst)) {
-        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        (src1->ne[1] <= esimd_max_cols || dpas_cols) &&
+        ggml_is_contiguous(src1) && should_reorder_tensor(ctx, dst, reorder_cols)) {
+        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ, reorder_cols);
         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
