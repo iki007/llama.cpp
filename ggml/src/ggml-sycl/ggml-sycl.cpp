@@ -107,6 +107,7 @@ int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_enable_fusion = 1;
+int g_ggml_sycl_gdn_fold = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
@@ -428,6 +429,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
+        g_ggml_sycl_gdn_fold = ggml_sycl_get_env("GGML_SYCL_GDN_FOLD", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
@@ -560,7 +562,7 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FUSION: %d\n", g_ggml_sycl_enable_fusion);
-        GGML_LOG_INFO("  GGML_SYCL_UPLOAD_STAGING_SLOTS: %d\n", g_ggml_sycl_upload_staging_slots);
+        GGML_LOG_INFO("  GGML_SYCL_GDN_FOLD: %d\n", g_ggml_sycl_gdn_fold);
 
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d\n", g_ggml_sycl_enable_esimd);
@@ -7625,12 +7627,144 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// The tensor whose buffer region t occupies: t itself, or the end of its chain of views.
+static const ggml_tensor * ggml_sycl_view_base(const ggml_tensor * t) {
+    while (t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// Decode-size gated_delta_net calls read the recurrent state through the GET_ROWS that gathers it from the cache, and
+// apply beta's SIGMOID at its load, so that both nodes can be skipped (the kernel supports both folds; the ESIMD
+// kernel from GGML_SYCL_GDN_ESIMD_MIN tokens on does not, so prefill keeps them). Qwen3.8-27B decode on an Arc Pro B70:
+// the gather copies a 3 MB state per recurrent layer and token. A fold requires the folded node to have no other
+// reader, and nothing between the GET_ROWS and the gated_delta_net to write into the cache it reads.
+static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph) {
+    auto & f = ctx.gdn_folds;
+    if (cgraph->uid != 0 && f.uid == cgraph->uid && f.n_nodes == cgraph->n_nodes) {
+        return;
+    }
+    f.uid     = cgraph->uid;
+    f.n_nodes = cgraph->n_nodes;
+    f.skip.assign(cgraph->n_nodes, 0);
+    f.gather.assign(cgraph->n_nodes, nullptr);
+    f.beta.assign(cgraph->n_nodes, 0);
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_gdn_fold) {
+        return;
+    }
+
+    bool any = false;
+    for (int i = 0; i < cgraph->n_nodes && !any; i++) {
+        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
+    }
+    if (!any) {
+        return;
+    }
+
+    // readers of every tensor, and the node index of every node
+    struct use { int n = 0; const ggml_tensor * last = nullptr; };
+    std::unordered_map<const ggml_tensor *, use> uses;
+    std::unordered_map<const ggml_tensor *, int> index;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        index[n] = i;
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (n->src[k] != nullptr) {
+                auto & u = uses[n->src[k]];
+                u.n++;
+                u.last = n;
+            }
+        }
+    }
+    // t is read only by `reader`, directly or through a chain of views that nothing else reads
+    auto only_read_by = [&](const ggml_tensor * t, const ggml_tensor * reader) {
+        while (true) {
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                return false;
+            }
+            const auto it = uses.find(t);
+            if (it == uses.end() || it->second.n != 1) {
+                return false;
+            }
+            const ggml_tensor * u = it->second.last;
+            if (u == reader) {
+                return true;
+            }
+            if (u->view_src != t || !ggml_sycl_is_view_or_noop(u)) {
+                return false;
+            }
+            t = u;
+        }
+    };
+
+    // A folded node's inputs are read later than the graph says, when the allocator may already have handed their memory to a
+    // node allocated after their last reader (Qwen3.6-35B-A3B: the row index of the last layer's gather was overwritten before
+    // its gated_delta_net ran). Fold only if no node from `first` to `last` touches the bytes of t.
+    auto untouched = [&](const ggml_tensor * t, int first, int last) {
+        const char * t0 = (const char *) t->data;
+        const char * t1 = t0 + ggml_nbytes(t);
+        for (int k = first; k <= last; k++) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (ggml_sycl_is_view_or_noop(n) || n->data == nullptr) {
+                continue;
+            }
+            const char * n0 = (const char *) n->data;
+            const char * n1 = n0 + ggml_nbytes(n);
+            if (n0 < t1 && t0 < n1) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    static const int esimd_min = ggml_sycl_get_env("GGML_SYCL_GDN_ESIMD_MIN", 16);
+    for (int g = 0; g < cgraph->n_nodes; g++) {
+        const ggml_tensor * gdn = cgraph->nodes[g];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || gdn->src[2]->ne[2] >= esimd_min) {
+            continue;
+        }
+
+        // state: [S_v, S_v, H, n_seqs] as a reshape of GET_ROWS(cache rows, I32 row per sequence)
+        const ggml_tensor * gr = ggml_sycl_view_base(gdn->src[5]);
+        const auto          ig = index.find(gr);
+        if (gr->op == GGML_OP_GET_ROWS && ig != index.end() && ig->second < g && gr->type == GGML_TYPE_F32 &&
+            gr->src[0]->type == GGML_TYPE_F32 && gr->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(gr->src[0]) &&
+            ggml_is_contiguous(gdn->src[5]) && gr->src[1]->ne[0] == gdn->src[2]->ne[3] &&
+            gr->src[0]->ne[0] == ggml_nelements(gdn->src[5]) / gdn->src[5]->ne[3] && only_read_by(gr, gdn)) {
+            const ggml_tensor * cache = ggml_sycl_view_base(gr->src[0]);
+            bool                ok    = untouched(gr->src[1], ig->second + 1, g);
+            for (int k = ig->second + 1; k < g && ok; k++) {
+                const ggml_tensor * n = cgraph->nodes[k];
+                ok = ggml_nbytes(n) == 0 || ggml_sycl_is_view_or_noop(n) || ggml_sycl_view_base(n) != cache;
+            }
+            if (ok) {
+                f.gather[g]        = gr;
+                f.skip[ig->second] = 1;
+            }
+        }
+
+        // beta = SIGMOID(x): the kernel reads x and applies the sigmoid
+        const ggml_tensor * sg = gdn->src[4];
+        const auto          is = index.find(sg);
+        if (sg->op == GGML_OP_UNARY && ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && is != index.end() &&
+            is->second < g && sg->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(sg->src[0]) &&
+            ggml_are_same_shape(sg, sg->src[0]) && ggml_are_same_stride(sg, sg->src[0]) && only_read_by(sg, gdn) &&
+            untouched(sg->src[0], is->second + 1, g)) {
+            f.beta[g]          = 1;
+            f.skip[is->second] = 1;
+        }
+    }
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
     // addresses are reused across graphs, so nothing survives the boundary.
     sycl_ctx->src1_f16_reset();
     sycl_ctx->cur_graph = cgraph;
+    ggml_sycl_gdn_folds(*sycl_ctx, cgraph);
+    const auto & gdn_folds = sycl_ctx->gdn_folds;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -7639,6 +7773,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (gdn_folds.skip[i]) {
             continue;
         }
 
@@ -7657,11 +7794,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
+            const ggml_tensor * state_gather = gdn_folds.gather[i];
+            const bool          beta_sigmoid = gdn_folds.beta[i] != 0;
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy, beta_sigmoid, state_gather);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+            if (state_gather != nullptr || beta_sigmoid) {
+                ggml_sycl_gated_delta_net(*sycl_ctx, node, beta_sigmoid, state_gather);
                 continue;
             }
         }
