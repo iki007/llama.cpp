@@ -3236,6 +3236,59 @@ struct test_cpy : public test_case {
     }
 };
 
+struct test_cpy_batch : public test_case {
+    const int copies;
+    const int channels;
+    const int sequences;
+    const bool state_layout;
+    const int dependency; // 0: independent, 1: WAW, 2: RAW, 3: WAR
+    std::vector<ggml_tensor *> outputs;
+
+    test_cpy_batch(int copies, int channels, int sequences, bool state_layout = true, int dependency = 0)
+        : copies(copies), channels(channels), sequences(sequences), state_layout(state_layout), dependency(dependency) {}
+
+    std::string op_desc(ggml_tensor *) override { return "CPY_BATCH"; }
+    std::string vars() override { return VARS_TO_STR5(copies, channels, sequences, state_layout, dependency); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+    double max_nmse_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override { return memcmp(a, b, n * sizeof(float)) != 0; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        const float values[] = { 0.0f, -0.0f, 1e-40f, 1e30f };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr && t->type == GGML_TYPE_F32 && ggml_nbytes(t) >= sizeof(values)) {
+                ggml_backend_tensor_set(t, values, 0, sizeof(values));
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 + copies, channels, sequences);
+        ggml_tensor * cache = state_layout
+            ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * channels, (sequences + 1) * copies)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3 + copies, channels, sequences, copies);
+        outputs.clear();
+        for (int k = 0; k < copies; ++k) {
+            ggml_tensor * src = ggml_view_3d(ctx, input, 3, channels, sequences, input->nb[1], input->nb[2], k * sizeof(float));
+            const int slot = dependency == 1 ? 0 : k;
+            ggml_tensor * dst = state_layout
+                ? ggml_view_2d(ctx, cache, 3 * channels, sequences, cache->nb[1], slot * (sequences + 1) * cache->nb[1])
+                : ggml_view_3d(ctx, cache, 3, channels, sequences, cache->nb[1], cache->nb[2], slot * cache->nb[3]);
+            if (dependency == 2 && k > 0) {
+                src = outputs.back();
+            } else if (dependency == 3 && k == 0) {
+                src = ggml_view_3d(ctx, cache, 3, channels, sequences, cache->nb[1], cache->nb[2], cache->nb[3]);
+            }
+            ggml_tensor * out = ggml_cpy(ctx, src, dst);
+            outputs.push_back(out);
+            ggml_build_forward_expand(gf, out);
+        }
+        return outputs.back();
+    }
+};
+
 // GGML_OP_CONT
 // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
 // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
@@ -6711,6 +6764,25 @@ struct test_conv_3d : public test_case {
 };
 
 // GGML_OP_CONCAT
+struct test_concat_conv : public test_case {
+    const int channels;
+    const int tokens;
+    const int sequences;
+
+    test_concat_conv(int channels, int tokens, int sequences)
+        : channels(channels), tokens(tokens), sequences(sequences) {}
+
+    std::string vars() override { return VARS_TO_STR3(channels, tokens, sequences); }
+    double max_nmse_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override { return memcmp(a, b, n * sizeof(float)) != 0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, channels, sequences);
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, tokens, sequences);
+        return ggml_concat(ctx, state, ggml_transpose(ctx, qkv), 0);
+    }
+};
+
 struct test_concat : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -9260,6 +9332,19 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int sequences : { 1, 2 }) {
+        for (int copies : { 1, 2, 15, 16, 17 }) {
+            test_cases.emplace_back(new test_cpy_batch(copies, 17, sequences));
+        }
+        for (int dependency : { 0, 1, 2, 3 }) {
+            test_cases.emplace_back(new test_cpy_batch(3, 17, sequences, false, dependency));
+        }
+        for (int tokens : { 1, 4, 5, 6, 14, 28, 29 }) {
+            test_cases.emplace_back(new test_concat_conv(17, tokens, sequences));
+        }
+    }
+    test_cases.emplace_back(new test_cpy_batch(15, 10240, 1));
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11616,6 +11701,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int tokens : { 1, 4, 14 }) {
+        test_cases.emplace_back(new test_concat_conv(10240, tokens, 1));
+    }
 
     // Qwen3.8-27B attention: head 256, 24 query / 4 KV heads (GQA 6) at long context.
     // No tile groups 6 query heads per KV head, so up to 4 rows (4 = a DFlash n_max 3 verify batch)
