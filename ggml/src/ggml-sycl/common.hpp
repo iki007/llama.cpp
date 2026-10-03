@@ -395,6 +395,16 @@ struct ggml_backend_sycl_context {
     const ggml_cgraph * cur_graph = nullptr;
     int                 cur_node  = -1;
 
+    // GET_ROWS / SIGMOID nodes that a later gated_delta_net reads through instead (ggml_sycl_gdn_folds), for the
+    // graph with this uid; recomputed when a graph has no uid
+    struct {
+        uint64_t                          uid     = 0;
+        int                               n_nodes = -1;
+        std::vector<uint8_t>              skip;   // node runs inside a later gated_delta_net
+        std::vector<const ggml_tensor *>  gather; // per gated_delta_net node: the state GET_ROWS it reads through
+        std::vector<uint8_t>              beta;   // per gated_delta_net node: beta's SIGMOID is applied at load
+    } gdn_folds;
+
     // The general device pool is stack-disciplined (it asserts that a free is the top of
     // the stack), so a buffer held across nodes cannot live there. Give the cache its own
     // pool -- it is the only allocation in it, so LIFO is trivially satisfied. Mirrors the
