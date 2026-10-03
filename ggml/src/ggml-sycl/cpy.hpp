@@ -534,4 +534,9 @@ inline void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
 void ggml_sycl_dup(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+#define GGML_SYCL_CPY_BATCH_MAX 16
+// Sources and destinations must share their respective layouts. Copies must not read or write another copy's destination.
+void ggml_sycl_cpy_f32_batch(ggml_backend_sycl_context & ctx, const ggml_tensor * const * src,
+                           const ggml_tensor * const * dst, int n);
+
 #endif  // GGML_SYCL_CPY_HPP
