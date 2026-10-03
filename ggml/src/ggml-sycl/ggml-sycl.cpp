@@ -7757,6 +7757,66 @@ static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgra
     }
 }
 
+// Batch independent copies with matching layouts, allowing views between copies.
+static int ggml_sycl_cpy_batch_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    static const bool   enabled = ggml_sycl_get_env("GGML_SYCL_CPY_BATCH", 1) != 0;
+    const ggml_tensor * node    = cgraph->nodes[node_idx];
+    const ggml_tensor * s0      = node->src[0];
+    const ggml_tensor * d0      = node->src[1];
+    if (!enabled || !g_ggml_sycl_enable_fusion || s0->type != GGML_TYPE_F32 || d0->type != GGML_TYPE_F32 ||
+        ggml_nelements(s0) > INT_MAX - SYCL_CPY_BLOCK_SIZE || ggml_nbytes(s0) >= INT_MAX ||
+        ggml_nbytes(d0) >= INT_MAX) {
+        return 0;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (s0->nb[d] > INT_MAX || d0->nb[d] > INT_MAX) {
+            return 0;
+        }
+    }
+
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t ab = (uintptr_t) a->data;
+        const uintptr_t bb = (uintptr_t) b->data;
+        return ab <= bb ? bb - ab < ggml_nbytes(a) : ab - bb < ggml_nbytes(b);
+    };
+    auto same_layout = [](const ggml_tensor * a, const ggml_tensor * b) {
+        return a->type == b->type && ggml_are_same_shape(a, b) && memcmp(a->nb, b->nb, sizeof(a->nb)) == 0;
+    };
+
+    const ggml_tensor * src[GGML_SYCL_CPY_BATCH_MAX];
+    const ggml_tensor * dst[GGML_SYCL_CPY_BATCH_MAX];
+    int                 count = 0;
+    int                 last  = node_idx;
+    for (int j = node_idx; j < cgraph->n_nodes && count < GGML_SYCL_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * nj = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (nj->op != GGML_OP_CPY || !same_layout(nj->src[0], s0) || !same_layout(nj->src[1], d0) ||
+            nj->src[0]->buffer->buft != ggml_backend_sycl_buffer_type(ctx.device) ||
+            nj->src[1]->buffer->buft != ggml_backend_sycl_buffer_type(ctx.device) ||
+            overlaps(nj->src[0], nj->src[1])) {
+            break;
+        }
+        bool indep = true;
+        for (int k = 0; k < count && indep; ++k) {
+            indep = !overlaps(nj->src[1], src[k]) && !overlaps(nj->src[1], dst[k]) && !overlaps(nj->src[0], dst[k]);
+        }
+        if (!indep) {
+            break;
+        }
+        src[count] = nj->src[0];
+        dst[count] = nj->src[1];
+        ++count;
+        last = j;
+    }
+    if (count < 2) {
+        return 0;
+    }
+    ggml_sycl_cpy_f32_batch(ctx, src, dst, count);
+    return last - node_idx;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
@@ -7858,6 +7918,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const int l2_batch_skip = ggml_sycl_l2_norm_batch_fused(*sycl_ctx, cgraph, i);
             if (l2_batch_skip > 0) {
                 i += l2_batch_skip;
+                continue;
+            }
+        }
+
+        if (node->op == GGML_OP_CPY) {
+            const int cpy_batch_skip = ggml_sycl_cpy_batch_fused(*sycl_ctx, cgraph, i);
+            if (cpy_batch_skip > 0) {
+                i += cpy_batch_skip;
                 continue;
             }
         }
