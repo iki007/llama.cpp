@@ -14,6 +14,8 @@
 
 #include "concat.hpp"
 
+#include <climits>
+
 static inline size_t elem_size(ggml_type t) {
     return ggml_type_size(t) / ggml_blck_size(t);
 }
@@ -160,6 +162,41 @@ static void concat_T_sycl_non_cont(
   });
 }
 
+// Short rows leave most work-items idle in the per-row kernel.
+template <typename T>
+static void concat_T_sycl_flat(
+    queue_ptr stream, const char *src0, const char *src1, char *dst,
+    int ne00, int ne01, int ne02, int ne03, uint64_t nb00, uint64_t nb01, uint64_t nb02, uint64_t nb03,
+    uint64_t nb10, uint64_t nb11, uint64_t nb12, uint64_t nb13,
+    int ne0, int ne1, int ne2, int ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2, uint64_t nb3, int32_t dim) {
+    const int n  = ne0 * ne1 * ne2 * ne3;
+    const int wg = SYCL_CONCAT_BLOCK_SIZE;
+    stream->parallel_for(sycl::nd_range<1>(((size_t) n + wg - 1) / wg * wg, wg), [=](sycl::nd_item<1> item_ct1) {
+        const size_t index = item_ct1.get_global_id(0);
+        if (index >= (size_t) n) {
+            return;
+        }
+        const int i  = (int) index;
+        const int i0 = i % ne0;
+        int       r  = i / ne0;
+        const int i1 = r % ne1;
+        r /= ne1;
+        const int i2 = r % ne2;
+        const int i3 = r / ne2;
+
+        int o[4] = { 0, 0, 0, 0 };
+        o[dim]   = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
+
+        const T * x;
+        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+            x = (const T *) (src0 + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
+        } else {
+            x = (const T *) (src1 + (i3 - o[3]) * nb13 + (i2 - o[2]) * nb12 + (i1 - o[1]) * nb11 + (i0 - o[0]) * nb10);
+        }
+        *(T *) (dst + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0) = *x;
+    });
+}
+
 template <typename T>
 void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
@@ -168,8 +205,15 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
     queue_ptr            stream = ctx.stream();
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
+    const bool contiguous = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+    if (dst->ne[0] <= 8 && ggml_nelements(dst) < INT_MAX && (dim != 3 || !contiguous)) {
+        concat_T_sycl_flat<T>(stream, (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                             src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1],
+                             src0->nb[2], src0->nb[3], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], dst->nb[0], dst->nb[1], dst->nb[2],
+                             dst->nb[3], dim);
+    } else if (contiguous) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T * dst_d = (T *) dst->data;

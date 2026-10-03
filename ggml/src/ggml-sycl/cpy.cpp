@@ -1431,3 +1431,38 @@ void ggml_sycl_dup(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_cpy(ctx, dst->src[0], dst);
 }
+
+void ggml_sycl_cpy_f32_batch(ggml_backend_sycl_context & ctx, const ggml_tensor * const * src,
+                           const ggml_tensor * const * dst, int n) try {
+    GGML_ASSERT(n >= 1 && n <= GGML_SYCL_CPY_BATCH_MAX);
+    const ggml_tensor * src0 = src[0];
+    const ggml_tensor * src1 = dst[0];
+    GGML_TENSOR_BINARY_OP_LOCALS01;
+
+    struct {
+        const char * x[GGML_SYCL_CPY_BATCH_MAX];
+        char *       d[GGML_SYCL_CPY_BATCH_MAX];
+    } p = {};
+    for (int k = 0; k < n; ++k) {
+        p.x[k] = (const char *) src[k]->data;
+        p.d[k] = (char *) dst[k]->data;
+    }
+
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    // Use the per-tensor indexing, with one grid row per copy.
+    const int ne = ggml_nelements(src0);
+    const int i_ne00 = ne00, i_ne01 = ne01, i_ne02 = ne02, i_ne10 = ne10, i_ne11 = ne11, i_ne12 = ne12;
+    const int i_nb00 = nb00, i_nb01 = nb01, i_nb02 = nb02, i_nb03 = nb03;
+    const int i_nb10 = nb10, i_nb11 = nb11, i_nb12 = nb12, i_nb13 = nb13;
+    const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, n, num_blocks * SYCL_CPY_BLOCK_SIZE), sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int k = item_ct1.get_group(1);
+            cpy_f32_f16<cpy_1_f32_f32>(p.x[k], p.d[k], ne, i_ne00, i_ne01, i_ne02, i_nb00, i_nb01, i_nb02, i_nb03,
+                                       i_ne10, i_ne11, i_ne12, i_nb10, i_nb11, i_nb12, i_nb13, item_ct1);
+        });
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
