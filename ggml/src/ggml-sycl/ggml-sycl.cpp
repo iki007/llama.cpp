@@ -860,6 +860,12 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
+    // Pinned host memory (the CPU backend's compute buffer: graph inputs, CPU split outputs) needs no staging
+    static const bool pinned_set = ggml_sycl_get_env("GGML_SYCL_PINNED_SET", 1) != 0;
+    if (pinned_set && sycl::get_pointer_type(data, stream->get_context()) == sycl::usm::alloc::host) {
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+        return;
+    }
     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
     // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
     char * host_buf = (char *) malloc(size);
