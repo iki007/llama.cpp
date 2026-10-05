@@ -2,7 +2,9 @@
 #include "cpy.hpp"
 
 #include "ggml-quants.h"
+#include "ggml-impl.h"
 
+#include <climits>
 #include <vector>
 
 namespace utils {
@@ -14,6 +16,121 @@ static constexpr bool is_arithmetic_v() {
 #endif
         ;
 }
+}
+
+int ggml_sycl_qsa_mask_absorbs(const ggml_cgraph * graph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_QSA_MASK", 1) != 0;
+    if (!enabled || !g_ggml_sycl_enable_fusion || i + 8 >= graph->n_nodes) {
+        return 0;
+    }
+    const ggml_op ops[] = { GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_FILL, GGML_OP_REPEAT,
+                            GGML_OP_RESHAPE, GGML_OP_SET_ROWS, GGML_OP_VIEW, GGML_OP_ADD };
+    const int outputs[] = { i + 8 };
+    if (!ggml_can_fuse_subgraph(graph, i, 9, ops, outputs, 1)) {
+        return 0;
+    }
+    const auto n = graph->nodes + i;
+    const ggml_tensor * idx = n[6]->src[1];
+    const ggml_tensor * mask = n[8]->src[1];
+    const ggml_tensor * dst = n[8];
+    const int64_t nk = dst->ne[0], ns = n[0]->ne[0], nt = ggml_nrows(dst);
+    if (!idx || !mask || (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32) ||
+        nk <= 0 || ns <= 0 || nt <= 1 || nk > INT_MAX - ns || nt > INT_MAX ||
+        idx->type != GGML_TYPE_I32 || idx->ne[0] != ns || idx->ne[1] != nt ||
+        idx->ne[2] != 1 || idx->ne[3] != 1 || !ggml_is_contiguous(idx) ||
+        mask->type != dst->type || !ggml_are_same_shape(mask, dst) || !ggml_is_contiguous(mask) ||
+        !ggml_is_contiguous(dst) || dst->view_src || n[0]->view_src || n[3]->view_src || n[8]->src[0] != n[7]) {
+        return 0;
+    }
+    for (int j = 0; j < 8; ++j) {
+        if (n[j]->type != dst->type || n[j]->flags & GGML_TENSOR_FLAG_INPUT) {
+            return 0;
+        }
+    }
+    float fill, zero;
+    memcpy(&fill, n[3]->op_params, sizeof(fill));
+    memcpy(&zero, n[0]->op_params, sizeof(zero));
+    if (fill != -INFINITY || zero != 0.0f || std::signbit(zero) ||
+        n[3]->ne[0] != nk + ns || ggml_nrows(n[0]) != 1 || ggml_nrows(n[3]) != 1 ||
+        n[1]->src[0] != n[0] || n[1]->ne[0] != ns || n[1]->ne[1] != nt || ggml_nrows(n[1]) != nt ||
+        n[2]->src[0] != n[1] || n[2]->ne[0] != 1 || n[2]->ne[1] != ns || n[2]->ne[2] != nt || n[2]->ne[3] != 1 ||
+        n[4]->src[0] != n[3] || n[4]->ne[0] != nk + ns || n[4]->ne[1] != nt || ggml_nrows(n[4]) != nt ||
+        n[5]->src[0] != n[4] || n[5]->ne[0] != 1 || n[5]->ne[1] != nk + ns || n[5]->ne[2] != nt || n[5]->ne[3] != 1 ||
+        n[6]->src[0] != n[2] || n[6]->src[2] != n[5] || n[6]->view_src != n[4] ||
+        n[7]->src[0] != n[6] || n[7]->view_src != n[4] || n[7]->view_offs != 0 ||
+        !ggml_are_same_shape(n[7], dst) || n[7]->nb[0] != ggml_type_size(dst->type)) {
+        return 0;
+    }
+    size_t stride = (nk + ns) * ggml_type_size(dst->type);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (n[7]->nb[d] != stride) {
+            return 0;
+        }
+        stride *= dst->ne[d];
+    }
+    return 8;
+}
+
+template <typename T>
+static void qsa_mask_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * idx,
+                           const ggml_tensor * mask, ggml_tensor * dst, float fill, float zero) {
+    const int64_t nk = dst->ne[0], ns = idx->ne[0];
+    const size_t ni = ggml_nelements(idx), nd = ggml_nelements(dst);
+    const int32_t * indices = (const int32_t *) idx->data;
+    const T * causal = (const T *) mask->data;
+    T * out = (T *) dst->data;
+    const auto stream = ctx.stream();
+    constexpr size_t block = 256;
+    ggml_sycl_pool_alloc<T> saved(ctx.pool());
+    const T * selected = nullptr;
+    // ADD may reuse its causal input. Save the selected entries before filling it.
+    if (out == causal) {
+        selected = saved.alloc(ni);
+        T * values = saved.get();
+        stream->parallel_for(sycl::nd_range<1>((ni + block - 1) / block * block, block), [=](sycl::nd_item<1> it) {
+            const size_t j = it.get_global_id(0);
+            if (j < ni) {
+                const int32_t k = indices[j];
+                values[j] = k >= 0 && k < nk ? causal[(j / ns) * nk + k] : T(0.0f);
+            }
+        });
+    }
+    stream->parallel_for(sycl::nd_range<1>((nd + block - 1) / block * block, block), [=](sycl::nd_item<1> it) {
+        const size_t j = it.get_global_id(0);
+        if (j < nd) {
+            out[j] = T(fill + float(causal[j]));
+        }
+    });
+    stream->parallel_for(sycl::nd_range<1>((ni + block - 1) / block * block, block), [=](sycl::nd_item<1> it) {
+        const size_t j = it.get_global_id(0);
+        if (j < ni) {
+            const int32_t k = indices[j];
+            if (k >= 0 && k < nk) {
+                const size_t at = (j / ns) * nk + k;
+                const float v = float(selected ? selected[j] : causal[at]);
+                out[at] = T(zero + v);
+            }
+        }
+    });
+}
+
+int ggml_sycl_fuse_qsa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
+    const int skip = ggml_sycl_qsa_mask_absorbs(graph, i);
+    if (!skip) {
+        return 0;
+    }
+    const ggml_tensor * idx = graph->nodes[i + 6]->src[1];
+    const ggml_tensor * mask = graph->nodes[i + 8]->src[1];
+    ggml_tensor * dst = graph->nodes[i + 8];
+    const float fill = ggml_get_op_params_f32(graph->nodes[i + 3], 0);
+    const float zero = ggml_get_op_params_f32(graph->nodes[i], 0);
+    GGML_SYCL_DEBUG("%s: %lld cells, %lld rows\n", __func__, (long long) dst->ne[0], (long long) ggml_nrows(dst));
+    if (dst->type == GGML_TYPE_F16) {
+        qsa_mask_sycl<sycl::half>(ctx, idx, mask, dst, fill, zero);
+    } else {
+        qsa_mask_sycl<float>(ctx, idx, mask, dst, fill, zero);
+    }
+    return skip;
 }
 
 template<typename TIn, typename TOut>
