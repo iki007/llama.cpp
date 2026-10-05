@@ -550,6 +550,9 @@ int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i)
         return 0;
     }
 
+    if (const int n = ggml_sycl_fuse_qsa_attn(ctx, cgraph, i)) {
+        return n;
+    }
     if (const int n = ggml_sycl_fuse_qsa_mask(ctx, cgraph, i)) {
         return n;
     }

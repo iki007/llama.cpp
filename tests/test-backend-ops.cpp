@@ -7327,6 +7327,64 @@ struct test_qsa_mask : public test_case {
     }
 };
 
+struct test_qsa_attn : public test_qsa_mask {
+    const int64_t g;
+    const int variant;
+
+    test_qsa_attn(int64_t nk, int64_t nt, int64_t g, int variant = 0)
+        : test_qsa_mask(GGML_TYPE_F16, nk, 127, nt, variant == 3, false, variant == 4 || variant == 5 ? variant - 3 : 0), g(g), variant(variant) {}
+
+    std::string op_desc(ggml_tensor *) override { return "QSA_ATTN"; }
+    std::string vars() override { return test_qsa_mask::vars() + "," + VARS_TO_STR2(g, variant); }
+    double max_nmse_err() override { return 5e-4; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (variant == 6 && (memcmp(a, a + n / 2, n / 2 * sizeof(float)) != 0 || memcmp(b, b + n / 2, n / 2 * sizeof(float)) != 0)) {
+            return 1.0;
+        }
+        return test_case::err(a, b, n);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, nt, 2 * g);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, 256, nk, 2);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, 256, nk, 2);
+        ggml_tensor * mask = test_qsa_mask::build_graph(ctx, ctx_weights);
+        if (variant == 1) {
+            ggml_set_output(mask);
+        }
+        mask = ggml_reshape_4d(ctx, mask, nk, nt, 1, 1);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / 16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(out, ns);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        if (variant == 6) {
+            ggml_tensor * all = ggml_fill(ctx, ggml_new_tensor_1d(ctx, type, nk + ns), -INFINITY);
+            all = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, all, nk + ns, nt, 1, 1), 1, nk + ns, nt);
+            ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_1d(ctx, type, ns), 0.0f);
+            zeros = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, zeros, ns, nt, 1, 1), 1, ns, nt);
+            ggml_tensor * sel = ggml_set_rows(ctx, all, zeros, idx);
+            sel = ggml_view_2d(ctx, sel, nk, nt, sel->nb[2], 0);
+            ggml_tensor * dense = ggml_add(ctx, sel, causal);
+            // Keep the reference mask materialized to compare both attention paths.
+            ggml_set_output(dense);
+            ggml_tensor * ref = ggml_flash_attn_ext(ctx, q, k, v, ggml_reshape_4d(ctx, dense, nk, nt, 1, 1), 1.0f / 16.0f, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_n_kv_max(ref, ns);
+            ggml_prec_set_acc(ref, GGML_PREC_F32);
+            out = ggml_concat(ctx, out, ref, 3);
+        }
+        outputs.erase(outputs.begin());
+        outputs.push_back(out);
+        if (variant == 2 && gf) {
+            ggml_build_forward_expand(gf, out);
+            ggml_tensor * side = ggml_dup(ctx, mask);
+            outputs.push_back(side);
+            ggml_build_forward_expand(gf, side);
+        }
+        return out;
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -11793,6 +11851,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
+    for (int64_t g : { 6, 12, 16 }) {
+        for (int64_t nt : { 9, 17, 33 }) {
+            test_cases.emplace_back(new test_qsa_attn(32768, nt, g));
+        }
+    }
+    for (int variant : { 1, 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_qsa_attn(32768, 9, 12, variant));
+    }
+    test_cases.emplace_back(new test_qsa_attn(4096, 17, 12));
+    for (int64_t g : { 6, 12, 16 }) {
+        test_cases.emplace_back(new test_qsa_attn(32768, 17, g, 6));
+    }
+
     for (int kv : { 1024, 2048, }) {
         for (int hs : { 64, 128, 256, }) {
             for (int nb : { 32, 64, }) {
