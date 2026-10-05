@@ -774,7 +774,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 (lightning indexer) or F32 (matrix-product scorer) [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
@@ -799,7 +799,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    // the lightning indexer scores small batches and reads an f16 mask; the scorer of larger batches adds an f32 one
+    const bool lid  = cparams.fused_lid && n_tokens <= 32;
+    inp->pool_mask  = ggml_new_tensor_2d(ctx0, lid ? GGML_TYPE_F16 : GGML_TYPE_F32, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -895,7 +897,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     cb(q, "indexer_q", il);
 
     ggml_tensor * score = nullptr;
-    if (cparams.fused_lid && n_tokens <= 32) {
+    if (inp_kpool->pool_mask->type == GGML_TYPE_F16) {
         ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
         score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask);
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
