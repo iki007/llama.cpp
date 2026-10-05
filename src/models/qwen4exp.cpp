@@ -23,6 +23,18 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
     }
 }
 
+static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
+    if (cparams.ctx_other == nullptr) {
+        throw std::runtime_error(format("QWEN4EXP MTP: this draft head has no '%s' of its own; "
+                                        "load it as a draft of its target model (-md), not on its own", name));
+    }
+    const llama_model & other = *llama_get_model(cparams.ctx_other);
+    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
+        throw std::runtime_error(format("QWEN4EXP MTP: draft and target disagree on the shape of '%s'", name));
+    }
+    return other;
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -179,7 +191,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a draft that borrows the embeddings and the LM head from its target has neither
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -188,7 +201,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -298,12 +311,52 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
         nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
         nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
+
+        // optional shortlisted draft head: its row count is whatever the file keeps
+        const std::string draft_head_name = tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il).str();
+        if (const ggml_tensor * meta = ml.get_tensor_meta(draft_head_name.c_str())) {
+            const std::string map_name = tn(LLM_TENSOR_NEXTN_DRAFT_VOCAB_MAP, "weight", il).str();
+            const ggml_tensor * map_meta = ml.get_tensor_meta(map_name.c_str());
+            if (meta->ne[1] <= 0 || meta->ne[1] > n_vocab) {
+                throw std::runtime_error("QWEN4EXP MTP: invalid shortlisted head row count");
+            }
+            if (!map_meta || map_meta->type != GGML_TYPE_I32) {
+                throw std::runtime_error("QWEN4EXP MTP: shortlisted head requires an I32 vocabulary map");
+            }
+            nextn.draft_head      = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD,      "weight", il), { n_embd, meta->ne[1] }, mtp_flags);
+            nextn.draft_vocab_map = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_VOCAB_MAP, "weight", il), { n_vocab }, mtp_flags);
+        }
     }
+}
+
+bool llama_model_qwen4exp::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_base::load_tensors(ml)) {
+        return false;
+    }
+    for (const auto & layer : layers) {
+        const auto & nextn = layer.nextn;
+        if (!nextn.draft_vocab_map || ml.no_alloc) {
+            continue;
+        }
+        std::vector<int32_t> ids(vocab.n_tokens());
+        ggml_backend_tensor_get(nextn.draft_vocab_map, ids.data(), 0, ids.size() * sizeof(int32_t));
+        for (int32_t id : ids) {
+            if (id < 0 || id > nextn.draft_head->ne[1]) {
+                throw std::runtime_error("QWEN4EXP MTP: shortlisted vocabulary map index is out of range");
+            }
+        }
+    }
+    return true;
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
+    }
+    // without this a draft without a trunk loads, then walks the null trunk and segfaults
+    if (hc_head_norm == nullptr) {
+        throw std::runtime_error("this model is an MTP draft head without a trunk; "
+                                 "load it as a draft of its target model (-md), not on its own");
     }
     return std::make_unique<graph>(*this, params);
 }
@@ -554,7 +607,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * tok_embd;
     if (ubatch.token) {
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        ggml_tensor * tok_embd_w = model.tok_embd;
+        if (tok_embd_w == nullptr) {
+            tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
+            GGML_ASSERT(tok_embd_w && "QWEN4EXP MTP: the target model has no token embeddings to borrow");
+        }
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
@@ -571,7 +629,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+    // a draft file can mark the MTP block as dense attention (ratio 0): its k-pool inputs would stay unallocated
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);
@@ -593,6 +652,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+
+    // the attention has stored K and V for every token; a draft context reads only the output rows from here on,
+    // so the FFN does not run on the rest of a prompt batch
+    if (inp_out_ids && cparams.embeddings_nextn_masked) {
+        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+        res_hc = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens), inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+        inp_out_ids = nullptr;
+    }
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
@@ -600,7 +669,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     // the next draft step reads this residual as its h
-    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
+    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
     res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
     cb(res->t_h_nextn, "h_nextn", il);
@@ -612,7 +681,30 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (layer.nextn.draft_head) {
+        GGML_ASSERT(layer.nextn.draft_vocab_map && layer.nextn.draft_vocab_map->type == GGML_TYPE_I32);
+
+        // score only the kept rows, then scatter them back to the full vocab through the map;
+        // ids outside the shortlist point at an extra -inf row, so the draft never proposes them.
+        // the target still verifies every drafted token, so this changes speed, not output.
+        const int64_t n_out = cur->ne[1];
+        cur = ggml_mul_mat(ctx0, layer.nextn.draft_head, cur);
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        ggml_tensor * ninf = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_out, 1), -INFINITY);
+        cur = ggml_concat(ctx0, cur, ninf, 1);
+        cur = ggml_get_rows(ctx0, cur, layer.nextn.draft_vocab_map);
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+    } else {
+        ggml_tensor * head_w = model.output;
+        ggml_tensor * head_s = model.output_s;
+        if (head_w == nullptr) {
+            const llama_model & other = qwen4exp_shared_model(cparams, model, "output.weight");
+            head_w = other.output;
+            head_s = other.output_s;
+            GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
+        }
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
