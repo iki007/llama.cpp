@@ -1,5 +1,6 @@
 #include "set_rows.hpp"
 #include "cpy.hpp"
+#include "fattn-xmx.hpp"
 
 #include "ggml-quants.h"
 #include "ggml-impl.h"
@@ -69,6 +70,41 @@ int ggml_sycl_qsa_mask_absorbs(const ggml_cgraph * graph, int i) {
         stride *= dst->ne[d];
     }
     return 8;
+}
+
+int ggml_sycl_qsa_attn_absorbs(int device, const ggml_cgraph * graph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_QSA_COMPACT", 0) != 0;
+    if (!enabled || !ggml_sycl_qsa_mask_absorbs(graph, i) || i + 10 >= graph->n_nodes) {
+        return 0;
+    }
+    const ggml_op ops[] = { GGML_OP_FILL, GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_FILL, GGML_OP_REPEAT,
+                            GGML_OP_RESHAPE, GGML_OP_SET_ROWS, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_RESHAPE, GGML_OP_FLASH_ATTN_EXT };
+    const int outputs[] = { i + 10 };
+    if (!ggml_can_fuse_subgraph(graph, i, 11, ops, outputs, 1)) {
+        return 0;
+    }
+    const auto n = graph->nodes + i;
+    const ggml_tensor * causal = n[8]->src[1];
+    if (!n[10]->src[0] || !n[10]->src[1] || !n[10]->src[2] ||
+        n[8]->type != GGML_TYPE_F16 || n[9]->src[0] != n[8] || n[9]->view_src != n[8] || n[9]->view_offs != 0 ||
+        !ggml_are_same_shape(n[8], n[9]) || n[10]->src[3] != n[9] || n[9]->flags & GGML_TENSOR_FLAG_INPUT ||
+        causal->view_offs % 16 != 0 || (uintptr_t) causal->data % 16 != 0 ||
+        n[8]->ne[0] != n[10]->src[1]->ne[1] || ggml_nrows(n[8]) != n[10]->src[0]->ne[1] ||
+        !ggml_sycl_flash_attn_ext_xmx_qsa_supported(device, n[10])) {
+        return 0;
+    }
+    return 10;
+}
+
+int ggml_sycl_fuse_qsa_attn(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
+    const int skip = ggml_sycl_qsa_attn_absorbs(ctx.device, graph, i);
+    if (!skip) {
+        return 0;
+    }
+    GGML_SYCL_DEBUG("%s: %s\n", __func__, graph->nodes[i + skip]->name);
+    ggml_sycl_flash_attn_ext_xmx_qsa(ctx, graph->nodes[i + skip], graph->nodes[i + 6]->src[1], graph->nodes[i + 8]->src[1],
+                                  ggml_get_op_params_f32(graph->nodes[i + 3], 0), ggml_get_op_params_f32(graph->nodes[i], 0));
+    return skip;
 }
 
 template <typename T>
