@@ -8,6 +8,7 @@
 #include "binbcast.hpp"
 #include "getrows.hpp"
 #include "qsa-score.hpp"
+#include "set_rows.hpp"
 #include "topk-radix.hpp"
 #include "topk-moe.hpp"
 #include "moe-weighted-reduction.hpp"
@@ -547,6 +548,10 @@ static bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, con
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion) {
         return 0;
+    }
+
+    if (const int n = ggml_sycl_fuse_qsa_mask(ctx, cgraph, i)) {
+        return n;
     }
 
     if (cgraph->nodes[i]->op == GGML_OP_MUL) {

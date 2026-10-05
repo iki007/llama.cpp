@@ -8129,6 +8129,9 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    if (const int n = ggml_sycl_qsa_mask_absorbs(cgraph, node_idx)) {
+        return n;
+    }
     if (const int n = ggml_sycl_qsa_topk_absorbs(cgraph, node_idx)) {
         return n;
     }
