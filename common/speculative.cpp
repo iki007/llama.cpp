@@ -1631,7 +1631,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        // Qwen drafts borrow weights and keep their own KV cache.
+        char arch[64] = {};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "qwen4exp") != 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
