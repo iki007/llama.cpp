@@ -335,12 +335,26 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+        auto init_gpu_backend = [&](ggml_backend_dev_t dev) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev) {
+                    return;
+                }
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
             }
             backends.emplace_back(backend);
+        };
+        for (const auto & dev : model.devices) {
+            init_gpu_backend(dev.dev);
+        }
+        // Borrowed weights or KV can live on other target devices.
+        if (cparams.ctx_other) {
+            for (const auto & dev : llama_get_model(cparams.ctx_other)->devices) {
+                init_gpu_backend(dev.dev);
+            }
         }
 
         // add ACCEL backends (such as BLAS)
