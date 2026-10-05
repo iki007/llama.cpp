@@ -238,6 +238,11 @@ struct llama_layer_nextn {
     struct ggml_tensor * hc_head_norm          = nullptr;
     struct ggml_tensor * hc_head_down          = nullptr;
     struct ggml_tensor * hc_head_up            = nullptr;
+
+    // optional reduced draft head: rows of the LM head for a vocabulary shortlist, and the map from each vocab id
+    // to its row (the row count for ids outside the shortlist)
+    struct ggml_tensor * draft_head            = nullptr;
+    struct ggml_tensor * draft_vocab_map       = nullptr;
 };
 
 struct llama_layer_switch_lora {
