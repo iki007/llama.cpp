@@ -7656,13 +7656,15 @@ static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgra
     f.skip.assign(cgraph->n_nodes, 0);
     f.gather.assign(cgraph->n_nodes, nullptr);
     f.beta.assign(cgraph->n_nodes, 0);
-    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_gdn_fold) {
+    f.lid_gather.assign(cgraph->n_nodes, nullptr);
+    static const bool lid_fold = ggml_sycl_get_env("GGML_SYCL_LID_FOLD", 1) != 0;
+    if (!g_ggml_sycl_enable_fusion || (!g_ggml_sycl_gdn_fold && !lid_fold)) {
         return;
     }
 
     bool any = false;
     for (int i = 0; i < cgraph->n_nodes && !any; i++) {
-        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
+        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET || cgraph->nodes[i]->op == GGML_OP_LIGHTNING_INDEXER;
     }
     if (!any) {
         return;
@@ -7724,8 +7726,41 @@ static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgra
         return true;
     };
 
+    // lightning_indexer K = reshape of GET_ROWS(quantized cache view, I32 row index): the kernel reads the cache rows
+    // through the index (qwen4exp gathers every pooled key of the QSA indexer cache each step)
+    for (int l = 0; l < cgraph->n_nodes && lid_fold; l++) {
+        const ggml_tensor * lid = cgraph->nodes[l];
+        if (lid->op != GGML_OP_LIGHTNING_INDEXER || lid->src[0]->ne[3] != 1 || lid->src[1]->ne[1] != 1) {
+            continue;
+        }
+        const ggml_tensor * gr = ggml_sycl_view_base(lid->src[1]);
+        const auto          ig = index.find(gr);
+        if (gr->op != GGML_OP_GET_ROWS || ig == index.end() || ig->second >= l || gr->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(gr) || !ggml_is_contiguous(lid->src[1]) || !only_read_by(gr, lid)) {
+            continue;
+        }
+        const ggml_tensor * kc = gr->src[0];
+        const ggml_tensor * ri = gr->src[1];
+        if ((kc->type != GGML_TYPE_Q8_0 && kc->type != GGML_TYPE_F16 && kc->type != GGML_TYPE_F32) ||
+            kc->nb[0] != ggml_type_size(kc->type) || kc->ne[0] != lid->src[1]->ne[0] || kc->ne[2] != 1 ||
+            kc->ne[3] != 1 || ri->type != GGML_TYPE_I32 || !ggml_is_contiguous(ri) ||
+            ri->ne[0] != lid->src[1]->ne[2] || ggml_nelements(ri) != ri->ne[0]) {
+            continue;
+        }
+        const ggml_tensor * cache = ggml_sycl_view_base(kc);
+        bool                ok    = untouched(ri, ig->second + 1, l);
+        for (int k = ig->second + 1; k < l && ok; k++) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            ok = ggml_nbytes(n) == 0 || ggml_sycl_is_view_or_noop(n) || ggml_sycl_view_base(n) != cache;
+        }
+        if (ok) {
+            f.lid_gather[l]    = gr;
+            f.skip[ig->second] = 1;
+        }
+    }
+
     static const int esimd_min = ggml_sycl_get_env("GGML_SYCL_GDN_ESIMD_MIN", 16);
-    for (int g = 0; g < cgraph->n_nodes; g++) {
+    for (int g = 0; g < cgraph->n_nodes && g_ggml_sycl_gdn_fold; g++) {
         const ggml_tensor * gdn = cgraph->nodes[g];
         if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || gdn->src[2]->ne[2] >= esimd_min) {
             continue;
@@ -7848,6 +7883,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
+            continue;
+        }
+        if (node->op == GGML_OP_LIGHTNING_INDEXER && gdn_folds.lid_gather[i] != nullptr) {
+            ggml_sycl_op_lightning_indexer(*sycl_ctx, node, gdn_folds.lid_gather[i]);
             continue;
         }
 #ifndef NDEBUG
