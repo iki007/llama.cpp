@@ -422,6 +422,17 @@ struct ggml_sycl_pinned_buffer {
     ~ggml_sycl_pinned_buffer() { release(); }
 };
 
+// y = act(x * s0 + b0) * s1 + b1 at the store of a mat-vec output; the default is the identity
+enum ggml_sycl_mmv_act { GGML_SYCL_MMV_ACT_NONE = 0, GGML_SYCL_MMV_ACT_SILU, GGML_SYCL_MMV_ACT_SIGMOID };
+struct ggml_sycl_mmv_epilogue {
+    int   act    = GGML_SYCL_MMV_ACT_NONE;
+    float s0     = 1.0f;
+    float b0     = 0.0f;
+    float s1     = 1.0f;
+    float b1     = 0.0f;
+    bool  active = false;
+};
+
 namespace sycl_ex = sycl::ext::oneapi::experimental;
 struct ggml_backend_sycl_context {
     int device;
@@ -459,6 +470,11 @@ struct ggml_backend_sycl_context {
         std::vector<uint8_t>              beta;   // per gated_delta_net node: beta's SIGMOID is applied at load
         std::vector<const ggml_tensor *>  lid_gather; // per lightning_indexer node: the K GET_ROWS it reads through
     } gdn_folds;
+
+    // elementwise tail of a fused mat-vec (ggml_sycl_fuse_mmv_epilogue), applied by the ESIMD mat-vec at its store;
+    // mmv_epi_done tells whether a kernel took it
+    ggml_sycl_mmv_epilogue mmv_epi;
+    bool                   mmv_epi_done = false;
 
     // The general device pool is stack-disciplined (it asserts that a free is the top of
     // the stack), so a buffer held across nodes cannot live there. Give the cache its own

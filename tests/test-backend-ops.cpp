@@ -9099,6 +9099,53 @@ struct test_lightning_indexer_gather : public test_case {
     }
 };
 
+// MUL_MAT -> [SCALE] -> [SILU | SIGMOID] -> [SCALE]: a backend may apply the tail at the mat-vec's store
+struct test_mul_mat_epilogue : public test_case {
+    const ggml_type type_a;
+    const int64_t m, n, k;
+    const bool scale0;
+    const int act; // 0 none, 1 silu, 2 sigmoid
+    const bool scale1;
+
+    std::string vars() override { return VARS_TO_STR7(type_a, m, n, k, scale0, act, scale1); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_EPILOGUE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool scale0, int act, bool scale1)
+        : type_a(type_a), m(m), n(n), k(k), scale0(scale0), act(act), scale1(scale1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        if (scale0) {
+            out = ggml_scale_bias(ctx, out, 0.25f, -0.5f);
+        }
+        if (act == 1) {
+            out = ggml_silu(ctx, out);
+        } else if (act == 2) {
+            out = ggml_sigmoid(ctx, out);
+        }
+        if (scale1) {
+            out = ggml_scale_bias(ctx, out, 1.5f, 0.125f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // small activations keep the outputs out of the sigmoid's tails, where the reference's quantized activations
+    // dominate
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t, t->type == GGML_TYPE_F32 && t->ne[1] == n ? -0.1f : -1.0f,
+                                    t->type == GGML_TYPE_F32 && t->ne[1] == n ? 0.1f : 1.0f);
+            }
+        }
+    }
+};
+
 struct test_lightning_indexer : public test_case {
     const int64_t hsk; // indexer K head size
     const int64_t nh; // num indexer heads
@@ -12449,6 +12496,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_lightning_indexer_gather(128, 4, kv, 4*kv + 9, 1, true));
     }
+
+    // Qwen3.8-Flash-Next's hyper-connection gates (scale, silu) and injections (scale, sigmoid, scale), the shared
+    // expert's gate (sigmoid); Q4_0 / F16 take routes without the fused store
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
+        for (int64_t n : { 1, 3 }) {
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 320, n, 10240, true, 1, false));
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 5, n, 10240, true, 2, true));
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 1, n, 2560, false, 2, false));
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 16, n, 256, false, 2, false));
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 64, n, 2560, true, 0, true));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_epilogue(GGML_TYPE_F32, 48, 64, 2560, true, 1, true));
 
     return test_cases;
 }

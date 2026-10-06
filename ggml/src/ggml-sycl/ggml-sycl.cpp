@@ -7863,6 +7863,77 @@ static int ggml_sycl_cpy_batch_fused(ggml_backend_sycl_context & ctx, ggml_cgrap
     return last - node_idx;
 }
 
+// MUL_MAT -> [SCALE] -> [SILU | SIGMOID] -> [SCALE], each read only by the next (Qwen3.8-Flash-Next's
+// hyper-connection gates and injections, the shared expert's gate): one launch instead of up to four. The mat-vec
+// writes into the last node; the ESIMD mat-vec applies the tail at its store, any other route gets one kernel after.
+static int ggml_sycl_fuse_mmv_epilogue(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_MMV_EPILOGUE", 1) != 0;
+    ggml_tensor *     mm      = cgraph->nodes[i];
+    if (!enabled || mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+        mm->view_src != nullptr) {
+        return 0;
+    }
+
+    ggml_sycl_mmv_epilogue e;
+    ggml_op                ops[4] = { GGML_OP_MUL_MAT };
+    int                    n      = 1;
+    int                    stage  = 0;  // 0: first scale, 1: activation, 2: second scale
+    while (i + n < cgraph->n_nodes && n < 4) {
+        const ggml_tensor * t = cgraph->nodes[i + n];
+        // a SIGMOID that a gated_delta_net applies itself (ggml_sycl_gdn_folds) reads the mat-vec's own output
+        const bool folded = (size_t) (i + n) < ctx.gdn_folds.skip.size() && ctx.gdn_folds.skip[i + n];
+        if (folded || t->src[0] != cgraph->nodes[i + n - 1] || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            break;
+        }
+        if (t->op == GGML_OP_SCALE && stage == 0) {
+            memcpy(&e.s0, (const float *) t->op_params + 0, sizeof(float));
+            memcpy(&e.b0, (const float *) t->op_params + 1, sizeof(float));
+            stage = 1;
+        } else if (t->op == GGML_OP_UNARY && stage <= 1 &&
+                   (ggml_get_unary_op(t) == GGML_UNARY_OP_SILU || ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) &&
+                   ggml_sycl_topk_moe_node_count(cgraph, i + n) == 0) {
+            e.act = ggml_get_unary_op(t) == GGML_UNARY_OP_SILU ? GGML_SYCL_MMV_ACT_SILU : GGML_SYCL_MMV_ACT_SIGMOID;
+            stage = 2;
+        } else if (t->op == GGML_OP_SCALE && stage >= 1) {
+            memcpy(&e.s1, (const float *) t->op_params + 0, sizeof(float));
+            memcpy(&e.b1, (const float *) t->op_params + 1, sizeof(float));
+            stage = 3;
+        } else {
+            break;
+        }
+        ops[n++] = t->op;
+        if (stage == 3) {
+            break;
+        }
+    }
+    if (n < 2 || !ggml_can_fuse(cgraph, i, ops, n)) {
+        return 0;
+    }
+
+    ggml_tensor * out  = cgraph->nodes[i + n - 1];
+    void *        data = mm->data;
+    e.active           = true;
+    ctx.mmv_epi        = e;
+    ctx.mmv_epi_done   = false;
+    mm->data           = out->data;  // the routes read the weights' state through dst->src[0], so keep the node
+    ggml_sycl_mul_mat(ctx, mm->src[0], mm->src[1], mm);
+    mm->data         = data;
+    ctx.mmv_epi      = {};
+    if (!ctx.mmv_epi_done) {
+        float *       x  = (float *) out->data;
+        const int64_t ne = ggml_nelements(out);
+        ctx.stream()->parallel_for(sycl::range<1>(ne), [=](sycl::id<1> j) {
+            float v = x[j] * e.s0 + e.b0;
+            if (e.act != GGML_SYCL_MMV_ACT_NONE) {
+                const float d = 1.0f + sycl::exp(-v);
+                v             = e.act == GGML_SYCL_MMV_ACT_SILU ? v / d : 1.0f / d;
+            }
+            x[j] = v * e.s1 + e.b1;
+        });
+    }
+    return n - 1;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
@@ -7889,6 +7960,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
             continue;
+        }
+        if (g_ggml_sycl_enable_fusion) {
+            if (const int n = ggml_sycl_fuse_mmv_epilogue(*sycl_ctx, cgraph, i)) {
+                i += n;
+                continue;
+            }
         }
         if (node->op == GGML_OP_LIGHTNING_INDEXER && gdn_folds.lid_gather[i] != nullptr) {
             ggml_sycl_op_lightning_indexer(*sycl_ctx, node, gdn_folds.lid_gather[i]);
