@@ -9048,6 +9048,57 @@ struct test_diag : public test_case {
 };
 
 // GGML_OP_LIGHTNING_INDEXER
+// qwen4exp QSA decode: the lightning indexer scores pooled keys gathered from a quantized cache (rows: raw | pooled)
+struct test_lightning_indexer_gather : public test_case {
+    const int64_t hsk, nh, kv, n_cells, nb;
+    const bool expose; // the gathered keys are also an output
+    ggml_tensor * idx = nullptr;
+
+    std::string vars() override { return VARS_TO_STR6(hsk, nh, kv, n_cells, nb, expose); }
+    std::string op_desc(ggml_tensor *) override { return "LIGHTNING_INDEXER_GATHER"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+
+    test_lightning_indexer_gather(int64_t hsk, int64_t nh, int64_t kv, int64_t n_cells, int64_t nb, bool expose = false)
+        : hsk(hsk), nh(nh), kv(kv), n_cells(n_cells), nb(nb), expose(expose) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2*hsk, n_cells);
+        ggml_tensor * pooled = ggml_view_2d(ctx, cache, hsk, n_cells, cache->nb[1], ggml_row_size(GGML_TYPE_Q8_0, hsk));
+        idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+        ggml_tensor * k = ggml_get_rows(ctx, pooled, idx);
+        if (expose) {
+            ggml_set_output(k);
+        }
+        k = ggml_reshape_3d(ctx, k, hsk, 1, kv);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, 1);
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t == idx) {
+                continue;
+            }
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        std::vector<int32_t> rows(kv);
+        for (int64_t i = 0; i < kv; ++i) {
+            rows[i] = (int32_t) ((i * 4 + i % 3) % n_cells);
+        }
+        ggml_backend_tensor_set(idx, rows.data(), 0, rows.size() * sizeof(int32_t));
+    }
+};
+
 struct test_lightning_indexer : public test_case {
     const int64_t hsk; // indexer K head size
     const int64_t nh; // num indexer heads
@@ -12377,6 +12428,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, nh, 65, 5, 4, 1, type_K, true));
         }
+    }
+    for (int64_t kv : { 64, 257 }) {
+        for (int64_t nb : { 1, 3, 7 }) {
+            test_cases.emplace_back(new test_lightning_indexer_gather(128, 4, kv, 4*kv + 9, nb));
+        }
+        test_cases.emplace_back(new test_lightning_indexer_gather(128, 4, kv, 4*kv + 9, 1, true));
     }
 
     return test_cases;

@@ -457,6 +457,7 @@ struct ggml_backend_sycl_context {
         std::vector<uint8_t>              skip;   // node runs inside a later gated_delta_net
         std::vector<const ggml_tensor *>  gather; // per gated_delta_net node: the state GET_ROWS it reads through
         std::vector<uint8_t>              beta;   // per gated_delta_net node: beta's SIGMOID is applied at load
+        std::vector<const ggml_tensor *>  lid_gather; // per lightning_indexer node: the K GET_ROWS it reads through
     } gdn_folds;
 
     // The general device pool is stack-disciplined (it asserts that a free is the top of

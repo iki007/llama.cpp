@@ -11,7 +11,7 @@ static void lightning_indexer_f32_sycl(
         int64_t nbw1, int64_t nbw3,
         int64_t nbm1, int64_t nbm3,
         int64_t nb1, int64_t nb3,
-        ggml_type k_type,
+        ggml_type k_type, const int32_t * k_rows,
         queue_ptr stream) {
 
     constexpr int64_t LANES = WARP_SIZE;
@@ -40,8 +40,8 @@ static void lightning_indexer_f32_sycl(
             const int64_t batch0   = (HEAD4 ? item.get_group(1) : i_bs / n_stream) * QUERY_TILE;
             const int64_t i_stream = HEAD4 ? item.get_group(0) : i_bs % n_stream;
 
-            // load K row slice into registers (row is contiguous, nbk0 == type size)
-            const char * k_base = k + i_kv*nbk2 + i_stream*nbk3;
+            // load K row slice into registers (row is contiguous, nbk0 == type size); k_rows: K row i is cache row k_rows[i]
+            const char * k_base = k + (k_rows ? (int64_t) k_rows[i_kv] : i_kv)*nbk2 + i_stream*nbk3;
             float k_local[ELEMS_PER_LANE];
             if (k_type == GGML_TYPE_F16) {
                 const sycl::half * k_row = (const sycl::half *) k_base;
@@ -151,10 +151,12 @@ static void lightning_indexer_f32_sycl(
         });
 }
 
-void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * k_gather) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
     const ggml_tensor * q = dst->src[0];
-    const ggml_tensor * k = dst->src[1];
+    // k_gather: K is GET_ROWS(cache view, row index), read straight from the cache rows (ggml_sycl_gdn_folds)
+    const ggml_tensor * k = k_gather ? k_gather->src[0] : dst->src[1];
+    const int32_t * k_rows = k_gather ? (const int32_t *) k_gather->src[1]->data : nullptr;
     const ggml_tensor * w = dst->src[2]; // weights
     const ggml_tensor * m = dst->src[3]; // mask
 
@@ -186,7 +188,8 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
     const int64_t n_head   = neq1;
     const int64_t n_batch  = neq2;
     const int64_t n_stream = neq3;
-    const int64_t n_kv     = nek2;
+    const int64_t n_kv     = k_gather ? k_gather->src[1]->ne[0] : nek2;
+    GGML_ASSERT(!k_gather || (n_stream == 1 && nek0 == n_embd && n_kv == dst->src[1]->ne[2]));
 
     GGML_ASSERT(n_embd == WARP_SIZE * 8);
 
@@ -201,10 +204,10 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
             (const char *) w->data, (const char *) m->data, (float *) dst->data,
             n_embd, n_head, n_batch, n_stream, n_kv, nem3,
             nbq1, nbq2, nbq3,
-            nbk2, nbk3,
+            k_gather ? nbk1 : nbk2, k_gather ? 0 : nbk3,
             nbw1, nbw3,
             nbm1, nbm3,
             nb1, nb3,
-            k->type,
+            k->type, k_rows,
             ctx.stream());
 }
