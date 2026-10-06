@@ -2181,7 +2181,16 @@ static void dequantize_mul_mat_vec_esimd_nc_by_len_sycl(const void * vx, const f
                                                        dpct::queue_ptr stream) {
     static_assert(ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value == 64);
     const int nb_row = ncols / 64;
-    if (nb_row >= 128) {
+    // Few row pairs keep the GPU mostly idle with the counts below (Flash-Next: the hyper-connection injections,
+    // 4 rows x 10240; ssm_alpha / ssm_beta, 48 x 2560; the shared expert's gate, 1 x 2560; the indexer's k_proj,
+    // 128 x 2560 BF16), so they take twice the threads: 2-3 blocks per thread cut them by about a third in decode.
+    // 64 threads lost again to the reduction over the partial sums.
+    const int64_t pairs = (nrows + 1) / 2;
+    if (nb_row >= 128 && pairs * 16 < 2048) {
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 32>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+    } else if (nb_row >= 32 && nb_row < 128 && pairs * 8 < 2048) {
+        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+    } else if (nb_row >= 128) {
         dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
     } else if (nb_row >= 32) {
         dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
