@@ -7677,6 +7677,10 @@ static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgra
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * n = cgraph->nodes[i];
         index[n] = i;
+        // a zero-sized view reads nothing (build_rs: the extra states of a single sequence)
+        if (ggml_nbytes(n) == 0 && ggml_sycl_is_view_or_noop(n)) {
+            continue;
+        }
         for (int k = 0; k < GGML_MAX_SRC; k++) {
             if (n->src[k] != nullptr) {
                 auto & u = uses[n->src[k]];
@@ -7699,7 +7703,8 @@ static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgra
             if (u == reader) {
                 return true;
             }
-            if (u->view_src != t || !ggml_sycl_is_view_or_noop(u)) {
+            // a reshape of a view points its view_src at the base tensor: follow the op's input instead
+            if (u->src[0] != t || !ggml_sycl_is_view_or_noop(u)) {
                 return false;
             }
             t = u;
@@ -7771,7 +7776,7 @@ static void ggml_sycl_gdn_folds(ggml_backend_sycl_context & ctx, const ggml_cgra
         const auto          ig = index.find(gr);
         if (gr->op == GGML_OP_GET_ROWS && ig != index.end() && ig->second < g && gr->type == GGML_TYPE_F32 &&
             gr->src[0]->type == GGML_TYPE_F32 && gr->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(gr->src[0]) &&
-            ggml_is_contiguous(gdn->src[5]) && gr->src[1]->ne[0] == gdn->src[2]->ne[3] &&
+            ggml_is_contiguous(gdn->src[5]) && gdn->src[5]->data == gr->data && gr->src[1]->ne[0] == gdn->src[2]->ne[3] &&
             gr->src[0]->ne[0] == ggml_nelements(gdn->src[5]) / gdn->src[5]->ne[3] && only_read_by(gr, gdn)) {
             const ggml_tensor * cache = ggml_sycl_view_base(gr->src[0]);
             bool                ok    = untouched(gr->src[1], ig->second + 1, g);
