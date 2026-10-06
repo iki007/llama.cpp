@@ -10012,6 +10012,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // short rows (one work-item per pair of values in SYCL), e.g. qwen4exp gathering 128-value pooled keys
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1}) {
+        for (int n : {32, 128, 384}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 2048, 1500, 1, 1, false));
+            test_cases.emplace_back(new test_get_rows(type, n, 300, 200, 3, 2, true, true));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -12887,6 +12894,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // qwen4exp QSA pooled-key gather at ~100k context: 25000 rows of 128 values from a q8_0 cache
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 128, 104000, 25000, 1, 1, false));
 
     // lightning_indexer
     for (int kv : { 256, 4096, 25536, 65536 }) {

@@ -24,7 +24,7 @@ static void k_get_rows(
             /*size_t s0,*/ size_t s1, size_t s2, size_t s3,
             /*size_t nb00,*/ size_t nb01, size_t nb02, size_t nb03,
             size_t s10, size_t s11, size_t s12,
-            const sycl::nd_item<3> &item_ct1/*, size_t s13*/) {
+            const sycl::nd_item<3> &item_ct1, int64_t ne10 = INT64_MAX/*, size_t s13*/) {
 
     const int i00 = (item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                      item_ct1.get_local_id(2)) *
@@ -38,7 +38,7 @@ static void k_get_rows(
                      item_ct1.get_local_id(0)) %
                     ne12;
 
-    if (i00 >= ne00) {
+    if (i00 >= ne00 || i10 >= ne10) {
         return;
     }
 
@@ -161,6 +161,24 @@ static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *sr
     //const size_t s13 = nb13 / ggml_element_size(src1);
 
     GGML_ASSERT(ne00 % 2 == 0);
+
+    // a short row would leave most of a SYCL_GET_ROWS_BLOCK_SIZE work-group idle (a 128-value row: 64 of 256 threads):
+    // give each work-group several rows instead, one work-item per pair of values
+    static const bool multi_row = ggml_sycl_get_env("GGML_SYCL_GET_ROWS_MULTI", 1) != 0;
+    if (multi_row && ne00 < 2*SYCL_GET_ROWS_BLOCK_SIZE) {
+        const int64_t n_pairs = ne00 / 2;
+        const int64_t n_rows  = std::max<int64_t>(1, SYCL_GET_ROWS_BLOCK_SIZE / n_pairs);
+        const sycl::range<3> wg(1, n_rows, n_pairs);
+        const sycl::range<3> grid(ne11 * ne12, (ne10 + n_rows - 1) / n_rows * n_rows, n_pairs);
+        stream->parallel_for(sycl::nd_range<3>(grid, wg),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 k_get_rows<qk, qr, dq>(
+                                     src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                                     s3, nb01, nb02, nb03, s10, s11, s12, item_ct1, ne10);
+                             });
+        GGML_UNUSED(ctx);
+        return;
+    }
 
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) {
