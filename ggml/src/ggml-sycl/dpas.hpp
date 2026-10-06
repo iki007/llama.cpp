@@ -308,6 +308,46 @@ template <> struct dpas_tile_traits<GGML_TYPE_IQ4_XS> {
     }
 };
 
+// Q8_0, reorder layout [qs: nb*QK_K int8] [d: nb*8 half]: a QK_K block is 8 Q8_0 blocks, block s with
+// the 32 bytes at qs + QK_K bi + 32 s and the scale d[8 bi + s].
+template <> struct dpas_tile_traits<GGML_TYPE_Q8_0> {
+    template <typename F>
+    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs = (const uint8_t *) vx;
+        const uint8_t * d  = qs + nb * QK_K;
+
+#pragma unroll
+        for (int s = 0; s < QK_K / QK8_0; ++s) {
+            simd<uint16_t, 16>    dbit = convert<uint16_t>(dpas_gather_u16(d + 2 * s, bi * (uint32_t) (QK_K / QK8_0)));
+            const simd<float, 16> drow = convert<float>(simd<sycl::half, 16>(dbit.bit_cast_view<sycl::half>().read()));
+            simd<float, 32>       sc2;
+            sc2.select<16, 2>(0) = drow;
+            sc2.select<16, 2>(1) = drow;
+
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                // 16 qs bytes per row: k 32s + 16h..
+                simd<uint32_t, 64>    w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) QK_K + 32 * s + 16 * h);
+                simd<sycl::half, 256> b;
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
+                    auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                    for (int j = 0; j < 4; j += 2) {
+                        simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
+                        simd<int8_t, 32>  qi = q.bit_cast_view<int8_t>().read();
+                        const int         kp = (4 * g + j) / 2;
+                        b.select<32, 1>(kp * 32) = convert<sycl::half>(convert<float>(qi) * sc2);
+                    }
+                }
+                fn(32 * s + 16 * h, b);
+            }
+        }
+    }
+};
+
 #endif // __INTEL_LLVM_COMPILER
 
 #endif // GGML_SYCL_DPAS_HPP
