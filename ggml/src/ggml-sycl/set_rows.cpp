@@ -36,7 +36,7 @@ int ggml_sycl_qsa_mask_absorbs(const ggml_cgraph * graph, int i) {
     const ggml_tensor * dst = n[8];
     const int64_t nk = dst->ne[0], ns = n[0]->ne[0], nt = ggml_nrows(dst);
     if (!idx || !mask || (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32) ||
-        nk <= 0 || ns <= 0 || nt <= 1 || nk > INT_MAX - ns || nt > INT_MAX ||
+        nk <= 0 || ns <= 0 || nt < 1 || nk > INT_MAX - ns || nt > INT_MAX ||
         idx->type != GGML_TYPE_I32 || idx->ne[0] != ns || idx->ne[1] != nt ||
         idx->ne[2] != 1 || idx->ne[3] != 1 || !ggml_is_contiguous(idx) ||
         mask->type != dst->type || !ggml_are_same_shape(mask, dst) || !ggml_is_contiguous(mask) ||
