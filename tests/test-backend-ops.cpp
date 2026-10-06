@@ -10988,6 +10988,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : { 1, 2, 8 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 321, n, 10240, { 1, 1 }, { 1, 1 }));
     }
+    // F32 / BF16 with few row pairs take wider ESIMD work-groups (32 threads at 160 blocks, 16 at 40 blocks)
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (int n : { 1, 2, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5, n, 10240, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1, n, 2560, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 49, n, 2560, { 1, 1 }, { 1, 1 }));
+        }
+    }
 
     // The SYCL XMX (DPAS) mat-vec takes 4-8 columns of Q4_K with at least 8M weights; the odd m ends
     // in a partial 16-row tile.
