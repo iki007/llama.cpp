@@ -6039,7 +6039,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
                                  ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], src1->ne[1]);
     const int64_t reorder_cols = dpas_cols ? std::max<int64_t>(8, src1->ne[1]) : 8;
     if (!split && (use_mul_mat_vec_q || dpas_cols) && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
-        ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols &&
+        // types without an ESIMD kernel (q4_0, iq4_nl) come here only for the XMX one
+        ((ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols) || dpas_cols) &&
         (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0) &&
         // past the ESIMD range only where the XMX mat-vec takes over (e.g. iq4_xs at 5-8 columns)
         (src1->ne[1] <= esimd_max_cols || dpas_cols) &&

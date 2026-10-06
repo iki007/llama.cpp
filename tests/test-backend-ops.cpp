@@ -11055,6 +11055,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
     }
+    // Q4_0 from 5 columns and IQ4_NL from 3 on the XMX mat-vec (MMVQ below; neither has an ESIMD kernel)
+    for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int n : { 8, 9, 16, 32 }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
+        }
+    }
     // IQ4_XS takes it from 3 columns (2 is the ESIMD side of the boundary); 4097 x 2304 has an odd block count, so
     // its d array starts at an odd half
     for (int n = 2; n <= 8; ++n) {
