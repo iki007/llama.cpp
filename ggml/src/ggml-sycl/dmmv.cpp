@@ -2200,7 +2200,15 @@ static void dequantize_mul_mat_vec_esimd_nc_any_sycl(const void * vx, const floa
     if constexpr (ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value == 64) {
         dequantize_mul_mat_vec_esimd_nc_by_len_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
     } else {
-        dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        // Q8_0 with few, long rows (Qwen3.8-Flash-Next's hyper-connection down-projections, 320 rows x 10240): the
+        // default 4 threads per row pair leave most of the GPU idle; 16 cut them by 8% in decode (8 threads by 3%),
+        // while shorter rows (640 x 2560) get slower with more threads
+        constexpr int QB = ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value;
+        if (T == GGML_TYPE_Q8_0 && (int64_t) (nrows + 1) / 2 * GGML_SYCL_DMMV_ESIMD_WG_SIZE < 2048 && ncols / QB >= 32) {
+            dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        } else {
+            dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream);
+        }
     }
 }
 
