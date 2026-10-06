@@ -2512,10 +2512,12 @@ static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, in
 // 1.08x at 3, 1.61x / 1.66x / 1.48x / 1.53x at 8). q5_K wins in op tests from 3 columns too, but those
 // matrices (<= 31 MB) stay in L2 there; in the model, streaming from memory, it pays only from 5: the
 // 27B's 4-row batch took 32.2 ms with q5_K on DPAS vs 31.2 on ESIMD, its 8-row one 38.3 vs 39.3.
+// q8_0 replaces the chunks of 8 columns past 8 (17408x5120 / 5120x17408: 3.5x / 4.7x at 9 columns,
+// 2.4x / 3.0x at 32); below 9 it is behind ESIMD on one of those two shapes.
 static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
     const auto arch     = ggml_sycl_info().devices[device].hw_info.arch;
     const int  min_cols = type == GGML_TYPE_Q4_K ? 4 : type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K ? 3 :
-                          type == GGML_TYPE_Q5_K ? 5 : 0;
+                          type == GGML_TYPE_Q5_K ? 5 : type == GGML_TYPE_Q8_0 && ncols % QK_K == 0 ? 9 : 0;
     return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= GGML_SYCL_DPAS_MAX_COLS &&
            ncols * nrows >= 8 * 1024 * 1024 &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
@@ -2615,6 +2617,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
                                                                        (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
             } else if (src0->type == GGML_TYPE_Q5_K) {
                 dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q5_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
+            } else if (src0->type == GGML_TYPE_Q8_0) {
+                dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q8_0>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
                                                                        (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
             } else {
                 dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q4_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,

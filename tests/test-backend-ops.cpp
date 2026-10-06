@@ -11050,6 +11050,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
     }
+    // Q8_0 takes it from 9 columns (8 is the ESIMD side of the boundary); 4105 rows end in a partial 16-row tile
+    for (int n : { 8, 9, 16, 17, 24, 32 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
+    }
     // IQ4_XS takes it from 3 columns (2 is the ESIMD side of the boundary); 4097 x 2304 has an odd block count, so
     // its d array starts at an odd half
     for (int n = 2; n <= 8; ++n) {
