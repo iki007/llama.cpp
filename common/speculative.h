@@ -83,6 +83,10 @@ struct common_speculative_draft_params {
     // per-request minimum draft-token probability. The effective gate is the larger of this and
     // the server-wide p_min, so a request can make drafting stricter but not looser (-1 disabled)
     float p_min = -1.0f;
+
+    // context lookup extension: the minimum match (0 = off) and the maximum draft length with the extension
+    int32_t lookup_n_min = 0;
+    int32_t lookup_n_max = 0;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

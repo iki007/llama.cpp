@@ -351,6 +351,12 @@ struct common_params_speculative_draft {
     int32_t n_max_deep = 0;
     int32_t n_ctx_deep = 0;
 
+    // extend a draft with the tokens that followed the longest earlier occurrence of the context's tail (the draft
+    // included, at least lookup_n_min tokens; 0 = off), up to lookup_n_max draft tokens in total
+    int32_t lookup_n_min = 0;
+    int32_t lookup_n_max = 14;
+    int32_t lookup_n_ctx = 0; // only once the context holds this many tokens (where drafts are short and verifying is slow)
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
@@ -422,7 +428,8 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // a draft extended from the context needs as many rollback snapshots as its tokens
+        return needs_rs_seq ? (uint32_t) std::max(draft.n_max, draft.lookup_n_min > 0 ? draft.lookup_n_max : 0) : 0u;
     }
 };
 

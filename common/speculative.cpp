@@ -3172,6 +3172,55 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     return result;
 }
 
+// Appends to a draft the tokens that followed the longest earlier occurrence of the tail of prompt + id_last + draft
+// (at least n_min tokens), up to n_max draft tokens in total. Where the output repeats the context (edits, quotes,
+// tool calls) this fills the verify batch beyond the drafter's own length.
+static void common_speculative_lookup_extend(const llama_tokens & prompt, llama_token id_last, llama_tokens & draft, int n_min, int n_max) {
+    const int64_t n_prompt = (int64_t) prompt.size();
+    const int64_t n        = n_prompt + 1 + (int64_t) draft.size();
+    const int     n_ext    = n_max - (int) draft.size();
+    if (n_min <= 0 || n_ext <= 0 || n <= n_min) {
+        return;
+    }
+
+    auto at = [&](int64_t i) -> llama_token {
+        return i < n_prompt ? prompt[i] : i == n_prompt ? id_last : draft[i - n_prompt - 1];
+    };
+
+    // the tail, last token first
+    const int n_back = 64;
+    llama_token tail[n_back];
+    const int n_tail = (int) std::min<int64_t>(n_back, n);
+    for (int m = 0; m < n_tail; ++m) {
+        tail[m] = at(n - 1 - m);
+    }
+
+    // e = end of an earlier occurrence; the most recent of the longest matches wins
+    int64_t best     = -1;
+    int     best_len = 0;
+    for (int64_t e = n - 1; e >= n_min; --e) {
+        if (at(e - 1) != tail[0]) {
+            continue;
+        }
+        int m = 1;
+        while (m < n_tail && e - 1 - m >= 0 && at(e - 1 - m) == tail[m]) {
+            m++;
+        }
+        if (m >= n_min && m > best_len) {
+            best     = e;
+            best_len = m;
+        }
+    }
+    if (best < 0) {
+        return;
+    }
+
+    for (int64_t i = best; i < n && (int) (i - best) < n_ext; ++i) {
+        const llama_token t = at(i);
+        draft.push_back(t);
+    }
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3233,6 +3282,10 @@ void common_speculative_draft(common_speculative * spec) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
                             common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
                             impl.get()->n_call_draft, result.size());
+
+                    if (dp.lookup_n_min > 0) {
+                        common_speculative_lookup_extend(*dp.prompt, dp.id_last, result, dp.lookup_n_min, dp.lookup_n_max);
+                    }
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();

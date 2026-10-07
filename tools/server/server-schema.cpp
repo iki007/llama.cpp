@@ -219,6 +219,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Context length from which speculative.n_max_deep applies (0 = never)"));
 
+    add((new field_num("speculative.lookup_n_min", params.speculative.draft.lookup_n_min))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Minimum match for extending a draft from the context (0 = no extension). Only if the server was launched with --spec-draft-lookup-n-min"));
+
     // TODO: switching the speculator type or ngram parameters per request would require
     //       rebuilding the implementation, so those stay server-wide.
 #if 0

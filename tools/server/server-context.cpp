@@ -59,8 +59,13 @@ static common_speculative_output_limits server_output_limits(const common_params
         return { params.n_batch, 1 };
     }
 
-    auto result = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+    // a draft extended from the context can be longer than n_max
+    int32_t n_draft = common_speculative_n_max(&params.speculative);
+    if (params.speculative.draft.lookup_n_min > 0) {
+        n_draft = std::max(n_draft, params.speculative.draft.lookup_n_max);
+    }
+
+    auto result = common_speculative_get_output_limits(params.n_batch, params.n_parallel, n_draft);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -3932,6 +3937,20 @@ private:
                             /* .seed     = */ slot.task->params.sampling.seed,
                             /* .p_min    = */ slot.task->params.speculative.draft.p_min,
                         };
+
+                        // the context lookup may extend the draft beyond n_max, up to what fits the slot. The rollback
+                        // snapshots are sized at launch, so a request can turn the extension off but not on
+                        if (params_base.speculative.draft.lookup_n_min > 0 && slot.task->params.speculative.draft.lookup_n_min > 0 &&
+                            slot.prompt.n_tokens() >= params_base.speculative.draft.lookup_n_ctx) {
+                            int n_room = slot.n_ctx - slot.prompt.n_tokens() - 2;
+                            if (slot.n_remaining() > 0) {
+                                n_room = std::min(n_room, slot.n_remaining() - 1);
+                            }
+
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dp.lookup_n_min = slot.task->params.speculative.draft.lookup_n_min;
+                            dp.lookup_n_max = std::min(params_base.speculative.draft.lookup_n_max, n_room);
+                        }
 
                         drafting.push_back(&slot);
                     }

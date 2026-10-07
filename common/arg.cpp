@@ -4227,6 +4227,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DEEP_CTX"));
     add_opt(common_arg(
+        {"--spec-draft-lookup-n-min"}, "N",
+        string_format("extend a draft with the tokens that followed the longest earlier occurrence of the context's tail, "
+                      "if at least N tokens match, the draft included (default: %d, 0 = off)", params.speculative.draft.lookup_n_min),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.lookup_n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKUP_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-lookup-n-max"}, "N",
+        string_format("maximum number of draft tokens with the --spec-draft-lookup-n-min extension (default: %d)", params.speculative.draft.lookup_n_max),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.lookup_n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKUP_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-lookup-ctx"}, "N",
+        string_format("context length from which --spec-draft-lookup-n-min applies (default: %d)", params.speculative.draft.lookup_n_ctx),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.lookup_n_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKUP_CTX"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {
