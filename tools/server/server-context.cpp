@@ -313,6 +313,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // n_tokens of the context checkpoint this task restored, while nothing was decoded since (-1 otherwise)
+    int64_t n_tokens_ckpt_restored = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -2744,10 +2747,19 @@ private:
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+        // the checkpoint this task restored still holds the current state when nothing was decoded since: keep it
+        // (checkpoints are shared and immutable, so it keeps the id_task and positions it was created with)
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if ((*it)->n_tokens == n_tokens_new) {
+                    if (slot.n_tokens_ckpt_restored == n_tokens_new) {
+                        const auto & cur = **it;
+                        SLT_TRC(slot,
+                                "kept context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                        return;
+                    }
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
@@ -4031,6 +4043,8 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        slot.n_tokens_ckpt_restored = -1;
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -4274,6 +4288,7 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
 
+                                        slot.n_tokens_ckpt_restored = (int64_t) reuse.n_past == cur.n_tokens ? cur.n_tokens : -1;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
                                     }
                                 }
@@ -4589,6 +4604,9 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
+
+                    // the batch below moves the slot past the checkpoint it restored
+                    slot.n_tokens_ckpt_restored = -1;
                 }
 
                 if (!slot_batched) {
