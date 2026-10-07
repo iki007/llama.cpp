@@ -5939,6 +5939,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         ggml_is_contiguous(dst) && dst->ne[2] == 1 && dst->ne[3] == 1 &&
         ggml_get_op_params_i32(dst, 0) == GGML_PREC_DEFAULT &&
         !ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], ncols_y)) {
+        // the chunks can take kernels with and without a fused tail (ggml_sycl_fuse_mmv_epilogue), e.g. a last chunk
+        // of one column: none applies it, the caller's own pass does for all columns
+        const ggml_sycl_mmv_epilogue epi = ctx.mmv_epi;
+        ctx.mmv_epi = {};
         for (int64_t c0 = 0; c0 < ncols_y; c0 += 8) {
             const int64_t nc = std::min<int64_t>(8, ncols_y - c0);
             ggml_tensor src1_c = *src1;
@@ -5952,6 +5956,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
             dst_c.src[1] = &src1_c;
             ggml_sycl_mul_mat(ctx, src0, &src1_c, &dst_c);
         }
+        ctx.mmv_epi = epi;
         return;
     }
 

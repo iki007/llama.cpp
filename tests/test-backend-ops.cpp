@@ -12521,6 +12521,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat_epilogue(GGML_TYPE_F32, 48, 64, 2560, true, 1, true));
+    // column chunks (9 to 32 src1 rows) whose last chunk is one row or a full one: the tail is applied to every row
+    for (ggml_type t : { GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S }) {
+        for (int64_t n : { 9, 16, 17, 25 }) {
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 64, n, 2560, true, 1, false));
+            test_cases.emplace_back(new test_mul_mat_epilogue(t, 320, n, 1024, false, 2, true));
+        }
+    }
 
     return test_cases;
 }
