@@ -4041,7 +4041,28 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // the prompt with the fewest tokens left goes first: a short one does not wait behind a long one
+            std::vector<server_slot *> prompting;
+            for (auto & slot : slots) {
+                prompting.push_back(&slot);
+            }
+            {
+                const auto n_left = [](const server_slot * slot) -> int64_t {
+                    if (slot->state == SLOT_STATE_PROCESSING_PROMPT) {
+                        return slot->task->n_tokens() - slot->prompt.n_tokens();
+                    }
+                    if (slot->state == SLOT_STATE_STARTED) {
+                        const int64_t n_cached = slot->task->params.cache_prompt ? slot->prompt.tokens.get_common_prefix(slot->task->tokens) : 0;
+                        return slot->task->n_tokens() - n_cached;
+                    }
+                    return 0;
+                };
+                std::stable_sort(prompting.begin(), prompting.end(), [&](const server_slot * a, const server_slot * b) {
+                    return n_left(a) < n_left(b);
+                });
+            }
+
+            iterate(prompting, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
