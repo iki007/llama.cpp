@@ -9,6 +9,7 @@
         #define GGML_SYCL_DMMV_HAS_BF16
     #endif
     #include <sycl/ext/intel/esimd.hpp>
+    #include <sycl/ext/intel/experimental/esimd/memory.hpp>
     #include "esimd.hpp"
     #include "dpas.hpp"
     #define GGML_SYCL_DMMV_HAS_ESIMD
@@ -2267,12 +2268,22 @@ static bool dequantize_mul_mat_vec_reorder_esimd_ncols_sycl(const void * vx, con
 // The TPW threads of a work-group (ggml_sycl_dmmv_dpas_tpw) split the k blocks and sum through
 // local memory.
 // ---------------------------------------------------------------------------
+// 2D block loads need a 64-byte aligned surface base and a pitch in whole 16 bytes (GGML_SYCL_DPAS_A2D=0: off)
+static bool ggml_sycl_dpas_a2d(const sycl::half * y, int64_t y_stride) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_DPAS_A2D", 1) != 0;
+    return enabled && ((uintptr_t) y % 64) == 0 && (y_stride * (int64_t) sizeof(sycl::half)) % 16 == 0;
+}
+
+// The activations of a k step are one 2D block load when y allows it (a2d: 64-byte aligned base, pitch a multiple of
+// 16 bytes): one message for NC columns x 16 halves, already in DPAS A order, instead of one load per column.
 template <ggml_type T, int NC, int TPW>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                               const int nrows, const int64_t y_stride, const int64_t dst_stride,
-                                              sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
+                                              const bool a2d, sycl::local_accessor<float, 1> lmem,
+                                              const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
+    namespace xmx    = sycl::ext::intel::esimd::xmx;
+    namespace esimd_x = sycl::ext::intel::experimental::esimd;
     using traits  = dpas_tile_traits<T>;
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
 
@@ -2286,15 +2297,23 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
     rows.merge(simd<uint32_t, ROWS>(nrows - 1), rows >= (uint32_t) nrows);
     const simd<uint32_t, ROWS> row_blk = rows * (uint32_t) nb_row;
 
+    esimd_x::config_2d_mem_access<sycl::half, 16, NC, 1> a_desc(y, (unsigned) ncols * 2 - 1, NC - 1,
+                                                                 (unsigned) y_stride * 2 - 1, 0, 0);
+
     // acc[c*16 + n]: column c, row row0 + n
     simd<float, NC * ROWS> acc = 0.0f;
     for (int ib = tid; ib < nb_row; ib += TPW) {
         const sycl::half * yb = y + (size_t) ib * QK_K;
         traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
             simd<sycl::half, NC * 16> a;
+            if (a2d) {
+                a_desc.set_x(ib * QK_K + koff);
+                a = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
+            } else {
 #pragma unroll
-            for (int c = 0; c < NC; ++c) {
-                a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + c * y_stride + koff);
+                for (int c = 0; c < NC; ++c) {
+                    a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + c * y_stride + koff);
+                }
             }
             acc = xmx::dpas<8, NC, float, float>(acc, b, a);
         });
@@ -2333,11 +2352,13 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
     GGML_ASSERT(ncols % QK_K == 0);
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
     const int     workgroups = (nrows + ROWS - 1) / ROWS;
+    const bool    a2d        = ggml_sycl_dpas_a2d(y, y_stride);
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NC * ROWS), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
                        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                           dequantize_mul_mat_vec_dpas<T, NC, TPW>(vx, y, dst, ncols, nrows, y_stride, dst_stride, lmem, it);
+                           dequantize_mul_mat_vec_dpas<T, NC, TPW>(vx, y, dst, ncols, nrows, y_stride, dst_stride, a2d, lmem,
+                                                                   it);
                        });
     });
 }
@@ -2347,10 +2368,11 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
 template <ggml_type T, int NG, int TPW>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
-                                                   const int64_t dst_stride, sycl::local_accessor<float, 1> lmem,
-                                                   const sycl::nd_item<1> & it) {
+                                                   const int64_t dst_stride, const bool a2d,
+                                                   sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
+    namespace xmx    = sycl::ext::intel::esimd::xmx;
+    namespace esimd_x = sycl::ext::intel::experimental::esimd;
     using traits  = dpas_tile_traits<T>;
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
     constexpr int NC   = 8;
@@ -2371,16 +2393,25 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
     for (int g = 0; g < NG; ++g) {
         acc[g] = 0.0f;
     }
+    // rows (columns of y) past ncols_y read as zero through the 2D load; their sums are not written
+    esimd_x::config_2d_mem_access<sycl::half, 16, NC, 1> a_desc(y, (unsigned) ncols * 2 - 1, (unsigned) ncols_y - 1,
+                                                                 (unsigned) y_stride * 2 - 1, 0, 0);
     for (int ib = tid; ib < nb_row; ib += TPW) {
         const sycl::half * yb = y + (size_t) ib * QK_K;
         traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
+            a_desc.set_x(ib * QK_K + koff);
 #pragma unroll
             for (int g = 0; g < NG; ++g) {
                 simd<sycl::half, NC * 16> a;
+                if (a2d) {
+                    a_desc.set_y(g * NC);
+                    a = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
+                } else {
 #pragma unroll
-                for (int c = 0; c < NC; ++c) {
-                    const int col = g * NC + c < ncols_y ? g * NC + c : ncols_y - 1;
-                    a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + col * y_stride + koff);
+                    for (int c = 0; c < NC; ++c) {
+                        const int col = g * NC + c < ncols_y ? g * NC + c : ncols_y - 1;
+                        a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + col * y_stride + koff);
+                    }
                 }
                 acc[g] = xmx::dpas<8, NC, float, float>(acc[g], b, a);
             }
@@ -2430,12 +2461,13 @@ static void dequantize_mul_mat_vec_dpas_wide_sycl(const void * vx, const sycl::h
     GGML_ASSERT(ncols % QK_K == 0);
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
     const int     workgroups = (nrows + ROWS - 1) / ROWS;
+    const bool    a2d        = ggml_sycl_dpas_a2d(y, y_stride);
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NG * 8 * ROWS), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
                        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                            dequantize_mul_mat_vec_dpas_wide<T, NG, TPW>(vx, y, dst, ncols, nrows, ncols_y, y_stride,
-                                                                        dst_stride, lmem, it);
+                                                                        dst_stride, a2d, lmem, it);
                        });
     });
 }
