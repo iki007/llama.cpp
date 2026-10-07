@@ -308,6 +308,9 @@ struct server_slot {
 
     // n_tokens of the context checkpoint this task restored, while nothing was decoded since (-1 otherwise)
     int64_t n_tokens_ckpt_restored = -1;
+
+    // the last batch of the prompt ended at the prompt step (--prompt-step), not at a checkpoint place
+    bool prompt_step_cut = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -4041,6 +4044,12 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // while other slots generate, the prompts take the batch in steps, so that the generated tokens keep coming
+            int32_t n_batch_prompt = n_batch;
+            if (params_base.n_prompt_step > 0 && !generating.empty()) {
+                n_batch_prompt = std::min(n_batch, batch.size() + params_base.n_prompt_step);
+            }
+
             // the prompt with the fewest tokens left goes first: a short one does not wait behind a long one
             std::vector<server_slot *> prompting;
             for (auto & slot : slots) {
@@ -4063,7 +4072,7 @@ private:
             }
 
             iterate(prompting, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4102,6 +4111,7 @@ private:
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         slot.n_tokens_ckpt_restored = -1;
+                        slot.prompt_step_cut        = false;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4556,6 +4566,11 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // the prompt step applies to prompts that can be cut anywhere
+                    const int32_t n_batch_slot = slot.can_split() && slot.task->type == SERVER_TASK_TYPE_COMPLETION ? n_batch_prompt : n_batch;
+
+                    bool step_cut = false;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4625,6 +4640,12 @@ private:
                                 break;
                             }
                         }
+
+                        // the prompt step ends here, the rest goes to the next batches
+                        if (n_batch_slot < n_batch && batch.size() >= n_batch_slot) {
+                            step_cut = slot.prompt.n_tokens() < slot.task->n_tokens();
+                            break;
+                        }
                     }
 
                     // the number of tokens added to the batch for the current slot
@@ -4632,7 +4653,10 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // a batch that starts where a prompt step ended is not at one of the checkpoint places above
+                    const bool near_prompt_end = !slot.prompt_step_cut && slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+
+                    slot.prompt_step_cut = step_cut;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
