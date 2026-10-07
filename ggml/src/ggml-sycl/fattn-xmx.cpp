@@ -888,12 +888,12 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
     size_t       k_nb1 = K->nb[1], k_nb2 = K->nb[2], v_nb1 = V->nb[1], v_nb2 = V->nb[2];
-    ggml_sycl_fattn_alloc K_f16(ctx.fattn_buffers().K);
-    ggml_sycl_fattn_alloc V_f16(ctx.fattn_buffers().V);
     if (q8 && !direct) {
+        // the f16 staging of a cache that is not f16 is part of the node's allocation (ggml_sycl_fattn_get_extra)
         const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
-        sycl::half * Kh = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr : K_f16.alloc(ggml_nelements(K));
-        sycl::half * Vh = extra.V_buffer_ptr ? (sycl::half *) extra.V_buffer_ptr : V_f16.alloc(ggml_nelements(V));
+        GGML_ASSERT(extra.K_buffer_ptr && extra.V_buffer_ptr);
+        sycl::half * Kh = (sycl::half *) extra.K_buffer_ptr;
+        sycl::half * Vh = (sycl::half *) extra.V_buffer_ptr;
         GGML_ASSERT((uintptr_t) Kh % 64 == 0 && (uintptr_t) Vh % 64 == 0);
         // one work-item per 8 values of a row (head, token, group); rows of masked spans stay stale and are never read
         for (const ggml_tensor * t : { K, V }) {
