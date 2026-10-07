@@ -5876,6 +5876,23 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
 }
 
 
+// From 9 columns MMVQ unpacks the weights once per column. For the K-quants two chunks of 8 columns through the
+// ESIMD kernel are faster at 9 to 16 columns. Qwen3.8-27B with two sequences decoding together (16 columns,
+// reordered weights, per call on an Arc Pro B70): q3_K ffn 363 -> 205 us, q5_K attn_k / attn_v 105 -> 39 us, q6_K
+// 46 -> 34 us (the larger q4_K / q5_K / q6_K matrices take the XMX mat-vec instead). Not Q8_0: its reordered MMVQ
+// is faster than two chunks (ssm_alpha 29 -> 34 us); iq3_s and iq4_xs lose as well (0.7-0.8x on small matrices).
+static bool ggml_sycl_chunk_cols_from_9(const ggml_tensor * src0) {
+    switch (src0->type) {
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // The F16/BF16 qk=1 kernel iterates with stride 2*DMMV_X, requiring ne[0] to be
     // a multiple of 2*DMMV_X. Quantized types use block-structured kernels that only
@@ -5931,8 +5948,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // 17 to 32 columns of a type with no wide XMX kernel: chunks of 8 columns keep the decode kernels, where
     // dequantize + GEMM costs 2-30x more per call (several sequences decoding together). Qwen3.8-27B with 4
     // sessions, per call: a q4_0 draft head 23.9 ms -> 4 x 0.7, q3_K 0.81 ms -> 4 x 0.11, iq3_s 1.34 -> 4 x 0.13.
-    const int64_t ncols_y = src1->ne[1];
-    if (!split && !g_ggml_sycl_prioritize_dmmv && dst->op == GGML_OP_MUL_MAT && ncols_y > MMVQ_MAX_BATCH_SIZE &&
+    // From 9 columns for the types of ggml_sycl_chunk_cols_from_9() (two sequences decoding together).
+    const int64_t ncols_y   = src1->ne[1];
+    const int64_t chunk_min = ggml_sycl_chunk_cols_from_9(src0) ? 8 : MMVQ_MAX_BATCH_SIZE;
+    if (!split && !g_ggml_sycl_prioritize_dmmv && dst->op == GGML_OP_MUL_MAT && ncols_y > chunk_min &&
         ncols_y <= 32 && ggml_sycl_supports_reorder_mmvq(src0->type) && should_reorder_tensor(ctx, dst, ncols_y) &&
         !ggml_sycl_in_compute_buffer(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
