@@ -12624,18 +12624,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat_epilogue(GGML_TYPE_F32, 48, 64, 2560, true, 1, true));
-    // column chunks (9 to 32 src1 rows) whose last chunk is one row or a full one: the tail is applied to every row
+    // column chunks (9 to 32 src1 rows, 33 to 128 in chunks of 32) whose last chunk is one row or a full one: the
+    // tail is applied to every row
     for (ggml_type t : { GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S }) {
-        for (int64_t n : { 9, 16, 17, 25 }) {
+        for (int64_t n : { 9, 16, 17, 25, 33, 40, 64 }) {
             test_cases.emplace_back(new test_mul_mat_epilogue(t, 64, n, 2560, true, 1, false));
             test_cases.emplace_back(new test_mul_mat_epilogue(t, 320, n, 1024, false, 2, true));
         }
     }
-    // batches past the mat-vec kernels on a weight a one-row MUL_MAT has reordered: 33 to 64 rows (the dequantizing
-    // XMX GEMM where a type has one) and wider (dequantize + library GEMM)
+    // batches past 32 rows on a weight a one-row MUL_MAT has reordered: up to 128 rows in chunks of 32 where a type
+    // has a mat-vec kernel that wide, else the dequantizing XMX GEMM (33 to 64 rows) or dequantize + library GEMM
     for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                          GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL }) {
-        for (int64_t n : { 33, 48, 64, 96 }) {
+        for (int64_t n : { 33, 48, 64, 65, 96, 128, 129 }) {
             test_cases.emplace_back(new test_mul_mat_reordered(t, 4096, n, 2048));
             test_cases.emplace_back(new test_mul_mat_reordered(t, 1030, n, 2560));
         }

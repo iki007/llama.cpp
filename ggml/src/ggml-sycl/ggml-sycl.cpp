@@ -5964,21 +5964,30 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // dequantize + GEMM costs 2-30x more per call (several sequences decoding together). Qwen3.8-27B with 4
     // sessions, per call: a q4_0 draft head 23.9 ms -> 4 x 0.7, q3_K 0.81 ms -> 4 x 0.11, iq3_s 1.34 -> 4 x 0.13.
     // From 9 columns for the types of ggml_sycl_chunk_cols_from_9() (two sequences decoding together).
+    // 33 to 128 columns of a type with the wide XMX mat-vec: chunks of 32 columns keep that kernel (short prompt
+    // batches, many sequences decoding together). Qwen3.8-27B on two cards, per batch: 33 columns 148.7 ->
+    // 84.4 ms, 64 columns 164.1 -> 118.6, 128 columns 233.4 -> 215.3; from 160 columns the GEMM routes win.
+    // Chunks of 8 columns past 32 lose to them (64 columns: +13 ms for 11 matrices).
+    // GGML_SYCL_CHUNK_MAX_COLS sets the limit, 32 turns the wide chunks off.
     const int64_t ncols_y   = src1->ne[1];
     const int64_t chunk_min = ggml_sycl_chunk_cols_from_9(src0) ? 8 : MMVQ_MAX_BATCH_SIZE;
+    static const int64_t chunk_max = ggml_sycl_get_env("GGML_SYCL_CHUNK_MAX_COLS", 128);
+    const bool chunk_wide = ncols_y > 32 && ncols_y <= chunk_max &&
+                            ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], 32);
+    const int64_t chunk_cols = chunk_wide ? 32 : 8;
     if (!split && !g_ggml_sycl_prioritize_dmmv && dst->op == GGML_OP_MUL_MAT && ncols_y > chunk_min &&
-        ncols_y <= 32 && ggml_sycl_supports_reorder_mmvq(src0->type) && should_reorder_tensor(ctx, dst, ncols_y) &&
+        (ncols_y <= 32 || chunk_wide) && ggml_sycl_supports_reorder_mmvq(src0->type) && should_reorder_tensor(ctx, dst, ncols_y) &&
         !ggml_sycl_in_compute_buffer(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
         ggml_is_contiguous(dst) && dst->ne[2] == 1 && dst->ne[3] == 1 &&
         ggml_get_op_params_i32(dst, 0) == GGML_PREC_DEFAULT &&
-        !ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], ncols_y)) {
+        (chunk_wide || !ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], ncols_y))) {
         // the chunks can take kernels with and without a fused tail (ggml_sycl_fuse_mmv_epilogue), e.g. a last chunk
         // of one column: none applies it, the caller's own pass does for all columns
         const ggml_sycl_mmv_epilogue epi = ctx.mmv_epi;
         ctx.mmv_epi = {};
-        for (int64_t c0 = 0; c0 < ncols_y; c0 += 8) {
-            const int64_t nc = std::min<int64_t>(8, ncols_y - c0);
+        for (int64_t c0 = 0; c0 < ncols_y; c0 += chunk_cols) {
+            const int64_t nc = std::min<int64_t>(chunk_cols, ncols_y - c0);
             ggml_tensor src1_c = *src1;
             src1_c.ne[1] = nc;
             src1_c.nb[2] = src1_c.nb[3] = nc * src1->nb[1];
