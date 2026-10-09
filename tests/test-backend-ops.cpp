@@ -9139,6 +9139,63 @@ struct test_lightning_indexer_gather : public test_case {
     }
 };
 
+// MUL_MAT with one src1 row, then with n rows on the same weight: a backend may rewrite the weight in another layout
+// at the first one, and the second has to read that layout
+struct test_mul_mat_reordered : public test_case {
+    const ggml_type type_a;
+    const int64_t m, n, k;
+
+    std::string vars() override { return VARS_TO_STR4(type_a, m, n, k); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_REORDERED"; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_reordered(ggml_type type_a, int64_t m, int64_t n, int64_t k) : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * bn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * o1 = ggml_mul_mat(ctx, a, b1);
+        ggml_tensor * on = ggml_mul_mat(ctx, a, bn);
+        // o1 is reached first, through src[0] of the add, so it runs before on
+        return ggml_add(ctx, ggml_repeat(ctx, o1, on), on);
+    }
+};
+
+// the same for the experts of a MUL_MAT_ID: one token, then n tokens
+struct test_mul_mat_id_reordered : public test_case {
+    const ggml_type type_a;
+    const int n_mats, n_used;
+    const int64_t m, n, k;
+
+    std::string vars() override { return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_REORDERED"; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_id_reordered(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used < n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * out[2];
+        for (int i = 0; i < 2; i++) {
+            const int64_t n_tokens = i == 0 ? 1 : n;
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+            ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n_tokens);
+            out[i] = ggml_mul_mat_id(ctx, as, b, ids);
+        }
+        // the one-token op is reached first, through src[0] of the add
+        return ggml_add(ctx, ggml_repeat(ctx, out[0], out[1]), out[1]);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // MUL_MAT -> [SCALE] -> [SILU | SIGMOID] -> [SCALE]: a backend may apply the tail at the mat-vec's store
 struct test_mul_mat_epilogue : public test_case {
     const ggml_type type_a;
@@ -12572,6 +12629,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : { 9, 16, 17, 25 }) {
             test_cases.emplace_back(new test_mul_mat_epilogue(t, 64, n, 2560, true, 1, false));
             test_cases.emplace_back(new test_mul_mat_epilogue(t, 320, n, 1024, false, 2, true));
+        }
+    }
+    // batches past the mat-vec kernels on a weight a one-row MUL_MAT has reordered: 33 to 64 rows (the dequantizing
+    // XMX GEMM where a type has one) and wider (dequantize + library GEMM)
+    for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                         GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n : { 33, 48, 64, 96 }) {
+            test_cases.emplace_back(new test_mul_mat_reordered(t, 4096, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_reordered(t, 1030, n, 2560));
+        }
+    }
+    // 4 experts, 2 per token: about n / 2 rows per expert
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS,
+                         GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n : { 80, 96, 112, 200 }) {
+            test_cases.emplace_back(new test_mul_mat_id_reordered(t, 4, 2, 1024, n, 2048));
         }
     }
 
