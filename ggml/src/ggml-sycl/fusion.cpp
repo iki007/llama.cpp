@@ -103,6 +103,12 @@ static bool ggml_sycl_should_fuse_mul_mat_id_glu(const ggml_tensor * gate, const
     return true;
 }
 
+// the unary ops the fused unary chains in element_wise.cpp have a functor for
+static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
+    return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
+           unary_op == GGML_UNARY_OP_SOFTPLUS;
+}
+
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops) {
 #ifndef NDEBUG
