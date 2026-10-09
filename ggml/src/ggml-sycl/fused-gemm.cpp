@@ -371,19 +371,15 @@ static __dpct_inline__ void fg_stage_a(const block_iq4_nl * __restrict__ xrow, c
 // iq3_s: k step kb is sub-block kb % 8 of superblock kb / 8. The superblock is 110 bytes, so read
 // only the fields of that sub-block instead of copying the block. Same decode as
 // dequantize_block_iq3_s: grid entries are taken as dwords and the sign bit is a plain shift.
+// The decode takes the fields of one sub-block, so the reorder (SoA) layout below shares it.
 template <typename E>
-static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, const int kb, typename E::pair * a) {
-    static_assert(QK_K == 256, "the iq3_s A stage assumes 8 sub-blocks per superblock");
-    const block_iq3_s * blk = xrow + kb / (QK_K / 32);
-    const int           ib8 = kb % (QK_K / 32);
-    const uint8_t *     qs  = blk->qs + 8 * ib8;
-    const int           qh  = blk->qh[ib8];
-    const float         d   = (float) blk->d * (1 + 2 * ((blk->scales[ib8 / 2] >> (4 * (ib8 % 2))) & 0xf));
+static __dpct_inline__ void fg_decode_iq3_s(const uint8_t * __restrict__ qs, const int qh,
+                                            const uint8_t * __restrict__ sgn, const float d, typename E::pair * a) {
 #pragma unroll
     for (int il = 0; il < 4; ++il) {
         const uint32_t grid1 = iq3s_grid[qs[2 * il + 0] | ((qh << (8 - 2 * il)) & 256)];
         const uint32_t grid2 = iq3s_grid[qs[2 * il + 1] | ((qh << (7 - 2 * il)) & 256)];
-        const int      signs = blk->signs[4 * ib8 + il];
+        const int      signs = sgn[il];
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             const float g1a = (float) ((grid1 >> (16 * j + 0)) & 0xff);
@@ -397,6 +393,15 @@ static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, co
                                         d * ((signs & (1 << (s + 5))) ? -g2b : g2b));
         }
     }
+}
+
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, const int kb, typename E::pair * a) {
+    static_assert(QK_K == 256, "the iq3_s A stage assumes 8 sub-blocks per superblock");
+    const block_iq3_s * blk = xrow + kb / (QK_K / 32);
+    const int           ib8 = kb % (QK_K / 32);
+    const float         d   = (float) blk->d * (1 + 2 * ((blk->scales[ib8 / 2] >> (4 * (ib8 % 2))) & 0xf));
+    fg_decode_iq3_s<E>(blk->qs + 8 * ib8, blk->qh[ib8], blk->signs + 4 * ib8, d, a);
 }
 
 // values per stored block, so a row of K values is K/qk blocks
@@ -734,6 +739,62 @@ template <> struct fg_soa<block_q6_K> {
 };
 
 
+// iq4_nl, iq4_xs and iq3_s are reordered too, with reorder_qw_iq4_nl(), reorder_qw_iq4_xs() and
+// reorder_qw_iq3_s().
+
+// 32 iq4_nl or iq4_xs values: the low nibbles of qs[0..15], then the high ones
+template <typename E>
+static __dpct_inline__ void fg_decode_iq4(const uint8_t * __restrict__ qs, const float d, typename E::pair * a) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        a[j]     = E::make(d * kvalues_iq4nl[qs[2 * j] & 0xf], d * kvalues_iq4nl[qs[2 * j + 1] & 0xf]);
+        a[8 + j] = E::make(d * kvalues_iq4nl[qs[2 * j] >> 4],  d * kvalues_iq4nl[qs[2 * j + 1] >> 4]);
+    }
+}
+
+template <> struct fg_soa<block_iq4_nl> {
+    static constexpr bool supported = true;
+    // [qs][d]
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int,
+                                      typename E::pair * a) {
+        const float d = (float) ((const sycl::half *) (x + nblocks * (QK4_NL / 2)))[ib];
+        fg_decode_iq4<E>(x + ib * (QK4_NL / 2), d, a);
+    }
+};
+
+template <> struct fg_soa<block_iq4_xs> {
+    static constexpr bool supported = true;
+    // [qs][scales_l][scales_h][d]
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
+                                      typename E::pair * a) {
+        const int          sb       = kb % (QK_K / 32);
+        const uint8_t *    scales_l = x + nblocks * (QK_K / 2);
+        const uint16_t *   scales_h = (const uint16_t *) (scales_l + nblocks * (QK_K / 64));
+        const sycl::half * dp       = (const sycl::half *) (scales_h + nblocks);
+        const float d = (float) dp[ib] * ((((scales_l[ib * (QK_K / 64) + sb / 2] >> (4 * (sb % 2))) & 0xf) |
+                                           (((scales_h[ib] >> (2 * sb)) & 3) << 4)) - 32);
+        fg_decode_iq4<E>(x + ib * (QK_K / 2) + 16 * sb, d, a);
+    }
+};
+
+template <> struct fg_soa<block_iq3_s> {
+    static constexpr bool supported = true;
+    // [qs][qh][signs][scales+d]
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
+                                      typename E::pair * a) {
+        const int       sb    = kb % (QK_K / 32);
+        const uint8_t * qh    = x + nblocks * (QK_K / 4);
+        const uint8_t * signs = qh + nblocks * (QK_K / 32);
+        const uint8_t * sd    = signs + nblocks * (QK_K / 8) + ib * ((QK_K / 64) + sizeof(sycl::half));
+        const float d = (float) *(const sycl::half *) (sd + QK_K / 64) * (1 + 2 * ((sd[sb / 2] >> (4 * (sb % 2))) & 0xf));
+        fg_decode_iq3_s<E>(x + ib * (QK_K / 4) + 8 * sb, qh[ib * (QK_K / 32) + sb], signs + ib * (QK_K / 8) + 4 * sb, d,
+                           a);
+    }
+};
+
 // one SG_ROWS x BN output tile: B columns [b0, b0 + BN) of packed_b go to dst columns [n0, n1),
 // n1 - n0 <= BN
 template <typename S, typename block_q_t, bool reordered>
@@ -860,7 +921,7 @@ static void fused_dequant_gemm_tile(
     }
 }
 
-template <typename S, typename block_q_t>
+template <typename S, typename block_q_t, bool reordered>
 static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb * packed, float * dst, const int M,
                                       const int N, const int Npad, const int K, const int ldd,
                                       const int64_t groups_n, const int64_t groups_m, dpct::queue_ptr stream) {
@@ -871,8 +932,8 @@ static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb *
             sycl::nd_range<2>(sycl::range<2>(groups_n, groups_m * S::WG_SIZE), sycl::range<2>(1, S::WG_SIZE)),
             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(S::SG)]] {
                 const int n0 = item.get_group(0) * S::BN;
-                fused_dequant_gemm_tile<S, block_q_t, false>((const block_q_t *) src0, packed, dst, M, Npad, K, ldd,
-                                                      n0, n0, N, tile_a, tile_c, item);
+                fused_dequant_gemm_tile<S, block_q_t, reordered>((const block_q_t *) src0, packed, dst, M, Npad, K,
+                                                                 ldd, n0, n0, N, tile_a, tile_c, item);
             });
     });
 }
@@ -974,9 +1035,9 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
 }
 
 template <typename S>
-static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
-                         float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd, ggml_sycl_pool & pool,
-                         dpct::queue_ptr stream) {
+static bool fg_fused_run(ggml_type src0_type, bool reordered, const void * src0, const void * src1,
+                         ggml_type src1_type, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
+                         ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     const int64_t groups_n = (N + S::BN - 1) / S::BN;
     const int64_t groups_m = (M + S::SG_ROWS - 1) / S::SG_ROWS;
     const int     Npad     = (int) (groups_n * S::BN);
@@ -992,21 +1053,22 @@ static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * sr
     }
 
     const typename S::tsb * packed = packed_b.get();
-    return fg_visit_type(src0_type, false, [&](auto tag) {
-        using block_q_t = typename decltype(tag)::type;
+    return fg_visit_type(src0_type, reordered, [&](auto tag) {
+        using T         = decltype(tag);
+        using block_q_t = typename T::type;
         if constexpr (fg_plain_ok<block_q_t>()) {
-            fused_dequant_gemm_launch<S, block_q_t>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd,
-                                                    groups_n, groups_m, stream);
+            fused_dequant_gemm_launch<S, block_q_t, T::reordered>(src0, packed, dst, (int) M, (int) N, Npad, (int) K,
+                                                                  (int) ldd, groups_n, groups_m, stream);
         }
     });
 }
 
-bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
-                                  int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
-                                  ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool reordered, const void * src0, const void * src1,
+                                  ggml_type src1_type, int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K,
+                                  int64_t ldd, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     // every BN columns dequantize A again, so wide N is left to the library GEMM
     bool plain_ok = false;
-    fg_visit_type(src0_type, false, [&](auto tag) { plain_ok = fg_plain_ok<typename decltype(tag)::type>(); });
+    fg_visit_type(src0_type, reordered, [&](auto tag) { plain_ok = fg_plain_ok<typename decltype(tag)::type>(); });
     if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
         !ggml_sycl_xmx_gather_type_enabled(src0_type) || !plain_ok) {
         return false;
@@ -1023,7 +1085,8 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const 
     }
     bool launched = false;
     fg_visit_combo(combo, [&](auto s) {
-        launched = fg_fused_run<decltype(s)>(src0_type, src0, src1, src1_type, dst, M, N, K, ldd, pool, stream);
+        launched = fg_fused_run<decltype(s)>(src0_type, reordered, src0, src1, src1_type, dst, M, N, K, ldd, pool,
+                                             stream);
     });
     return launched;
 }

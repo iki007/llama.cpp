@@ -68,10 +68,11 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
 // The XMX combination is picked per call from the src1 type and its precision request src1_prec
 // (op_params[3], [TAG_GGML_PREC]); the accumulator is f32, which meets any request.
 // q8_0 and the k-quants are not handled here, only in the grouped path below.
-// Returns false when the case is not handled (type, device, precision, or shape).
-bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
-                                  int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
-                                  ggml_sycl_pool & pool, dpct::queue_ptr stream);
+// reordered: src0 is in the reorder (SoA) layout of reorder_qw().
+// Returns false when the case is not handled (type, layout, device, precision, or shape).
+bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool reordered, const void * src0, const void * src1,
+                                  ggml_type src1_type, int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K,
+                                  int64_t ldd, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
 // One launch for every expert of a MUL_MAT_ID: rows of src1/dst are grouped by expert, expert e
 // owns rows [expert_row_offsets[e], expert_row_offsets[e+1]) and reads its weights at
