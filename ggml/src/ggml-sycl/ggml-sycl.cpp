@@ -6089,6 +6089,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     int64_t esimd_min_cols = 0;
     int64_t esimd_max_cols = 0;
     ggml_sycl_esimd_ncols_range(src0->type, esimd_min_cols, esimd_max_cols);
+    // q8_0 below the XMX mat-vec's size keeps the ESIMD kernel at 8 columns too: MMVQ needs 12.1 us there for each of
+    // Qwen3.8-27B's 96 matrices of 5120 x 48 (the larger ones measured equal on both, as in the range's own note)
+    if (src0->type == GGML_TYPE_Q8_0 && src0->ne[0] * src0->ne[1] < 8 * 1024 * 1024) {
+        esimd_max_cols = 8;
+    }
     // the XMX mat-vec also takes batches past MMVQ's column range (several sequences decoding together)
     const bool    dpas_cols    = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                                  ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], src1->ne[1]);
