@@ -4604,6 +4604,7 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ3_XXS:
             return true;
@@ -4616,6 +4617,11 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
 #endif
 }
 
+// q8_0 and iq4_nl are stored in blocks of 32 weights; their ESIMD kernels take rows of whole QK_K super-blocks
+static bool ggml_sycl_esimd_row_ok(const ggml_tensor * src0) {
+    return (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_IQ4_NL) || src0->ne[0] % QK_K == 0;
+}
+
 // Column counts the reordered ESIMD mat-vec takes, where it beats MMVQ on an Arc Pro B70
 // (m=4096 k=14336). The K-quants keep their single column on the DMMV branch (same kernel)
 // and gain from 2 columns on (q5_K 1.48x at 4). The IQ types have no DMMV path, so they
@@ -4624,6 +4630,7 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
 static void ggml_sycl_esimd_ncols_range(enum ggml_type type, int64_t & min_cols, int64_t & max_cols) {
     switch (type) {
         case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ3_S:
             min_cols = 1;
             max_cols = 4;
@@ -6220,8 +6227,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) &&
                                           ggml_sycl_supports_reorder_mmvq(src0->type)))) {
-        bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type) &&
-                   (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0);
+        bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type) && ggml_sycl_esimd_row_ok(src0);
         // Arc770 get benefit with Q4_0 by skipping MMVQ path
         if (!(ggml_sycl_info().devices[ctx.device].hw_info.arch ==
                     gpu_arch::intel_gpu_acm_g10 &&
@@ -6263,9 +6269,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
                                  ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], src1->ne[1]);
     const int64_t reorder_cols = dpas_cols ? std::max<int64_t>(8, src1->ne[1]) : 8;
     if (!split && (use_mul_mat_vec_q || dpas_cols) && !g_ggml_sycl_prioritize_dmmv && g_ggml_sycl_enable_esimd &&
-        // types without an ESIMD kernel (q4_0, iq4_nl) come here only for the XMX one
+        // types without an ESIMD kernel (q4_0) come here only for the XMX one
         ((ggml_sycl_supports_reorder_esimd(src0->type) && src1->ne[1] >= esimd_min_cols) || dpas_cols) &&
-        (src0->type != GGML_TYPE_Q8_0 || src0->ne[0] % QK_K == 0) &&
+        ggml_sycl_esimd_row_ok(src0) &&
         // past the ESIMD range only where the XMX mat-vec takes over (e.g. iq4_xs at 5-8 columns)
         (src1->ne[1] <= esimd_max_cols || dpas_cols) &&
         ggml_is_contiguous(src1) && should_reorder_tensor(ctx, dst, reorder_cols)) {
