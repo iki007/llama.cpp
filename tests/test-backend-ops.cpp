@@ -12648,6 +12648,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_reordered(t, 4, 2, 1024, n, 2048));
         }
     }
+    // 96 experts of 1.1 to 2.2 MB: a backend that reorders a few experts at a time takes several rounds
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS }) {
+        for (int64_t n : { 8, 200 }) {
+            test_cases.emplace_back(new test_mul_mat_id_reordered(t, 96, 2, 1024, n, 2048));
+        }
+    }
 
     return test_cases;
 }

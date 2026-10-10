@@ -5738,36 +5738,43 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     // remain self-contained after reorder.
     if (src0->ne[2] > 1) {
         GGML_ASSERT((size_t) size == (size_t) src0->ne[2] * src0->nb[2]);
+        bool (*reorder_moe)(uint8_t *, size_t, int64_t, dpct::queue_ptr) = nullptr;
         switch (src0->type) {
-            case GGML_TYPE_Q4_0:
-                return reorder_qw_q4_0_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_Q8_0:
-                return reorder_qw_q8_0_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_Q2_K:
-                return reorder_qw_q2_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_Q3_K:
-                return reorder_qw_q3_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_IQ4_XS:
-                return reorder_qw_iq4_xs_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_IQ4_NL:
-                return reorder_qw_iq4_nl_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_IQ3_XXS:
-                return reorder_qw_iq3_xxs_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_IQ2_S:
-                return reorder_qw_iq2_s_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_IQ3_S:
-                return reorder_qw_iq3_s_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_Q4_K:
-                return reorder_qw_q4_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_Q5_K:
-                return reorder_qw_q5_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_Q6_K:
-                return reorder_qw_q6_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
-            case GGML_TYPE_MXFP4:
-                return reorder_qw_mxfp4_moe(data_device, src0->nb[2], src0->ne[2], stream);
+            case GGML_TYPE_Q4_0:    reorder_moe = reorder_qw_q4_0_moe; break;
+            case GGML_TYPE_Q8_0:    reorder_moe = reorder_qw_q8_0_moe; break;
+            case GGML_TYPE_Q2_K:    reorder_moe = reorder_qw_q2_k_moe; break;
+            case GGML_TYPE_Q3_K:    reorder_moe = reorder_qw_q3_k_moe; break;
+            case GGML_TYPE_IQ4_XS:  reorder_moe = reorder_qw_iq4_xs_moe; break;
+            case GGML_TYPE_IQ4_NL:  reorder_moe = reorder_qw_iq4_nl_moe; break;
+            case GGML_TYPE_IQ3_XXS: reorder_moe = reorder_qw_iq3_xxs_moe; break;
+            case GGML_TYPE_IQ2_S:   reorder_moe = reorder_qw_iq2_s_moe; break;
+            case GGML_TYPE_IQ3_S:   reorder_moe = reorder_qw_iq3_s_moe; break;
+            case GGML_TYPE_Q4_K:    reorder_moe = reorder_qw_q4_k_moe; break;
+            case GGML_TYPE_Q5_K:    reorder_moe = reorder_qw_q5_k_moe; break;
+            case GGML_TYPE_Q6_K:    reorder_moe = reorder_qw_q6_k_moe; break;
+            case GGML_TYPE_MXFP4:   reorder_moe = reorder_qw_mxfp4_moe; break;
             default:
                 return false;
         }
+        // An expert is reordered within its own bytes, so a few experts at a time do with a small temporary copy.
+        // One copy of a whole tensor is 450 to 850 MiB for the 512 experts of a Qwen3.8-Flash-Next layer, and the
+        // copies of two tensors were alive together during the first decode: +1.4 GB for half a second on a card
+        // that the model fills to 2 GB below its size. The wait releases a chunk's copy before the next is taken.
+        // GGML_SYCL_ENABLE_GRAPH keeps the single copy: that path takes no host wait here.
+        const size_t  expert_bytes = src0->nb[2];
+        const int64_t n_expert     = src0->ne[2];
+        const int64_t chunk        = g_ggml_sycl_enable_graph ? n_expert : std::max<int64_t>(1, (64 << 20) / expert_bytes);
+        for (int64_t e0 = 0; e0 < n_expert; e0 += chunk) {
+            if (!reorder_moe(data_device + e0 * expert_bytes, expert_bytes, std::min(chunk, n_expert - e0), stream)) {
+                // without a copy for a later chunk the tensor would stay half reordered
+                GGML_ASSERT(e0 == 0);
+                return false;
+            }
+            if (chunk < n_expert) {
+                stream->wait_and_throw();
+            }
+        }
+        return true;
     }
 
     switch (src0->type) {
