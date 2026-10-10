@@ -2488,7 +2488,6 @@ static void dequantize_mul_mat_vec_dpas_wide_tpw_sycl(const void * vx, const syc
                                                       const int64_t dst_stride, const int tpw, dpct::queue_ptr stream) {
     switch (tpw) {
         case 3: dequantize_mul_mat_vec_dpas_wide_sycl<T, NG, 3>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, stream); break;
-        case 5: dequantize_mul_mat_vec_dpas_wide_sycl<T, NG, 5>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, stream); break;
         default: dequantize_mul_mat_vec_dpas_wide_sycl<T, NG, 4>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, stream); break;
     }
 }
@@ -2528,18 +2527,22 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
 // Threads per tile, splitting its k blocks. The tiles run in waves of the card's hardware threads
 // (Arc Pro B70: 256 XVEs x 8 = 2048), and a grid just past a full wave pays for a nearly empty second
 // one: 8704 rows (544 tiles, the 27B's gate/up per card) took 1.25x-1.57x longer at 4 threads per
-// tile (2176 threads) than at 3, which fit one wave. So 3 when that fits one wave and 4 does not; 5
-// when it fits and gives each thread fewer blocks than 4 (iq4_xs / q4_K 5120 x 8704 at 8 columns:
-// 1.16x / 1.11x; not q6_K, 0.91x-0.98x); else 4, also for grids that need several waves anyway
-// (124160 rows: 4 and 5 equal to 4% better at 4).
-static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, int64_t nrows) {
+// tile (2176 threads) than at 3, which fit one wave. So 3 when that fits one wave and 4 does not; else 4,
+// or 5 where that gives each thread fewer blocks and needs no more waves than 4 does: one wave (iq4_xs /
+// q4_K 5120 x 8704 at 8 columns: 1.16x / 1.11x; not q6_K, 0.91x-0.98x) or several (17408 x 5120, three
+// waves either way, q4_K / q5_K / iq4_xs at 8 columns: 103 -> 101, 154 -> 147, 130 -> 122 us; 69632 x 5120,
+// 9 waves against 11: 4 stays ahead by up to 3%). Past 8 columns 4 is ahead everywhere: 17408 x 5120 and
+// taller at 16 columns lose 3-13% at 5, and the 27B's 32-row batch takes 77.9 ms on one card with 5 on its
+// one-wave grids against 74.4 with 4 (two cards 61.6 / 60.2).
+static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
     const int64_t wave  = (int64_t) ggml_sycl_info().devices[device].nsm * 16 * 8;
     const int64_t tiles = (nrows + GGML_SYCL_DPAS_ROWS - 1) / GGML_SYCL_DPAS_ROWS;
     const int64_t nb    = ncols / QK_K;
-    if (tiles * 4 > wave) {
-        return tiles * 3 <= wave ? 3 : 4;
+    if (tiles * 4 > wave && tiles * 3 <= wave) {
+        return 3;
     }
-    return type != GGML_TYPE_Q6_K && tiles * 5 <= wave && (nb + 4) / 5 < (nb + 3) / 4 ? 5 : 4;
+    const bool five = type != GGML_TYPE_Q6_K && ncols_y <= 8 && (nb + 4) / 5 < (nb + 3) / 4;
+    return five && (tiles * 5 + wave - 1) / wave == (tiles * 4 + wave - 1) / wave ? 5 : 4;
 }
 
 // Where the XMX mat-vec beats the ESIMD one on an Arc Pro B70. It is written for 16-wide DPAS,
@@ -2653,7 +2656,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
         // reordered weights where the XMX kernel wins take DPAS
         const auto * extra0 = static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra);
         if (extra0 && extra0->optimized_feature.reorder && ggml_sycl_dmmv_dpas(ctx.device, src0->type, ne00, row_diff, src1_ncols)) {
-            const int tpw = ggml_sycl_dmmv_dpas_tpw(ctx.device, src0->type, ne00, row_diff);
+            const int tpw = ggml_sycl_dmmv_dpas_tpw(ctx.device, src0->type, ne00, row_diff, src1_ncols);
             GGML_SYCL_DEBUG("%s: XMX mat-vec, %s, %d columns, %d threads per tile\n", __func__,
                             ggml_type_name(src0->type), (int) src1_ncols, tpw);
             ggml_sycl_pool_alloc<sycl::half> src1_f16_a(ctx.pool(), src1_ncols * ne00);
