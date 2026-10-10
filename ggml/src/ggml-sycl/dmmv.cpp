@@ -2307,6 +2307,47 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
 
     // acc[c*16 + n]: column c, row row0 + n
     simd<float, NC * ROWS> acc = 0.0f;
+    if constexpr (dpas_trait_coded<traits>::value) {
+        // Weights coded as integers in f16 (block_coded): each chunk of 32 k collects sum(B a) in tq and sum(a) in ta,
+        // then joins acc with the rows' scale and offset. DPAS repeats over 1, 2, 4 or 8 A rows, so 5 to 7 columns
+        // run as 8 with the spare ones zero: one instruction for each sum instead of two or three.
+        constexpr int NP = NC > 4 ? 8 : NC;
+        simd<sycl::half, 256>  ones = sycl::half(1.0f);
+        simd<float, NP * ROWS> tq[2];
+        simd<float, NP * ROWS> ta[2];
+        tq[0] = 0.0f;
+        tq[1] = 0.0f;
+        ta[0] = 0.0f;
+        ta[1] = 0.0f;
+        for (int ib = tid; ib < nb_row; ib += TPW) {
+            const sycl::half * yb = y + (size_t) ib * QK_K;
+            traits::block_coded(vx, nb, row_blk + (uint32_t) ib,
+                [&](int slot, int koff, simd<sycl::half, 256> & b) {
+                    simd<sycl::half, NP * 16> a = sycl::half(0.0f);
+                    if (a2d) {
+                        a_desc.set_x(ib * QK_K + koff);
+                        a.template select<NC * 16, 1>(0) = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
+                    } else {
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + c * y_stride + koff);
+                        }
+                    }
+                    tq[slot] = xmx::dpas<8, NP, float, float>(tq[slot], b, a);
+                    ta[slot] = xmx::dpas<8, NP, float, float>(ta[slot], ones, a);
+                },
+                [&](int slot, simd<float, 16> sc, simd<float, 16> mn) {
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        simd<float, 16> q = tq[slot].template select<ROWS, 1>(c * ROWS);
+                        simd<float, 16> s = ta[slot].template select<ROWS, 1>(c * ROWS);
+                        acc.template select<ROWS, 1>(c * ROWS) += q * sc + s * mn;
+                    }
+                    tq[slot] = 0.0f;
+                    ta[slot] = 0.0f;
+                });
+        }
+    } else {
     for (int ib = tid; ib < nb_row; ib += TPW) {
         const sycl::half * yb = y + (size_t) ib * QK_K;
         traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
@@ -2322,6 +2363,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
             }
             acc = xmx::dpas<8, NC, float, float>(acc, b, a);
         });
+    }
     }
 
     // the threads' partial sums meet in local memory, a column of 16 rows per message
