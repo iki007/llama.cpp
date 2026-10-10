@@ -2559,11 +2559,13 @@ static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, in
 // no ESIMD kernel, against MMVQ (98304x5120 / 17408x5120): q4_0 1.12x / 1.0x at 5, 1.42x / 1.16x at 8,
 // 0.96x / 0.91x at 3; iq4_nl (codebook per column on MMVQ) 1.40x / 1.14x at 3, 1.75x / 1.47x at 8.
 // q3_K against ESIMD in the model (Qwen3.8-27B, 7 such matrices, ms per batch on two cards): equal at 3-4 columns,
-// 28.95 -> 28.81 at 5, 30.39 -> 30.04 at 8, 40.27 -> 39.30 at 16, 65.27 -> 63.07 at 32.
+// 28.95 -> 28.81 at 5, 30.39 -> 30.04 at 8, 40.27 -> 39.30 at 16, 65.27 -> 63.07 at 32. iq3_s likewise (4 matrices):
+// 25.53 -> 25.48 at 3, 28.51 -> 28.30 at 6, 30.04 -> 29.90 at 8, 39.31 -> 38.86 at 16, 62.99 -> 61.44 at 32.
 static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
     const auto arch     = ggml_sycl_info().devices[device].hw_info.arch;
     const bool whole_qk = ncols % QK_K == 0;
-    const int  min_cols = type == GGML_TYPE_Q4_K ? 4 : type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K ? 3 :
+    const int  min_cols = type == GGML_TYPE_Q4_K ? 4 :
+                          type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ? 3 :
                           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q3_K ? 5 : type == GGML_TYPE_Q8_0 && whole_qk ? 9 :
                           type == GGML_TYPE_Q4_0 && whole_qk ? 5 : type == GGML_TYPE_IQ4_NL && whole_qk ? 3 : 0;
     return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= GGML_SYCL_DPAS_MAX_COLS &&
@@ -2660,6 +2662,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             if (src0->type == GGML_TYPE_IQ4_XS) {
                 dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_IQ4_XS>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
                                                                          (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
+            } else if (src0->type == GGML_TYPE_IQ3_S) {
+                dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_IQ3_S>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
+                                                                        (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
             } else if (src0->type == GGML_TYPE_Q3_K) {
                 dequantize_mul_mat_vec_dpas_ncols_sycl<GGML_TYPE_Q3_K>(src0_dd_i, src1_f16, dst_dd_i, ne00, row_diff,
                                                                        (int) src1_ncols, ne00, dst->ne[0], tpw, stream);
