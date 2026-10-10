@@ -2228,7 +2228,12 @@ static void dequantize_mul_mat_vec_esimd_nc_any_sycl(const void * vx, const floa
         // default 4 threads per row pair leave most of the GPU idle; 16 cut them by 8% in decode (8 threads by 3%),
         // while shorter rows (640 x 2560) get slower with more threads
         constexpr int QB = ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value;
-        if (T == GGML_TYPE_Q8_0 && (int64_t) (nrows + 1) / 2 * GGML_SYCL_DMMV_ESIMD_WG_SIZE < 2048 && ncols / QB >= 32) {
+        // Few rows of 16 to 31 super-blocks (ggml_sycl_dmmv_q8_0_few_rows; Qwen3.8-27B: 96 matrices of 48 x 5120) take
+        // 16 too: with 4 a thread runs 5 blocks while the card idles. Per call at 8 columns 9.7 -> 5.6 us, at one
+        // 3.9 -> 2.3 (8 threads: 7.1 / 3.1; 20, one block each: 8.2 / 2.5).
+        if (T == GGML_TYPE_Q8_0 && ggml_sycl_dmmv_q8_0_few_rows(ncols, nrows)) {
+            dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
+        } else if (T == GGML_TYPE_Q8_0 && (int64_t) (nrows + 1) / 2 * GGML_SYCL_DMMV_ESIMD_WG_SIZE < 2048 && ncols / QB >= 32) {
             dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
         } else {
             dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
@@ -2635,6 +2640,19 @@ bool ggml_sycl_dmmv_dpas_supported(int device, ggml_type type, int64_t ncols, in
     GGML_UNUSED(ncols);
     GGML_UNUSED(nrows);
     GGML_UNUSED(ncols_y);
+    return false;
+#endif
+}
+
+// q8_0 with few rows of 16 to 31 super-blocks, which the ESIMD mat-vec runs with 16 threads per row pair: at most one
+// wave of threads (Arc Pro B70: 2048), i.e. up to 256 rows
+bool ggml_sycl_dmmv_q8_0_few_rows(int64_t ncols, int64_t nrows) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    const int64_t nb_row = ncols / QK_K;
+    return ncols % QK_K == 0 && nb_row >= 16 && nb_row < 32 && (nrows + 1) / 2 * 16 <= 2048;
+#else
+    GGML_UNUSED(ncols);
+    GGML_UNUSED(nrows);
     return false;
 #endif
 }
