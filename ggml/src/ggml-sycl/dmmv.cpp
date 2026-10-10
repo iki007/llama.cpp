@@ -2319,17 +2319,22 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
         });
     }
 
+    // the threads' partial sums meet in local memory, a column of 16 rows per message
+    if (tid != 0) {
 #pragma unroll
-    for (int i = 0; i < NC * ROWS; ++i) {
-        lmem[tid * NC * ROWS + i] = acc[i];
+        for (int c = 0; c < NC; ++c) {
+            block_store<float, ROWS>(lmem, (uint32_t) ((tid * NC + c) * ROWS * sizeof(float)),
+                                     acc.template select<ROWS, 1>(c * ROWS).read());
+        }
     }
     it.barrier(sycl::access::fence_space::local_space);
     if (tid == 0) {
 #pragma unroll
         for (int t = 1; t < TPW; ++t) {
 #pragma unroll
-            for (int i = 0; i < NC * ROWS; ++i) {
-                acc[i] += lmem[t * NC * ROWS + i];
+            for (int c = 0; c < NC; ++c) {
+                acc.template select<ROWS, 1>(c * ROWS) +=
+                    block_load<float, ROWS>(lmem, (uint32_t) ((t * NC + c) * ROWS * sizeof(float)));
             }
         }
 #pragma unroll
@@ -2418,11 +2423,15 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
         });
     }
 
+    // the threads' partial sums meet in local memory, a column of 16 rows per message
+    if (tid != 0) {
 #pragma unroll
-    for (int g = 0; g < NG; ++g) {
+        for (int g = 0; g < NG; ++g) {
 #pragma unroll
-        for (int i = 0; i < NC * ROWS; ++i) {
-            lmem[(tid * NG + g) * NC * ROWS + i] = acc[g][i];
+            for (int c = 0; c < NC; ++c) {
+                block_store<float, ROWS>(lmem, (uint32_t) (((tid * NG + g) * NC + c) * ROWS * sizeof(float)),
+                                         acc[g].template select<ROWS, 1>(c * ROWS).read());
+            }
         }
     }
     it.barrier(sycl::access::fence_space::local_space);
@@ -2432,8 +2441,9 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
 #pragma unroll
             for (int t = 1; t < TPW; ++t) {
 #pragma unroll
-                for (int i = 0; i < NC * ROWS; ++i) {
-                    acc[g][i] += lmem[(t * NG + g) * NC * ROWS + i];
+                for (int c = 0; c < NC; ++c) {
+                    acc[g].template select<ROWS, 1>(c * ROWS) +=
+                        block_load<float, ROWS>(lmem, (uint32_t) (((t * NG + g) * NC + c) * ROWS * sizeof(float)));
                 }
             }
 #pragma unroll
