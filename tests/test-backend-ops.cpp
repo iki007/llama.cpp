@@ -12648,11 +12648,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_epilogue(t, 320, n, 1024, false, 2, true));
         }
     }
-    // batches past 32 rows on a weight a one-row MUL_MAT has reordered: up to 128 rows in chunks of 32 where a type
+    // batches past 32 rows on a weight a one-row MUL_MAT has reordered: up to 160 rows in chunks of 32 where a type
     // has a mat-vec kernel that wide, else the dequantizing XMX GEMM (33 to 64 rows) or dequantize + library GEMM
     for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                          GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL }) {
-        for (int64_t n : { 33, 48, 64, 65, 96, 128, 129 }) {
+        for (int64_t n : { 33, 48, 64, 65, 96, 128, 129, 160, 161 }) {
             test_cases.emplace_back(new test_mul_mat_reordered(t, 4096, n, 2048));
             test_cases.emplace_back(new test_mul_mat_reordered(t, 1030, n, 2560));
         }

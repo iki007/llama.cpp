@@ -5976,15 +5976,19 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // dequantize + GEMM costs 2-30x more per call (several sequences decoding together). Qwen3.8-27B with 4
     // sessions, per call: a q4_0 draft head 23.9 ms -> 4 x 0.7, q3_K 0.81 ms -> 4 x 0.11, iq3_s 1.34 -> 4 x 0.13.
     // From 9 columns for the types of ggml_sycl_chunk_cols_from_9() (two sequences decoding together).
-    // 33 to 128 columns of a type with the wide XMX mat-vec: chunks of 32 columns keep that kernel (short prompt
+    // From 33 columns of a type with the wide XMX mat-vec: chunks of 32 columns keep that kernel (short prompt
     // batches, many sequences decoding together). Qwen3.8-27B on two cards, per batch: 33 columns 148.7 ->
-    // 84.4 ms, 64 columns 164.1 -> 118.6, 128 columns 233.4 -> 215.3; from 160 columns the GEMM routes win.
+    // 84.4 ms, 64 columns 164.1 -> 118.6. The GEMM routes take over at 225 columns where the weights are split by
+    // rows over two cards (144 / 160 / 192 / 224 / 256 columns: 252.8 -> 202.9, 257.0 -> 215.1, 274.7 -> 252.8,
+    // 301.2 -> 292.7, 313.4 -> 330.9 ms with chunks) and at 161 on one card (144 / 160 / 192: 322.3 -> 285.6,
+    // 325.5 -> 303.2, 332.5 -> 362.3; a limit by matrix height instead lost 3-7% at 176 to 224).
     // Chunks of 8 columns past 32 lose to them (64 columns: +13 ms for 11 matrices).
-    // GGML_SYCL_CHUNK_MAX_COLS sets the limit, 32 turns the wide chunks off.
+    // GGML_SYCL_CHUNK_MAX_COLS sets the limit for both layouts, 32 turns the wide chunks off.
     const int64_t ncols_y   = src1->ne[1];
     const int64_t chunk_min = ggml_sycl_chunk_cols_from_9(src0) ? 8 : MMVQ_MAX_BATCH_SIZE;
-    static const int64_t chunk_max = ggml_sycl_get_env("GGML_SYCL_CHUNK_MAX_COLS", 128);
-    const bool chunk_wide = ncols_y > 32 && ncols_y <= chunk_max &&
+    static const int64_t chunk_max = ggml_sycl_get_env("GGML_SYCL_CHUNK_MAX_COLS", 0);
+    const int64_t chunk_lim = chunk_max > 0 ? chunk_max : ctx.row_split ? 224 : 160;
+    const bool chunk_wide = ncols_y > 32 && ncols_y <= chunk_lim &&
                             ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], 32);
     const int64_t chunk_cols = chunk_wide ? 32 : 8;
     if (!split && !g_ggml_sycl_prioritize_dmmv && dst->op == GGML_OP_MUL_MAT && ncols_y > chunk_min &&
@@ -9306,6 +9310,8 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
     auto * sctx1 = (ggml_backend_sycl_context *) backends[1]->context;
     ctx->buf0 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx0->pool());
     ctx->buf1 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx1->pool());
+    sctx0->row_split = true;
+    sctx1->row_split = true;
     const sycl::context sycl_ctx = sctx0->stream()->get_context();
     if (sycl_ctx == sctx1->stream()->get_context()) {
         ctx->hflag = sycl::malloc_host<uint32_t>(32, sycl_ctx);
