@@ -445,6 +445,9 @@ struct ggml_backend_sycl_context {
     std::string name;
     optimize_feature opt_feature;
 
+    // this backend holds one part of weights split by rows over two devices (set by ggml_backend_sycl_comm_init)
+    bool row_split = false;
+
     // f32->f16 conversion cache for a matmul's src1. Several projections inside one block
     // read the SAME activation tensor -- Qwen3Next builds wq/wk/wv from one `cur` and
     // wqkv/wqkv_gate from one `input` -- but ggml_sycl_op_mul_mat_sycl converts src1 into a
