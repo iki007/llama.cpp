@@ -5901,8 +5901,9 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
 // From 9 columns MMVQ unpacks the weights once per column. For the K-quants two chunks of 8 columns through the
 // ESIMD kernel are faster at 9 to 16 columns. Qwen3.8-27B with two sequences decoding together (16 columns,
 // reordered weights, per call on an Arc Pro B70): q3_K ffn 363 -> 205 us, q5_K attn_k / attn_v 105 -> 39 us, q6_K
-// 46 -> 34 us (the larger q4_K / q5_K / q6_K matrices take the XMX mat-vec instead). Not Q8_0: its reordered MMVQ
-// is faster than two chunks (ssm_alpha 29 -> 34 us); iq3_s and iq4_xs lose as well (0.7-0.8x on small matrices).
+// 46 -> 34 us (the larger q4_K / q5_K / q6_K matrices take the XMX mat-vec instead). Not Q8_0 in general: its
+// reordered MMVQ is faster than two chunks at 4 threads per row pair (ssm_alpha 29 -> 34 us); iq3_s and iq4_xs lose
+// as well (0.7-0.8x on small matrices).
 static bool ggml_sycl_chunk_cols_from_9(const ggml_tensor * src0) {
     switch (src0->type) {
         case GGML_TYPE_Q3_K:
@@ -5910,6 +5911,10 @@ static bool ggml_sycl_chunk_cols_from_9(const ggml_tensor * src0) {
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
             return true;
+        case GGML_TYPE_Q8_0:
+            // few short rows: two launches of the ESIMD kernel at 16 threads per row pair (5.6 us each) against one
+            // of MMVQ at 16 columns (16.2 us); other q8_0 shapes are slower in chunks
+            return g_ggml_sycl_enable_esimd && ggml_sycl_dmmv_q8_0_few_rows(src0->ne[0], src0->ne[1]);
         default:
             return false;
     }

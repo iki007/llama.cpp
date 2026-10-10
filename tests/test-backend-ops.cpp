@@ -11147,6 +11147,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
     }
+    // few rows of Q8_0 in 16 to 31 super-blocks: the SYCL ESIMD mat-vec with 16 threads per row pair, in chunks of 8
+    // columns past 8; 49 and 3 rows end in a single row, 257 rows are past that rule
+    for (int m : { 3, 48, 49, 257 }) {
+        for (int n : { 1, 2, 7, 8, 9, 12, 16, 17, 32 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 5120, { 1, 1 }, { 1, 1 }));
+        }
+    }
     // Q8_0 takes it from 9 columns (8 is the ESIMD side of the boundary); 4105 rows end in a partial 16-row tile
     for (int n : { 8, 9, 16, 17, 24, 32 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
