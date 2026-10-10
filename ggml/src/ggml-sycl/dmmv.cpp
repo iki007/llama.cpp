@@ -2721,9 +2721,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const bool   f32_esimd  = src0->type == GGML_TYPE_F32 && g_ggml_sycl_enable_esimd && ne00 % QK_K == 0;
     // plain BF16 weights in blocks of 64 (e.g. Qwen3.8-Flash-Next's hyper-connections), 1-8 columns likewise
     const bool   bf16_esimd = src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_esimd && ne00 % 64 == 0;
-    if (src1_ncols > 1 || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S ||
-        src0->type == GGML_TYPE_IQ3_XXS || q8_0_esimd || f32_esimd || bf16_esimd) {
-        // 2-8 columns of reordered K-quant weights, or 1-4 of IQ4_XS / IQ3_S and 1-2 of IQ3_XXS
+    if (src1_ncols > 1 || src0->type == GGML_TYPE_IQ4_XS || (src0->type == GGML_TYPE_IQ4_NL && ne00 % QK_K == 0) ||
+        src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS || q8_0_esimd || f32_esimd || bf16_esimd) {
+        // 2-8 columns of reordered K-quant weights, or 1-4 of IQ4_XS / IQ4_NL / IQ3_S and 1-2 of IQ3_XXS
         // (no single-column kernel of their own here); ggml_sycl_mul_mat only routes those here
         // a fused elementwise tail (ggml_sycl_fuse_mmv_epilogue) is applied at the store
         const ggml_sycl_mmv_epilogue epi = ctx.mmv_epi;
@@ -2751,6 +2751,10 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
                 break;
             case GGML_TYPE_IQ4_XS:
                 ok = dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_IQ4_XS>(
+                    src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream, epi);
+                break;
+            case GGML_TYPE_IQ4_NL:
+                ok = ne00 % QK_K == 0 && dequantize_mul_mat_vec_reorder_esimd_ncols_sycl<GGML_TYPE_IQ4_NL>(
                     src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols, ne00, dst->ne[0], stream, epi);
                 break;
             case GGML_TYPE_Q4_K:

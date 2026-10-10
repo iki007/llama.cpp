@@ -11193,6 +11193,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
         }
     }
+    // IQ4_NL at 1 to 4 columns: the SYCL ESIMD mat-vec for rows of whole super-blocks (the XMX one from 3 columns on
+    // the larger shape), MMVQ for the 2080-wide rows
+    for (int n = 1; n <= 4; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 1025, n, 2304, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 1025, n, 2080, { 1, 1 }, { 1, 1 }));
+    }
     // IQ4_XS takes it from 3 columns (2 is the ESIMD side of the boundary); 4097 x 2304 has an odd block count, so
     // its d array starts at an odd half
     for (int n = 2; n <= 8; ++n) {
