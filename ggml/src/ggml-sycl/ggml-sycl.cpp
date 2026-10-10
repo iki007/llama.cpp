@@ -6839,6 +6839,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     }
 
+    // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
+    if (src0->type == GGML_TYPE_MXFP4) {
+        opt_for_reorder_id(&ctx, src0);
+    }
+
     const int32_t * ids_host = ggml_sycl_mul_mat_id_read_ids(ctx, ids);
 
     ggml_tensor src0_row = *src0;
