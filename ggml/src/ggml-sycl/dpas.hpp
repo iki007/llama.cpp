@@ -12,6 +12,7 @@
 // f16 once: an f16 scale or min would carry its rounding error into every weight of a chunk.
 
 #include "common.hpp"
+#include <type_traits>
 
 #if defined(__INTEL_LLVM_COMPILER)
 #include <sycl/ext/intel/esimd.hpp>
@@ -58,6 +59,41 @@ static ESIMD_INLINE void dpas_scale_min_k4(const uint8_t * scales, const uint8_t
         sc2[j].select<16, 2>(1) = sch;
         mn2[j].select<16, 2>(0) = mnh;
         mn2[j].select<16, 2>(1) = mnh;
+    }
+}
+
+// whether a tile trait also has block_coded(): the weights as integers coded in f16, their scale and offset per chunk
+template <typename Tr, typename = void> struct dpas_trait_coded : std::false_type {};
+template <typename Tr> struct dpas_trait_coded<Tr, std::void_t<decltype(Tr::coded)>> : std::true_type {};
+
+// the same scales and mins, one value per row
+template <uint32_t SC_STRIDE = K_SCALE_SIZE, uint32_t DM_STRIDE = 4>
+static ESIMD_INLINE void dpas_scale_min_k4_rows(const uint8_t * scales, const uint8_t * dm,
+                                                sycl::ext::intel::esimd::simd<uint32_t, 16> bi,
+                                                sycl::ext::intel::esimd::simd<float, 16> (&sc)[8],
+                                                sycl::ext::intel::esimd::simd<float, 16> (&mn)[8]) {
+    using namespace sycl::ext::intel::esimd;
+    // element-major: dword i of all 16 rows at [16 i]
+    simd<uint32_t, 48>   sw   = gather<uint32_t, 48, 3>((const uint32_t *) scales, bi * SC_STRIDE);
+    simd<uint32_t, 16>   dmw  = gather<uint32_t, 16>((const uint32_t *) dm, bi * DM_STRIDE);
+    simd<sycl::half, 32> dmh  = dmw.bit_cast_view<sycl::half>().read();
+    simd<float, 16>      dall = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(0)));
+    simd<float, 16>      dmin = convert<float>(simd<sycl::half, 16>(dmh.select<16, 2>(1)));
+    auto byte_of = [&](int i) -> simd<uint16_t, 16> {
+        return convert<uint16_t>((simd<uint32_t, 16>(sw.select<16, 1>(16 * (i / 4))) >> (8 * (i % 4))) & 0xFF);
+    };
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        simd<uint16_t, 16> a, m;
+        if (j < 4) {
+            a = byte_of(j) & 63;
+            m = byte_of(j + 4) & 63;
+        } else {
+            a = (byte_of(j + 4) & 0xF) | ((byte_of(j - 4) >> 6) << 4);
+            m = (byte_of(j + 4) >> 4) | ((byte_of(j) >> 6) << 4);
+        }
+        sc[j] = convert<float>(a) * dall;
+        mn[j] = convert<float>(m) * (-dmin);
     }
 }
 
@@ -136,6 +172,73 @@ static ESIMD_INLINE void dpas_q4_k_block(const uint8_t * qs, const uint8_t * sca
     }
 }
 
+// Q4_K / Q5_K block for the kernels that apply scale and offset after the DPAS. The weights go into B as OFF + q
+// (OFF = 16 or 32), written straight into f16 bit patterns: exponent fixed, q in the top mantissa bits. Converting
+// integers to f16 or f32 costs more than the rest of the tile build together (17408 x 5120 q4_K at 8 columns, compute
+// only: 21 us for loads and DPAS, 23.5 with the bytes selected and widened, 42.5 with them converted to f16, 49 with
+// the f32 scale and min applied as dpas_q4_k_block does). step(slot, k offset, B) takes the 16 k of chunk 2p (slot
+// 0) or 2p + 1 (slot 1); fold(slot, s, m) closes a chunk, whose rows sum to s * sum(B a) + m * sum(a) with
+// m = min - OFF * s.
+template <uint32_t QS_STRIDE, uint32_t SC_STRIDE, uint32_t DM_STRIDE, uint32_t QH_STRIDE, typename FS, typename FF>
+static ESIMD_INLINE void dpas_q4_k_block_coded(const uint8_t * qs, const uint8_t * scales, const uint8_t * dm,
+                                                sycl::ext::intel::esimd::simd<uint32_t, 16> bi, FS && step, FF && fold,
+                                                const uint8_t * qh = nullptr) {
+    using namespace sycl::ext::intel::esimd;
+    constexpr int      SH  = QH_STRIDE > 0 ? 5 : 6;
+    constexpr uint16_t EXP = QH_STRIDE > 0 ? 0x5000 : 0x4C00; // 32.0 and 16.0 as f16
+    constexpr float    OFF = QH_STRIDE > 0 ? 32.0f : 16.0f;
+    simd<float, 16> sc[8];
+    simd<float, 16> mn[8];
+    dpas_scale_min_k4_rows<SC_STRIDE, DM_STRIDE>(scales, dm, bi, sc, mn);
+
+    simd<uint32_t, 64> hw4[2];
+    if constexpr (QH_STRIDE > 0) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            hw4[h] = gather<uint32_t, 64, 4>((const uint32_t *) qh, bi * QH_STRIDE + h * 16);
+        }
+    }
+
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            simd<uint32_t, 64> w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * QS_STRIDE + (p * 32 + h * 16));
+            simd<sycl::half, 256> b_lo;
+            simd<sycl::half, 256> b_hi;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
+                auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                for (int j = 0; j < 4; j += 2) {
+                    simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
+                    simd<uint8_t, 32> lo = q & 0x0F;
+                    simd<uint8_t, 32> hi = q >> 4;
+                    if constexpr (QH_STRIDE > 0) {
+                        simd<uint32_t, 16> hw  = hw4[h].select<16, 1>(16 * g);
+                        auto               hwm = hw.bit_cast_view<uint8_t, 16, 4>();
+                        simd<uint8_t, 32>  qb  = hwm.select<16, 1, 2, 1>(0, j);
+                        lo |= dpas_bit_to_4(qb, 2 * p);
+                        hi |= dpas_bit_to_4(qb, 2 * p + 1);
+                    }
+                    const int          kp  = (4 * g + j) / 2;
+                    simd<uint16_t, 32> ulo = (convert<uint16_t>(lo) << SH) | EXP;
+                    simd<uint16_t, 32> uhi = (convert<uint16_t>(hi) << SH) | EXP;
+                    b_lo.select<32, 1>(kp * 32) = ulo.template bit_cast_view<sycl::half>().read();
+                    b_hi.select<32, 1>(kp * 32) = uhi.template bit_cast_view<sycl::half>().read();
+                }
+            }
+            step(0, (2 * p) * 32 + h * 16, b_lo);
+            step(1, (2 * p + 1) * 32 + h * 16, b_hi);
+            if (h == 1) {
+                fold(0, sc[2 * p], mn[2 * p] - sc[2 * p] * OFF);
+                fold(1, sc[2 * p + 1], mn[2 * p + 1] - sc[2 * p + 1] * OFF);
+            }
+        }
+    }
+}
+
 // Q4_K, reorder layout [qs: nb*(QK_K/2)] [scales: nb*12] [dm: nb*half2].
 template <> struct dpas_tile_traits<GGML_TYPE_Q4_K> {
     // calls fn(k offset in the block, B) for the block's 16 k steps; bi = the rows' block indices
@@ -145,6 +248,16 @@ template <> struct dpas_tile_traits<GGML_TYPE_Q4_K> {
         const uint8_t * scales = qs + nb * (QK_K / 2);
         const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
         dpas_q4_k_block<QK_K / 2, K_SCALE_SIZE, 4>(qs, scales, dm, bi, fn);
+    }
+
+    static constexpr bool coded = true;
+    template <typename FS, typename FF>
+    static ESIMD_INLINE void block_coded(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, FS && step,
+                                         FF && fold) {
+        const uint8_t * qs     = (const uint8_t *) vx;
+        const uint8_t * scales = qs + nb * (QK_K / 2);
+        const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
+        dpas_q4_k_block_coded<QK_K / 2, K_SCALE_SIZE, 4, 0>(qs, scales, dm, bi, step, fold);
     }
 };
 
@@ -157,6 +270,17 @@ template <> struct dpas_tile_traits<GGML_TYPE_Q5_K> {
         const uint8_t * scales = qh + nb * (QK_K / 8);
         const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
         dpas_q4_k_block<QK_K / 2, K_SCALE_SIZE, 4, QK_K / 8>(qs, scales, dm, bi, fn, qh);
+    }
+
+    static constexpr bool coded = true;
+    template <typename FS, typename FF>
+    static ESIMD_INLINE void block_coded(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, FS && step,
+                                         FF && fold) {
+        const uint8_t * qs     = (const uint8_t *) vx;
+        const uint8_t * qh     = qs + nb * (QK_K / 2);
+        const uint8_t * scales = qh + nb * (QK_K / 8);
+        const uint8_t * dm     = scales + nb * K_SCALE_SIZE;
+        dpas_q4_k_block_coded<QK_K / 2, K_SCALE_SIZE, 4, QK_K / 8>(qs, scales, dm, bi, step, fold, qh);
     }
 };
 
