@@ -6229,6 +6229,12 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
     if (wu->type == GGML_TYPE_Q5_K && act->ne[1] > 5) {
         return false;
     }
+    // q4_K where the XMX mat-vec takes the two unfused GEMVs (4+ columns): they need about half the fused kernel's
+    // time (Qwen3.8-27B per card at 8 columns: 2 x 55 us against 216)
+    if (wu->type == GGML_TYPE_Q4_K &&
+        ggml_sycl_dmmv_dpas_supported(ctx.device, wu->type, wu->ne[0], wu->ne[1], act->ne[1])) {
+        return false;
+    }
 
     // install the reorder (SoA) layout the fused kernel needs, as the unfused mmvq path would;
     // a no-op once done. after the bail checks so a declined op does not pay for it.
