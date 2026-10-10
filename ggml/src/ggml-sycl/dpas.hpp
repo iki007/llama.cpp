@@ -382,6 +382,60 @@ template <> struct dpas_tile_traits<GGML_TYPE_Q3_K> {
     }
 };
 
+// IQ3_S, reorder layout [qs: nb*(QK_K/4)] [qh: nb*(QK_K/32)] [signs: nb*(QK_K/8)] [scales (4 bytes) + d (half): nb*6]
+// (the ESIMD trait in esimd.hpp reads the same). Sub-block s (32 k): grid index j (0..7) is qs byte 8s + j | bit j
+// of qh byte s << 8 and selects the 4 magnitudes of k 32s + 4j.. in the 512-entry iq3s_grid; bit v of the s-th 32-bit
+// signs word negates k 32s + v; the scale is d * (1 + 2 * nibble s of the scales).
+template <> struct dpas_tile_traits<GGML_TYPE_IQ3_S> {
+    template <typename F>
+    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs    = (const uint8_t *) vx;
+        const uint8_t * qh    = qs + nb * (QK_K / 4);
+        const uint8_t * signs = qh + nb * (QK_K / 32);
+        const uint8_t * sd    = signs + nb * (QK_K / 8);
+
+        const simd<uint32_t, 16> scw  = gather<uint32_t, 16>((const uint32_t *) sd, bi * 6u);
+        simd<uint16_t, 16>       dbit = convert<uint16_t>(dpas_gather_u16(sd + QK_K / 64, bi * 3u));
+        const simd<float, 16>    drow = convert<float>(simd<sycl::half, 16>(dbit.bit_cast_view<sycl::half>().read()));
+        // the 8 qh bytes of every row, element-major: dword i of all rows at [16 i]
+        simd<uint32_t, 32>       qhw  = gather<uint32_t, 32, 2>((const uint32_t *) qh, bi * (uint32_t) (QK_K / 32));
+
+#pragma unroll
+        for (int s = 0; s < QK_K / 32; ++s) {
+            simd<float, 16>          sc  = (convert<float>((scw >> (4 * s)) & 0xF) * 2.0f + 1.0f) * drow;
+            const simd<uint32_t, 16> scb = sc.bit_cast_view<uint32_t>().read();
+            const simd<uint32_t, 16> qhs = (simd<uint32_t, 16>(qhw.select<16, 1>(16 * (s / 4))) >> (8 * (s % 4))) & 0xFF;
+            const simd<uint32_t, 16> sw  = gather<uint32_t, 16>((const uint32_t *) signs, bi * (uint32_t) (QK_K / 8) + 4 * s);
+            // 8 grid index bytes per row, 4 for each 16-k half h of the sub-block
+            simd<uint32_t, 32>       qw2 = gather<uint32_t, 32, 2>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 4) + 8 * s);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const simd<uint32_t, 16> qw = qw2.select<16, 1>(16 * h);
+                simd<sycl::half, 256>    b;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const simd<uint32_t, 16> idx = ((qw >> (8 * t)) & 0xFF) | (((qhs >> (4 * h + t)) & 1) << 8);
+                    simd<uint32_t, 16>       g   = gather<uint32_t, 16>(iq3s_grid, idx * (uint32_t) sizeof(uint32_t));
+                    auto                     gm  = g.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                    for (int jj = 0; jj < 4; jj += 2) {
+                        // the scale of each k with its sign bit folded in
+                        const int          v0 = 16 * h + 4 * t + jj;
+                        simd<uint32_t, 32> sb;
+                        sb.select<16, 2>(0) = scb ^ ((sw >> v0) << 31);
+                        sb.select<16, 2>(1) = scb ^ ((sw >> (v0 + 1)) << 31);
+                        simd<uint8_t, 32>  mag = gm.select<16, 1, 2, 1>(0, jj);
+                        const int          kp  = (4 * t + jj) / 2;
+                        b.select<32, 1>(kp * 32) = convert<sycl::half>(convert<float>(mag) * sb.bit_cast_view<float>().read());
+                    }
+                }
+                fn(32 * s + 16 * h, b);
+            }
+        }
+    }
+};
+
 // Q4_0 / IQ4_NL, reorder layout [qs: nb*QK_K/2] [d: nb*8 half]: a QK_K block is 8 blocks of 32, block s with
 // the 16 bytes at qs + QK_K/2 bi + 16 s (low nibbles k 0..15, high nibbles k 16..31) and the scale d[8 bi + s].
 // Q4_0 weights are (q - 8) d, IQ4_NL ones codebook(q) d (IQ4_XS's table).
