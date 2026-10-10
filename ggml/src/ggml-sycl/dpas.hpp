@@ -308,6 +308,80 @@ template <> struct dpas_tile_traits<GGML_TYPE_IQ4_XS> {
     }
 };
 
+// Q3_K, reorder layout [qs: nb*(QK_K/4)] [hmask: nb*(QK_K/8)] [scales: nb*12] [d: nb*half]. A block is two halves n
+// of four chunks j of 32 k: k 128n + 32j + l (l = 0..31) is the two bits at 2j of qs byte 32n + l, minus 4 unless bit
+// 4n + j of hmask byte l is set, times d * (scale - 32) with the 6-bit scale 8n + 2j + (l >= 16). The 16 scales are
+// unpacked from their 12 bytes as in dequantize_row_q3_K.
+template <> struct dpas_tile_traits<GGML_TYPE_Q3_K> {
+    template <typename F>
+    static ESIMD_INLINE void block(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, F && fn) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs     = (const uint8_t *) vx;
+        const uint8_t * hmask  = qs + nb * (QK_K / 4);
+        const uint8_t * scales = hmask + nb * (QK_K / 8);
+        const uint8_t * d      = scales + nb * 12;
+
+        // the 12 scale bytes of every row, element-major: dword i of all rows at [16 i]
+        simd<uint32_t, 48>       sw  = gather<uint32_t, 48, 3>((const uint32_t *) scales, bi * 12u);
+        const simd<uint32_t, 16> a0  = sw.select<16, 1>(0);
+        const simd<uint32_t, 16> a1  = sw.select<16, 1>(16);
+        const simd<uint32_t, 16> tmp = sw.select<16, 1>(32);
+        simd<uint32_t, 16>       aux[4];
+        aux[0] = (a0 & 0x0f0f0f0fu) | ((tmp & 0x03030303u) << 4);
+        aux[1] = (a1 & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);
+        aux[2] = ((a0 >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);
+        aux[3] = ((a1 >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);
+        simd<uint16_t, 16>    dbit = convert<uint16_t>(dpas_gather_u16(d, bi));
+        const simd<float, 16> drow = convert<float>(simd<sycl::half, 16>(dbit.bit_cast_view<sycl::half>().read()));
+        auto scale2 = [&](int i) -> simd<float, 32> {
+            const simd<uint32_t, 16> b = (aux[i / 4] >> (8 * (i % 4))) & 0xFF;
+            const simd<float, 16>    f = (convert<float>(b) - 32.0f) * drow;
+            simd<float, 32>          r;
+            r.select<16, 2>(0) = f;
+            r.select<16, 2>(1) = f;
+            return r;
+        };
+
+        // hmask bytes l = 16 sub .. of every row, shared by the 8 chunks of the block
+        simd<uint32_t, 64> hw4[2];
+#pragma unroll
+        for (int sub = 0; sub < 2; ++sub) {
+            hw4[sub] = gather<uint32_t, 64, 4>((const uint32_t *) hmask, bi * (uint32_t) (QK_K / 8) + 16 * sub);
+        }
+
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                // qs bytes 32n + 16 sub .. : two bits for each of the half's 4 chunks
+                simd<uint32_t, 64> w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 4) + (32 * n + 16 * sub));
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const simd<float, 32> sc = scale2(8 * n + 2 * j + sub);
+                    simd<sycl::half, 256> b;
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        simd<uint32_t, 16> w   = w4.select<16, 1>(16 * g);
+                        simd<uint32_t, 16> hw  = hw4[sub].select<16, 1>(16 * g);
+                        auto               wm  = w.bit_cast_view<uint8_t, 16, 4>();
+                        auto               hwm = hw.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                        for (int jj = 0; jj < 4; jj += 2) {
+                            simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, jj);
+                            simd<uint8_t, 32> hb = hwm.select<16, 1, 2, 1>(0, jj);
+                            // q - (hbit ? 0 : 4) as q + 4 hbit - 4
+                            simd<uint8_t, 32> v  = ((q >> (2 * j)) & 3) | (((hb >> (4 * n + j)) & 1) << 2);
+                            const int         kp = (4 * g + jj) / 2;
+                            b.select<32, 1>(kp * 32) = convert<sycl::half>((convert<float>(v) - 4.0f) * sc);
+                        }
+                    }
+                    fn(128 * n + 32 * j + 16 * sub, b);
+                }
+            }
+        }
+    }
+};
+
 // Q4_0 / IQ4_NL, reorder layout [qs: nb*QK_K/2] [d: nb*8 half]: a QK_K block is 8 blocks of 32, block s with
 // the 16 bytes at qs + QK_K/2 bi + 16 s (low nibbles k 0..15, high nibbles k 16..31) and the scale d[8 bi + s].
 // Q4_0 weights are (q - 8) d, IQ4_NL ones codebook(q) d (IQ4_XS's table).
