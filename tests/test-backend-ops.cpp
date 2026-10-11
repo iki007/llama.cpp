@@ -11404,6 +11404,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    // rows in 64-column messages: one thread up to 512 columns, 16 threads per row from 1024 to 8192
+    for (uint32_t n : { 128, 512, 1024, 5120, 8192 }) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 3, 1, 1 }, false, 1e-6f, true));
+        test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-6f, true, 1.5f));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({ n, 3, 2, 1 }, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
+    }
     // shapes below exceed the CUDA gridDim.y/gridDim.z limit of 65535 (#27901)
     test_cases.emplace_back(new test_norm        (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f));
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f, false));
