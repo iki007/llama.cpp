@@ -3921,6 +3921,44 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL by a weight with one row per row of x, shared by all tokens (qwen4exp's grouped norm
+// over the hyper-connection streams)
+struct test_rms_norm_mul_rows : public test_case {
+    const std::array<int64_t, 3> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_rms_norm_mul_rows(std::array<int64_t, 3> ne = {64, 4, 3}, float eps = 1e-6f) : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(a, "a");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL by a one-row weight; the sum is read again, as a residual stream is
 struct test_add_rms_norm_mul : public test_case {
     const std::array<int64_t, 4> ne;
@@ -10967,8 +11005,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
-    // rows in 64-column messages: one thread up to 512 columns, 16 threads per row from 1024 to 8192
-    for (uint32_t n : { 128, 512, 1024, 5120, 8192 }) {
+    // rows in 64-column messages: one thread up to 512 columns, up to 16 threads per wider row
+    for (uint32_t n : { 128, 512, 1024, 1536, 2560, 5120, 8192 }) {
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, 1e-6f));
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 3, 1, 1 }, false, 1e-6f, true));
         test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-6f, true, 1.5f));
@@ -11002,7 +11040,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
-    for (uint32_t n : { 64, 512, 768, 1024, 1025, 5120, 8192 }) {
+    for (int64_t n : { 64, 320, 1025, 2560, 5120 }) {
+        test_cases.emplace_back(new test_rms_norm_mul_rows({ n, 4, 1 }));
+        test_cases.emplace_back(new test_rms_norm_mul_rows({ n, 4, 7 }));
+    }
+    for (uint32_t n : { 64, 512, 768, 1024, 1025, 1536, 2560, 5120, 8192 }) {
         test_cases.emplace_back(new test_add_rms_norm_mul({ n, 1, 1, 1 }));
         test_cases.emplace_back(new test_add_rms_norm_mul({ n, 5, 4, 3 }));
         test_cases.emplace_back(new test_add_rms_norm_mul({ n, 3, 2, 1 }, 1e-6f, true));
