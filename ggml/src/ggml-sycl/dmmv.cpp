@@ -2555,6 +2555,7 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
                                                    const int64_t dst_stride, const int tpw, dpct::queue_ptr stream) {
     switch (ncols_y) {
+        case 2: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 2>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
         case 3: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
         case 4: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
         case 5: dequantize_mul_mat_vec_dpas_tpw_sycl<T, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, tpw, stream); break;
@@ -2608,15 +2609,19 @@ static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, in
 // 2.4x / 3.0x at 32); below 9 it is behind ESIMD on one of those two shapes. q4_0 and iq4_nl, which have
 // no ESIMD kernel, against MMVQ (98304x5120 / 17408x5120): q4_0 1.12x / 1.0x at 5, 1.42x / 1.16x at 8,
 // 0.96x / 0.91x at 3; iq4_nl (codebook per column on MMVQ) 1.40x / 1.14x at 3, 1.75x / 1.47x at 8.
+// q4_K and q5_K, whose weights go into the tile without a conversion (dpas_q4_k_block_coded), from 2 columns: in
+// Qwen3.8-27B on one card 2 / 3 / 4 / 5 rows took 38.38 / 41.34 / 42.57 / 43.42 ms with the earlier minimums of 4
+// and 5 columns and 37.64 / 39.28 / 40.09 / 40.95 with 2 (two cards 22.99 / 25.30 / 26.26 / 27.48 -> 22.87 / 24.43
+// / 25.22 / 26.20); the numbers above for these two types are of the f32 decode.
 // q3_K against ESIMD in the model (Qwen3.8-27B, 7 such matrices, ms per batch on two cards): equal at 3-4 columns,
 // 28.95 -> 28.81 at 5, 30.39 -> 30.04 at 8, 40.27 -> 39.30 at 16, 65.27 -> 63.07 at 32. iq3_s likewise (4 matrices):
 // 25.53 -> 25.48 at 3, 28.51 -> 28.30 at 6, 30.04 -> 29.90 at 8, 39.31 -> 38.86 at 16, 62.99 -> 61.44 at 32.
 static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
     const auto arch     = ggml_sycl_info().devices[device].hw_info.arch;
     const bool whole_qk = ncols % QK_K == 0;
-    const int  min_cols = type == GGML_TYPE_Q4_K ? 4 :
+    const int  min_cols = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 2 :
                           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ? 3 :
-                          type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q3_K ? 5 : type == GGML_TYPE_Q8_0 && whole_qk ? 9 :
+                          type == GGML_TYPE_Q3_K ? 5 : type == GGML_TYPE_Q8_0 && whole_qk ? 9 :
                           type == GGML_TYPE_Q4_0 && whole_qk ? 5 : type == GGML_TYPE_IQ4_NL && whole_qk ? 3 : 0;
     return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= GGML_SYCL_DPAS_MAX_COLS &&
            ncols * nrows >= 8 * 1024 * 1024 &&
