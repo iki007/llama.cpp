@@ -2271,7 +2271,14 @@ static void dequantize_mul_mat_vec_esimd_nc_any_sycl(const void * vx, const floa
         if (T == GGML_TYPE_Q8_0 && ggml_sycl_dmmv_q8_0_few_rows(ncols, nrows)) {
             dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
         } else if (T == GGML_TYPE_Q8_0 && (int64_t) (nrows + 1) / 2 * GGML_SYCL_DMMV_ESIMD_WG_SIZE < 2048 && ncols / QB >= 32) {
-            dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
+            // 16 threads per row pair while they fit one wave of hardware threads, else 8: 320 x 10240 is 160 pairs,
+            // 2560 threads at 16. Per call at 1 / 4 columns: 4.51 / 7.17 us with 16, 3.94 / 6.09 with 8 (12: 3.85 /
+            // 6.16, 4: 4.72 / 6.64)
+            if ((int64_t) (nrows + 1) / 2 * 16 <= 2048) {
+                dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 16>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
+            } else {
+                dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC, 8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
+            }
         } else {
             dequantize_mul_mat_vec_reorder_esimd_nc_sycl<T, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream, epi);
         }
