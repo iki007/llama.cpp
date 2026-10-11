@@ -8099,6 +8099,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i++;
             continue;
         }
+        if (node->op == GGML_OP_ADD && ggml_sycl_op_add_rms_norm_fused(*sycl_ctx, cgraph, i)) {
+            i += 2;
+            continue;
+        }
         if (node->op == GGML_OP_ADD &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD }, {})) {
             ggml_sycl_op_add_add_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
