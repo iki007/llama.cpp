@@ -362,8 +362,8 @@ static void group_norm_f32_sycl(const float* x, float* dst,
 #ifdef GGML_SYCL_NORM_HAS_ESIMD
 // A memory message costs a thread ~0.1 us on Xe whatever its size, so a kernel this small is bound by the messages
 // one thread sends in sequence, not by arithmetic: rms_norm_f32 sends a gather and a scatter per 16 columns.
-// Here a thread takes up to 8 messages of 64 columns, keeps them in registers for the second pass, and 16 threads
-// share a row of 1024 or more columns.
+// Here a thread takes up to 8 messages of 64 columns, keeps them in registers for the second pass, and up to 16
+// threads share a row of more than 512 columns.
 struct rms_norm_esimd_args {
     const float * x;
     const float * y;    // ADD: second addend, laid out as x
@@ -371,9 +371,11 @@ struct rms_norm_esimd_args {
     float *       sum;  // ADD: x + y, laid out as x
     float *       dst;
     int           chunks;  // 64-column messages per thread
+    int           wg;      // threads per row
     int           ncols;
     int64_t       ss1, ss2, ss3;
     int64_t       ds1, ds2, ds3;
+    int64_t       ms1;  // weight row stride; 0: one row for all
     float         eps;
     float         scale_mul;
 };
@@ -382,14 +384,24 @@ constexpr int RMS_NORM_ESIMD_K    = 64;
 constexpr int RMS_NORM_ESIMD_CMAX = 8;
 constexpr int RMS_NORM_ESIMD_WG   = 16;
 
-// threads per row, 0 if the row does not divide into whole messages
+// threads per row: the most (up to 16) that share it in whole messages; 0 if there is no such split
 static int rms_norm_esimd_wg(const int64_t ncols) {
-    constexpr int per = RMS_NORM_ESIMD_K * RMS_NORM_ESIMD_CMAX;  // columns one thread can take
-    const int     wg  = ncols > per ? RMS_NORM_ESIMD_WG : 1;
-    return ncols > 0 && ncols % (RMS_NORM_ESIMD_K * wg) == 0 && ncols <= per * wg ? wg : 0;
+    if (ncols <= 0 || ncols % RMS_NORM_ESIMD_K != 0) {
+        return 0;
+    }
+    const int64_t chunks = ncols / RMS_NORM_ESIMD_K;
+    if (chunks <= RMS_NORM_ESIMD_CMAX) {
+        return 1;
+    }
+    for (int wg = RMS_NORM_ESIMD_WG; wg > 1; --wg) {
+        if (chunks % wg == 0) {
+            return chunks / wg <= RMS_NORM_ESIMD_CMAX ? wg : 0;
+        }
+    }
+    return 0;
 }
 
-template <bool MUL, bool ADD, int WG, typename LM>
+template <bool MUL, bool ADD, bool WIDE, typename LM>
 ESIMD_INLINE void rms_norm_esimd(const rms_norm_esimd_args a, LM lmem, const sycl::nd_item<3> & it) {
     using namespace sycl::ext::intel::esimd;
     constexpr int K    = RMS_NORM_ESIMD_K;
@@ -432,7 +444,7 @@ ESIMD_INLINE void rms_norm_esimd(const rms_norm_esimd_args a, LM lmem, const syc
 #pragma unroll
         for (int c = 0; c < CMAX; ++c) {
             if (c < a.chunks) {
-                mv.template select<K, 1>(c * K) = block_load<float, K>(a.mul + c0 + c * K);
+                mv.template select<K, 1>(c * K) = block_load<float, K>(a.mul + it.get_group(2) * a.ms1 + c0 + c * K);
             }
         }
     }
@@ -448,10 +460,12 @@ ESIMD_INLINE void rms_norm_esimd(const rms_norm_esimd_args a, LM lmem, const syc
     simd<float, 16> acc16 = acc.template select<16, 1>(0) + acc.template select<16, 1>(16) +
                             acc.template select<16, 1>(32) + acc.template select<16, 1>(48);
     float sum = reduce<float>(acc16, std::plus<>{});
-    if constexpr (WG > 1) {
+    if constexpr (WIDE) {
         lmem[tid] = sum;
         it.barrier(sycl::access::fence_space::local_space);
-        sum = reduce<float>(block_load<float, WG>(lmem, 0), std::plus<>{});
+        simd<float, RMS_NORM_ESIMD_WG> part = block_load<float, RMS_NORM_ESIMD_WG>(lmem, 0);
+        part.merge(simd<float, RMS_NORM_ESIMD_WG>(0.0f), simd<int, RMS_NORM_ESIMD_WG>(0, 1) >= a.wg);
+        sum = reduce<float>(part, std::plus<>{});
     }
     const float scale = 1.0f / sqrt_ieee<float>(sum / a.ncols + a.eps);
 
@@ -469,26 +483,27 @@ ESIMD_INLINE void rms_norm_esimd(const rms_norm_esimd_args a, LM lmem, const syc
     }
 }
 
-template <bool MUL, bool ADD, int WG>
+template <bool MUL, bool ADD, bool WIDE>
 static void rms_norm_esimd_launch(const rms_norm_esimd_args a, const int nrows, const int nchannels, const int nsamples,
                                   queue_ptr stream) {
-    const sycl::nd_range<3> range(sycl::range<3>(nsamples, nchannels, (size_t) nrows * WG), sycl::range<3>(1, 1, WG));
-    if constexpr (WG > 1) {
+    const sycl::nd_range<3> range(sycl::range<3>(nsamples, nchannels, (size_t) nrows * a.wg), sycl::range<3>(1, 1, a.wg));
+    if constexpr (WIDE) {
         stream->submit([&](sycl::handler & h) {
-            sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG), h);
+            sycl::local_accessor<float, 1> lmem(sycl::range<1>(RMS_NORM_ESIMD_WG), h);
             h.parallel_for(range, [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
-                rms_norm_esimd<MUL, ADD, WG>(a, lmem, it);
+                rms_norm_esimd<MUL, ADD, true>(a, lmem, it);
             });
         });
     } else {
         stream->parallel_for(range, [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
-            rms_norm_esimd<MUL, ADD, 1>(a, 0, it);
+            rms_norm_esimd<MUL, ADD, false>(a, 0, it);
         });
     }
 }
 
-// rows of unit-stride F32 columns; mul (if any) is one row of ncols values
-static bool rms_norm_esimd_sycl(const float * x, const float * mul, float * dst, const int ncols, const int nrows,
+// rows of unit-stride F32 columns; mul (if any) is one row of ncols values, or one per row of x (mul_stride_row != 0)
+static bool rms_norm_esimd_sycl(const float * x, const float * mul, const int64_t mul_stride_row, float * dst,
+                                const int ncols, const int nrows,
                                 const int nchannels, const int nsamples, const int64_t src_stride_col,
                                 const int64_t src_stride_row, const int64_t src_stride_channel,
                                 const int64_t src_stride_sample, const int64_t dst_stride_col,
@@ -499,20 +514,21 @@ static bool rms_norm_esimd_sycl(const float * x, const float * mul, float * dst,
     if (!g_ggml_sycl_enable_esimd || src_stride_col != 1 || dst_stride_col != 1 || wg == 0) {
         return false;
     }
-    const rms_norm_esimd_args a = { x, nullptr, mul, nullptr, dst, ncols / RMS_NORM_ESIMD_K / wg, ncols,
+    const rms_norm_esimd_args a = { x, nullptr, mul, nullptr, dst, ncols / RMS_NORM_ESIMD_K / wg, wg, ncols,
                                     src_stride_row, src_stride_channel, src_stride_sample,
-                                    dst_stride_row, dst_stride_channel, dst_stride_sample, eps, scale_mul };
+                                    dst_stride_row, dst_stride_channel, dst_stride_sample, mul_stride_row, eps,
+                                    scale_mul };
     if (mul != nullptr) {
         if (wg > 1) {
-            rms_norm_esimd_launch<true, false, RMS_NORM_ESIMD_WG>(a, nrows, nchannels, nsamples, stream);
+            rms_norm_esimd_launch<true, false, true>(a, nrows, nchannels, nsamples, stream);
         } else {
-            rms_norm_esimd_launch<true, false, 1>(a, nrows, nchannels, nsamples, stream);
+            rms_norm_esimd_launch<true, false, false>(a, nrows, nchannels, nsamples, stream);
         }
     } else {
         if (wg > 1) {
-            rms_norm_esimd_launch<false, false, RMS_NORM_ESIMD_WG>(a, nrows, nchannels, nsamples, stream);
+            rms_norm_esimd_launch<false, false, true>(a, nrows, nchannels, nsamples, stream);
         } else {
-            rms_norm_esimd_launch<false, false, 1>(a, nrows, nchannels, nsamples, stream);
+            rms_norm_esimd_launch<false, false, false>(a, nrows, nchannels, nsamples, stream);
         }
     }
     return true;
@@ -529,7 +545,7 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
     const float eps, queue_ptr stream, int device) {
     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
 
-    if (rms_norm_esimd_sycl(x, nullptr, dst, ncols, nrows, nchannels, nsamples, src_stride_col, src_stride_row,
+    if (rms_norm_esimd_sycl(x, nullptr, 0, dst, ncols, nrows, nchannels, nsamples, src_stride_col, src_stride_row,
                             src_stride_channel, src_stride_sample, dst_stride_col, dst_stride_row, dst_stride_channel,
                             dst_stride_sample, eps, 1.0f, stream)) {
         return;
@@ -579,7 +595,7 @@ static void rms_norm_scale_f32_sycl(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
     const float eps, const float scale_mul, queue_ptr stream, int device) {
-    if (rms_norm_esimd_sycl(x, nullptr, dst, ncols, nrows, nchannels, nsamples, src_stride_col, src_stride_row,
+    if (rms_norm_esimd_sycl(x, nullptr, 0, dst, ncols, nrows, nchannels, nsamples, src_stride_col, src_stride_row,
                             src_stride_channel, src_stride_sample, dst_stride_col, dst_stride_row, dst_stride_channel,
                             dst_stride_sample, eps, scale_mul, stream)) {
         return;
@@ -632,10 +648,10 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
         const float eps, queue_ptr stream, int device) {
-    if (mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
-        rms_norm_esimd_sycl(x, mul, dst, ncols, nrows, nchannels, nsamples, src_stride_col, src_stride_row,
-                            src_stride_channel, src_stride_sample, dst_stride_col, dst_stride_row, dst_stride_channel,
-                            dst_stride_sample, eps, 1.0f, stream)) {
+    if ((mul_nrows == 1 || mul_nrows == nrows) && mul_nchannels == 1 && mul_nsamples == 1 &&
+        rms_norm_esimd_sycl(x, mul, mul_nrows == 1 ? 0 : mul_stride_row, dst, ncols, nrows, nchannels, nsamples,
+                            src_stride_col, src_stride_row, src_stride_channel, src_stride_sample, dst_stride_col,
+                            dst_stride_row, dst_stride_channel, dst_stride_sample, eps, 1.0f, stream)) {
         return;
     }
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
@@ -995,14 +1011,14 @@ bool ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx, const ggml
     const int64_t s3 = s2 * add->ne[2];
     const rms_norm_esimd_args args = { (const float *) a->data, (const float *) b->data, (const float *) w->data,
                                        (float *) add->data, (float *) mul->data,
-                                       (int) (add->ne[0] / RMS_NORM_ESIMD_K / wg), (int) add->ne[0],
-                                       s1, s2, s3, s1, s2, s3, eps, 1.0f };
+                                       (int) (add->ne[0] / RMS_NORM_ESIMD_K / wg), wg, (int) add->ne[0],
+                                       s1, s2, s3, s1, s2, s3, 0, eps, 1.0f };
     dpct::queue_ptr stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     if (wg > 1) {
-        rms_norm_esimd_launch<true, true, RMS_NORM_ESIMD_WG>(args, add->ne[1], add->ne[2], add->ne[3], stream);
+        rms_norm_esimd_launch<true, true, true>(args, add->ne[1], add->ne[2], add->ne[3], stream);
     } else {
-        rms_norm_esimd_launch<true, true, 1>(args, add->ne[1], add->ne[2], add->ne[3], stream);
+        rms_norm_esimd_launch<true, true, false>(args, add->ne[1], add->ne[2], add->ne[3], stream);
     }
     return true;
 #else
