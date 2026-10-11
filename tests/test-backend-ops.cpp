@@ -11656,6 +11656,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 5120, { 1, 1 }, { 1, 1 }));
         }
     }
+    // Q8_0 rows of 32 or more super-blocks: 16 threads per row pair up to 256 rows (one wave of threads), 8 beyond
+    for (int m : { 255, 256, 257, 320, 513 }) {
+        for (int n : { 1, 2, 4, 7 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 8192, { 1, 1 }, { 1, 1 }));
+        }
+    }
     // Q8_0 takes it from 9 columns (8 is the ESIMD side of the boundary); 4105 rows end in a partial 16-row tile
     for (int n : { 8, 9, 16, 17, 24, 32 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
