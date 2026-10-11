@@ -1888,6 +1888,35 @@ ESIMD_INLINE float ggml_sycl_mmv_epilogue_esimd(const ggml_sycl_mmv_epilogue & e
     return x * e.s1 + e.b1;
 }
 
+// The first N floats of a local accessor in registers, in the largest messages that fit (64, 32, ... 1 floats)
+template <int N>
+ESIMD_INLINE sycl::ext::intel::esimd::simd<float, N> esimd_lmem_load(sycl::local_accessor<float, 1> lmem) {
+    using namespace sycl::ext::intel::esimd;
+    simd<float, N> v;
+    if constexpr (N >= 64) {
+#pragma unroll
+        for (int o = 0; o + 64 <= N; o += 64) {
+            v.template select<64, 1>(o) = block_load<float, 64>(lmem, (uint32_t) (o * sizeof(float)));
+        }
+    }
+#define GGML_SYCL_LMEM_PIECE(M)                                                                                  \
+    if constexpr (N % (2 * M) >= M) {                                                                             \
+        constexpr int o = N / (2 * M) * (2 * M);                                                                  \
+        v.template select<M, 1>(o) = block_load<float, M>(lmem, (uint32_t) (o * sizeof(float)));                  \
+    }
+    GGML_SYCL_LMEM_PIECE(32)
+    GGML_SYCL_LMEM_PIECE(16)
+    GGML_SYCL_LMEM_PIECE(8)
+    GGML_SYCL_LMEM_PIECE(4)
+    GGML_SYCL_LMEM_PIECE(2)
+    GGML_SYCL_LMEM_PIECE(1)
+#undef GGML_SYCL_LMEM_PIECE
+    return v;
+}
+
+// floats a thread of the ESIMD mat-vec leaves in local memory: two row sums per column, in one message
+template <int NC> constexpr int esimd_mmv_slot = NC == 1 ? 2 : NC == 2 ? 4 : NC <= 4 ? 8 : 16;
+
 template <ggml_type T, int NC, int WG = GGML_SYCL_DMMV_ESIMD_WG_SIZE>
 ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_nc(
         const void * vx, const float * y, float * dst,
@@ -1921,22 +1950,30 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_nc(
         traits::template mac_pair_nc<NC>(ps, bi0, ps, bi1, has_row1, y + (size_t) ib * QB, y_stride, acc0, acc1);
     }
 
+    // The threads' sums meet in local memory. A thread pays the latency of each memory message in turn, so each
+    // stores its 2 NC sums as one message and thread 0 reads everybody's in messages of 64 floats: with a scalar
+    // per message, thread 0 of a 32-thread group read 448 of them at 7 columns.
+    constexpr int   S = esimd_mmv_slot<NC>;
+    simd<float, S> mine = 0.0f;
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
-        lmem[(tid * NC + c) * 2 + 0] = reduce<float>(acc0[c], std::plus<>{});
-        lmem[(tid * NC + c) * 2 + 1] = reduce<float>(acc1[c], std::plus<>{});
+        mine[c * 2 + 0] = reduce<float>(acc0[c], std::plus<>{});
+        mine[c * 2 + 1] = reduce<float>(acc1[c], std::plus<>{});
     }
+    block_store<float, S>(lmem, (uint32_t) (tid * S * sizeof(float)), mine);
     it.barrier(sycl::access::fence_space::local_space);
 
     if (tid == 0) {
+        simd<float, WG * S> part = esimd_lmem_load<WG * S>(lmem);
+        simd<float, S>      tot  = 0.0f;
+#pragma unroll
+        for (int p = 0; p < WG; ++p) {
+            tot += part.template select<S, 1>(p * S);
+        }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
-            float sum0 = 0.0f;
-            float sum1 = 0.0f;
-            for (int p = 0; p < WG; ++p) {
-                sum0 += lmem[(p * NC + c) * 2 + 0];
-                sum1 += lmem[(p * NC + c) * 2 + 1];
-            }
+            const float sum0 = tot[c * 2 + 0];
+            const float sum1 = tot[c * 2 + 1];
             dst[c * dst_stride + row0 + 0] = ggml_sycl_mmv_epilogue_esimd(epi, sum0);
             if (has_row1) {
                 dst[c * dst_stride + row0 + 1] = ggml_sycl_mmv_epilogue_esimd(epi, sum1);
@@ -2157,7 +2194,7 @@ static void dequantize_mul_mat_vec_reorder_esimd_nc_sycl(const void * vx, const 
     GGML_ASSERT(ncols % ggml_sycl_esimd::esimd_block_elems<ggml_sycl_esimd::esimd_reorder_q_traits<T>>::value == 0);
     const int workgroups = (nrows + 1) / 2;
     stream->submit([&](sycl::handler & h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * 2 * NC), h);
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * esimd_mmv_slot<NC>), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG), sycl::range<1>(WG)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {

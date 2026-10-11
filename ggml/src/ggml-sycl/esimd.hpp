@@ -1036,19 +1036,35 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
             d_b  = convert<float>(block_load<sycl::half, blocks_per_sb>(pb.d + bib * blocks_per_sb));
         }
 
+        // The activations arrive in waves of 64-float messages issued together, G floats per column and at most 32
+        // registers a wave: a thread pays the latency of each message it waits for in turn, and one message per
+        // 32 floats and column made 8 NC waves of a super-block (320 x 10240 at 7 columns: 12.1 us a call).
+        constexpr int G = NC <= 2 ? QK_K : NC <= 4 ? QK_K / 2 : QK_K / 4;
 #pragma unroll
-        for (int c = 0; c < blocks_per_sb; ++c) {
-            simd<int8_t, 32> q_a  = qs_a.select<32, 1>(c * QK8_0);
-            simd<int8_t, 32> q_b  = qs_b.select<32, 1>(c * QK8_0);
-            const float      da    = d_a[c];
-            const float      db    = d_b[c];
-            simd<float, 32>  deq_a = convert<float>(q_a) * da;
-            simd<float, 32>  deq_b = convert<float>(q_b) * db;
+        for (int g = 0; g < QK_K / G; ++g) {
+            simd<float, G> y[NC];
 #pragma unroll
             for (int n = 0; n < NC; ++n) {
-                simd<float, 32> y = block_load<float, 32>(y_blk + n * y_stride + c * QK8_0);
-                acc_a[n] += y * deq_a;
-                acc_b[n] += y * deq_b;
+#pragma unroll
+                for (int m = 0; m < G / 64; ++m) {
+                    y[n].template select<64, 1>(m * 64) = block_load<float, 64>(y_blk + n * y_stride + g * G + m * 64);
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < G / QK8_0; ++c) {
+                const int        b     = g * (G / QK8_0) + c;
+                simd<int8_t, 32> q_a   = qs_a.select<32, 1>(b * QK8_0);
+                simd<int8_t, 32> q_b   = qs_b.select<32, 1>(b * QK8_0);
+                const float      da    = d_a[b];
+                const float      db    = d_b[b];
+                simd<float, 32>  deq_a = convert<float>(q_a) * da;
+                simd<float, 32>  deq_b = convert<float>(q_b) * db;
+#pragma unroll
+                for (int n = 0; n < NC; ++n) {
+                    simd<float, 32> yc = y[n].template select<32, 1>(c * QK8_0);
+                    acc_a[n] += yc * deq_a;
+                    acc_b[n] += yc * deq_b;
+                }
             }
         }
     }
@@ -1080,18 +1096,24 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_F32> {
             sycl::ext::intel::esimd::simd<float, 32> (&acc_b)[NC]) {
         using namespace sycl::ext::intel::esimd;
 
+        // every message of the block before its first use: a thread pays the latency of each message in turn, and
+        // loads issued together overlap (4 x 10240 at 7 columns: one wave of 9 messages instead of 14 waves)
+        simd<float, block_elems> w_a = block_load<float, block_elems>(pa.x + bia * block_elems);
+        simd<float, block_elems> w_b = 0.0f;
+        if (has_b) {
+            w_b = block_load<float, block_elems>(pb.x + bib * block_elems);
+        }
+        simd<float, block_elems> y[NC];
+#pragma unroll
+        for (int n = 0; n < NC; ++n) {
+            y[n] = block_load<float, block_elems>(y_blk + n * y_stride);
+        }
 #pragma unroll
         for (int c = 0; c < block_elems / 32; ++c) {
-            simd<float, 32> w_a = block_load<float, 32>(pa.x + bia * block_elems + c * 32);
-            simd<float, 32> w_b = 0.0f;
-            if (has_b) {
-                w_b = block_load<float, 32>(pb.x + bib * block_elems + c * 32);
-            }
 #pragma unroll
             for (int n = 0; n < NC; ++n) {
-                simd<float, 32> y = block_load<float, 32>(y_blk + n * y_stride + c * 32);
-                acc_a[n] += y * w_a;
-                acc_b[n] += y * w_b;
+                acc_a[n] += y[n].template select<32, 1>(c * 32) * w_a.template select<32, 1>(c * 32);
+                acc_b[n] += y[n].template select<32, 1>(c * 32) * w_b.template select<32, 1>(c * 32);
             }
         }
     }
