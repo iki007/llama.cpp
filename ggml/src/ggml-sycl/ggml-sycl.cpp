@@ -6483,10 +6483,9 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
     if (wu->type == GGML_TYPE_Q5_K && act->ne[1] > 5) {
         return false;
     }
-    // q4_K where the XMX mat-vec takes the two unfused GEMVs (4+ columns): they need about half the fused kernel's
-    // time (Qwen3.8-27B per card at 8 columns: 2 x 55 us against 216)
-    if (wu->type == GGML_TYPE_Q4_K &&
-        ggml_sycl_dmmv_dpas_supported(ctx.device, wu->type, wu->ne[0], wu->ne[1], act->ne[1])) {
+    // where the XMX mat-vec takes the two unfused GEMVs (q4_K and q5_K from 2 columns on matrices of its size) they
+    // need about half the fused kernel's time (Qwen3.8-27B per card at 8 columns, q4_K: 2 x 55 us against 216)
+    if (ggml_sycl_dmmv_dpas_supported(ctx.device, wu->type, wu->ne[0], wu->ne[1], act->ne[1])) {
         return false;
     }
 

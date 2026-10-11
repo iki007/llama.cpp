@@ -11673,9 +11673,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // The SYCL XMX (DPAS) mat-vec takes 4-8 columns of Q4_K with at least 8M weights; the odd m ends
+    // The SYCL XMX (DPAS) mat-vec takes 2-8 columns of Q4_K with at least 8M weights; the odd m ends
     // in a partial 16-row tile.
-    for (int n = 4; n <= 8; ++n) {
+    for (int n = 2; n <= 8; ++n) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
     }
@@ -11712,7 +11712,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 4105, n, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 4097, n, 2304, { 1, 1 }, { 1, 1 }));
     }
-    // Q6_K likewise from 3 columns, Q5_K from 5 (2-4 are the ESIMD side)
+    // Q6_K likewise from 3 columns (2 is the ESIMD side), Q5_K from 2
     for (ggml_type t : { GGML_TYPE_Q6_K, GGML_TYPE_Q5_K }) {
         for (int n = 2; n <= 8; ++n) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
