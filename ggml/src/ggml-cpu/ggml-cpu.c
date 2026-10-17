@@ -2377,13 +2377,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // that one thread would wait out one at a time.
                 n_tasks = ggml_nrows(node) >= 16 ? n_threads : 1;
             } break;
-        case GGML_OP_SET_ROWS:
-            {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
-                n_tasks = 1;
-            } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
         case GGML_OP_RESHAPE:
