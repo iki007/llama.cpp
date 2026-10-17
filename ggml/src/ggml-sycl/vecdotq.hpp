@@ -2176,50 +2176,6 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
-template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS> {
-    static constexpr ggml_type gtype = GGML_TYPE_IQ3_XXS;
-
-    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
-                                     const sycl::half2 * q8_1_ds, const int & iqs) {
-#if DPCT_COMPATIBILITY_TEMP >= MIN_CC_DP4A && QK_K == 256
-        const uint8_t * base = static_cast<const uint8_t *>(vbq);
-        const uint8_t * qs   = base + ibx_offset.first;
-        const uint8_t * q3   = qs + 8 * iqs;
-        const uint16_t * gas = reinterpret_cast<const uint16_t *>(qs + QK_K / 4) + 2 * iqs;
-        const int8_t * q8    = q8_1_quant_ptr + iqs * QK8_1;
-        uint32_t aux32       = gas[0] | (gas[1] << 16);
-
-        int sumi = 0;
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const uint32_t grid1 = iq3xxs_grid[q3[2*l+0]];
-            const uint32_t grid2 = iq3xxs_grid[q3[2*l+1]];
-            const uint32_t sign_bits = iq_sign_bits(aux32);
-            const uint32_t signs0 = iq_sign_mask(sign_bits);
-            const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
-            const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
-            const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
-            sumi = dpct::dp4a(grid_l, *((const int *) q8 + 0), sumi);
-            sumi = dpct::dp4a(grid_h, *((const int *) q8 + 1), sumi);
-            q8 += 8;
-            aux32 >>= 7;
-        }
-
-        const ggml_half d = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
-        return (float) d * (0.5f + aux32) * q8_1_ds[iqs][0] * 0.5f * sumi;
-#else
-        GGML_UNUSED(vbq);
-        GGML_UNUSED(ibx_offset);
-        GGML_UNUSED(d_offset);
-        GGML_UNUSED(q8_1_quant_ptr);
-        GGML_UNUSED(q8_1_ds);
-        GGML_UNUSED(iqs);
-        GGML_ABORT("IQ3_XXS reorder vec dot requires dp4a and QK_K == 256");
-#endif
-    }
-};
-
 #define VDR_IQ3_S_Q8_1_MMVQ 1
 
 static __dpct_inline__ float
@@ -2254,50 +2210,6 @@ vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
     assert(false);
 #endif
 }
-
-template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S> {
-    static constexpr ggml_type gtype = GGML_TYPE_IQ3_S;
-
-    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
-                                     const sycl::half2 * q8_1_ds, const int & iqs) {
-#if QK_K == 256
-        const uint8_t * base     = static_cast<const uint8_t *>(vbq);
-        const uint8_t * qs       = base + ibx_offset.first + 8 * iqs;
-        const uint8_t * qh       = base + ibx_offset.second;
-        const uint8_t * signs    = base + d_offset.first + 4 * iqs;
-        const uint8_t * metadata = base + d_offset.second;
-        const ggml_half d        = *reinterpret_cast<const ggml_half *>(metadata);
-        const uint8_t * scales   = metadata + sizeof(ggml_half);
-        const int8_t * q8        = q8_1_quant_ptr + iqs * QK8_1;
-
-        int sumi = 0;
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const uint32_t grid1 = iq3s_grid[qs[2*l+0] | ((qh[iqs] << (8 - 2*l)) & 256)];
-            const uint32_t grid2 = iq3s_grid[qs[2*l+1] | ((qh[iqs] << (7 - 2*l)) & 256)];
-            const uint32_t signs0 = iq_sign_mask(signs[l]);
-            const uint32_t signs1 = iq_sign_mask(signs[l] >> 4);
-            const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
-            const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
-            sumi = dpct::dp4a(grid_l, *((const int *) q8 + 0), sumi);
-            sumi = dpct::dp4a(grid_h, *((const int *) q8 + 1), sumi);
-            q8 += 8;
-        }
-
-        const float scale = 1 + 2 * ((scales[iqs / 2] >> (4 * (iqs % 2))) & 0xf);
-        return (float) d * scale * q8_1_ds[iqs][0] * sumi;
-#else
-        GGML_UNUSED(vbq);
-        GGML_UNUSED(ibx_offset);
-        GGML_UNUSED(d_offset);
-        GGML_UNUSED(q8_1_quant_ptr);
-        GGML_UNUSED(q8_1_ds);
-        GGML_UNUSED(iqs);
-        GGML_ABORT("IQ3_S reorder vec dot not supported for QK_K != 256");
-#endif
-    }
-};
 
 #define VDR_IQ1_S_Q8_1_MMVQ 1
 

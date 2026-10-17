@@ -189,6 +189,7 @@ static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int
         [=](sycl::nd_item<3> item_ct1) {
             dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
         });
+
 }
 
 template <typename dst_t>
@@ -451,20 +452,6 @@ static void dequantize_row_iq3_xxs_sycl(const void *vx, dst_t *y, const int64_t 
                              });
         });
     }
-}
-
-template <typename dst_t>
-static void dequantize_row_iq3_xxs_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
-                                                dpct::queue_ptr stream) {
-    const int64_t nb = k / QK_K;
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
-        [=](sycl::nd_item<3> item_ct1) {
-            dequantize_block_iq3_xxs_reorder(
-                vx, y + item_ct1.get_group(2) * QK_K, item_ct1.get_group(2), item_ct1, nb,
-                iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs);
-        });
 }
 
 template <typename dst_t>
