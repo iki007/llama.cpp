@@ -146,6 +146,10 @@ LLAMA_API bool llama_batch_ext_set_decision_group(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// number of floats per token returned by llama_get_embeddings_layer_inp
+// equals llama_model_n_embd, except for models with a wider residual (e.g. hyper-connection streams)
+LLAMA_API int32_t llama_model_n_embd_layer_inp(const struct llama_model * model);
+
 //
 // model/context data extraction
 //
