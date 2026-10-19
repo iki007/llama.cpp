@@ -9502,7 +9502,14 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     static const bool q8_on    = ggml_sycl_get_env("GGML_SYCL_COMM_Q8", 1) != 0;
     const bool    q8       = big && !f16 && q8_on && nelem % 32 == 0;
     const bool    compress = big && !f16 && !q8;
-    const size_t  xbytes   = q8 ? nelem + nelem / 32 * sizeof(float) :
+    // From 13 rows of 5120 the kernels' block exchange writes 8-bit blocks too: per 64 values one 64-byte line of
+    // int8 and two f32 scales (1.125 instead of 2 bytes per value). Qwen3.8-27B on two Arc Pro B70, ms per batch of
+    // 16 / 8 rows: 37.9 -> 36.0 (-5%), 28.3 -> 27.7 (-2.4%); KL divergence against bf16 blocks 1.2e-4 / 2.0e-4, the
+    // same top token at 99.9% / 99.6% of positions, so one sequence decoding alone (up to 8 rows) keeps bf16.
+    // GGML_SYCL_COMM_Q8_BLOCK=0: bf16 at every size
+    static const bool q8b_on   = ggml_sycl_get_env("GGML_SYCL_COMM_Q8_BLOCK", 1) != 0;
+    const bool    q8b      = block && q8b_on && nelem % 64 == 0 && nelem >= 65536;
+    const size_t  xbytes   = q8 || q8b ? nelem + nelem / 32 * sizeof(float) :
                              compress || block ? nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
 
     if (comm_ctx->hbox_bytes < xbytes) {
@@ -9527,7 +9534,25 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     auto publish = [&](queue_ptr q, int dev, const void * out, uint8_t * stage) {
         uint8_t * box = comm_ctx->hbox[dev][slot];
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-        if (block) {
+        if (q8b) {
+            // per 64 values: one 64-byte line of int8 at qs + 64 w, two f32 scales at ds + 2 w
+            q->parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const float *   x  = (const float *) out + (size_t) w[0] * 64;
+                simd<float, 32> v0 = block_load<float, 32>(x, element_aligned_tag{});
+                simd<float, 32> v1 = block_load<float, 32>(x + 32, element_aligned_tag{});
+                const float     a0 = hmax<float>(abs(v0));
+                const float     a1 = hmax<float>(abs(v1));
+                simd<int8_t, 64> qv;
+                qv.template select<32, 1>(0)  = convert<int8_t>(rnde<float>(v0 * (a0 > 0.0f ? 127.0f / a0 : 0.0f)));
+                qv.template select<32, 1>(32) = convert<int8_t>(rnde<float>(v1 * (a1 > 0.0f ? 127.0f / a1 : 0.0f)));
+                block_store<uint32_t, 16>((uint32_t *) box + (size_t) w[0] * 16, qv.template bit_cast_view<uint32_t>().read(), overaligned_tag<64>{});
+                simd<float, 2> d;
+                d[0] = a0 / 127.0f;
+                d[1] = a1 / 127.0f;
+                block_store<float, 2>((float *) (box + nelem) + (size_t) w[0] * 2, d, element_aligned_tag{});
+            });
+        } else if (block) {
             // value i of a block in the low half of word i, value 16 + i in its high half
             q->parallel_for(sycl::range<1>(nelem / 32), [=](sycl::id<1> blk) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
@@ -9585,6 +9610,25 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
         const uint32_t * flag = flags + (dev ^ 1) * 16;
         const uint8_t *  box  = comm_ctx->hbox[dev ^ 1][slot];
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+        if (q8b) {
+            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
+            q->parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                float *            x  = (float *) out + (size_t) w[0] * 64;
+                simd<uint32_t, 16> qw = block_load<uint32_t, 16>((const uint32_t *) box + (size_t) w[0] * 16, overaligned_tag<64>{});
+                simd<float, 2>     d  = block_load<float, 2>((const float *) (box + nelem) + (size_t) w[0] * 2, element_aligned_tag{});
+                simd<int8_t, 64>   qv = qw.template bit_cast_view<int8_t>();
+                const float        d0 = d[0];
+                const float        d1 = d[1];
+                simd<float, 32>    p0 = convert<float>(simd<int8_t, 32>(qv.template select<32, 1>(0)))  * d0;
+                simd<float, 32>    p1 = convert<float>(simd<int8_t, 32>(qv.template select<32, 1>(32))) * d1;
+                simd<float, 32>    v0 = block_load<float, 32>(x, element_aligned_tag{});
+                simd<float, 32>    v1 = block_load<float, 32>(x + 32, element_aligned_tag{});
+                block_store<float, 32>(x, v0 + p0, element_aligned_tag{});
+                block_store<float, 32>(x + 32, v1 + p1, element_aligned_tag{});
+            });
+            return;
+        }
         if (block) {
             q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
             q->parallel_for(sycl::range<1>(nelem / 32), [=](sycl::id<1> blk) SYCL_ESIMD_KERNEL {
