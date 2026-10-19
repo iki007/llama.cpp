@@ -6034,9 +6034,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     const int64_t chunk_min = ggml_sycl_chunk_cols_from_9(src0) ? 8 : MMVQ_MAX_BATCH_SIZE;
     static const int64_t chunk_max = ggml_sycl_get_env("GGML_SYCL_CHUNK_MAX_COLS", 0);
     const int64_t chunk_lim = chunk_max > 0 ? chunk_max : ctx.row_split ? 224 : 160;
-    const bool chunk_wide = ncols_y > 32 && ncols_y <= chunk_lim &&
+    // the widest launch the XMX mat-vec takes for this matrix: 64 columns on tall ones (ggml_sycl_dmmv_dpas), else 32
+    const int64_t wide_cols = ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], 64) ? 64 : 32;
+    const bool chunk_wide = ncols_y > wide_cols && ncols_y <= chunk_lim &&
                             ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], 32);
-    const int64_t chunk_cols = chunk_wide ? 32 : 8;
+    const int64_t chunk_cols = chunk_wide ? wide_cols : 8;
     if (!split && !g_ggml_sycl_prioritize_dmmv && dst->op == GGML_OP_MUL_MAT && ncols_y > chunk_min &&
         (ncols_y <= 32 || chunk_wide) && ggml_sycl_supports_reorder_mmvq(src0->type) && should_reorder_tensor(ctx, dst, ncols_y) &&
         !ggml_sycl_in_compute_buffer(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
