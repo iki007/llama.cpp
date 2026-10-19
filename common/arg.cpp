@@ -4227,6 +4227,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_DEEP"));
     add_opt(common_arg(
+        {"--spec-draft-n-max-busy"}, "S:N[,S:N...]",
+        "with at least S slots generating, draft at most N tokens per slot (e.g. 6:3,12:2; default: off)",
+        [](common_params & params, const std::string & value) {
+            std::vector<std::pair<int32_t, int32_t>> steps;
+            for (const auto & item : string_split<std::string>(value, ',')) {
+                const auto parts = string_split<std::string>(item, ':');
+                if (parts.size() != 2) {
+                    throw std::invalid_argument("expected S:N[,S:N...]");
+                }
+                const int32_t n_slots = std::stoi(parts[0]);
+                const int32_t n_max   = std::stoi(parts[1]);
+                if (n_slots < 1 || n_max < 0 || (!steps.empty() && n_slots <= steps.back().first)) {
+                    throw std::invalid_argument("expected ascending S >= 1 and N >= 0");
+                }
+                steps.emplace_back(n_slots, n_max);
+            }
+            params.speculative.draft.n_max_busy = steps;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_BUSY"));
+    add_opt(common_arg(
         {"--spec-draft-deep-ctx"}, "N",
         string_format("context length from which --spec-draft-n-max-deep applies (default: %d, 0 = off)", params.speculative.draft.n_ctx_deep),
         [](common_params & params, int value) {

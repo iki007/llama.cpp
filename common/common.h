@@ -351,6 +351,10 @@ struct common_params_speculative_draft {
     int32_t n_max_deep = 0;
     int32_t n_ctx_deep = 0;
 
+    // with at least .first slots generating, draft at most .second tokens (ascending by slots; empty = off): the
+    // verify batch of many sequences fills the GPU, where every rejected draft row takes the place of a real token
+    std::vector<std::pair<int32_t, int32_t>> n_max_busy;
+
     // extend a draft with the tokens that followed the longest earlier occurrence of the context's tail (the draft
     // included, at least lookup_n_min tokens; 0 = off), up to lookup_n_max draft tokens in total
     int32_t lookup_n_min = 0;

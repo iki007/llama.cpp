@@ -3886,6 +3886,20 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // the draft length for the number of slots generating now (--spec-draft-n-max-busy)
+        int n_draft_busy = -1;
+        if (!params_base.speculative.draft.n_max_busy.empty()) {
+            int n_gen = 0;
+            for (const auto & slot : slots) {
+                n_gen += slot.state == SLOT_STATE_GENERATING;
+            }
+            for (const auto & [n_slots, n_max] : params_base.speculative.draft.n_max_busy) {
+                if (n_gen >= n_slots) {
+                    n_draft_busy = n_max;
+                }
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3911,7 +3925,8 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = n_draft_busy >= 0 ? std::min(slot.get_n_draft_max(), n_draft_busy)
+                                                          : slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
