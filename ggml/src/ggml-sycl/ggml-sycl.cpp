@@ -6032,6 +6032,13 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 }
 
+// Up to this many columns a type with the wide XMX mat-vec goes through it in chunks (see the chunk rule below).
+// GGML_SYCL_CHUNK_MAX_COLS sets the limit for both layouts, 32 turns the wide chunks off.
+static int64_t ggml_sycl_chunk_lim(const ggml_backend_sycl_context & ctx) {
+    static const int64_t chunk_max = ggml_sycl_get_env("GGML_SYCL_CHUNK_MAX_COLS", 0);
+    return chunk_max > 0 ? chunk_max : ctx.row_split ? 224 : 160;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -6051,8 +6058,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     // [k, n, b] activations against one 2D weight are b independent groups of columns. As one [k, n*b] batch they
     // take a single launch of the multi-column kernels instead of one per group (the recurrent layers with several
-    // sequences decoding together: Qwen3.8-27B ssm_out, 4 x 8 columns, 258 us in 4 launches).
-    if (!split && dst->op == GGML_OP_MUL_MAT && src1->ne[2] > 1 && src1->ne[3] == 1 && src1->ne[1] * src1->ne[2] <= 32 &&
+    // sequences decoding together: Qwen3.8-27B ssm_out, 4 x 8 columns, 258 us in 4 launches). Past 32 columns only
+    // where the wide XMX mat-vec then takes the batch (one launch or its chunks): 8 sessions verifying 8 rows each
+    // went in 8 launches of 8 columns, every one reading the weights again.
+    const int64_t ncols_flat = src1->ne[1] * src1->ne[2];
+    const bool    flat_cols  = ncols_flat <= 32 ||
+                               (ncols_flat <= ggml_sycl_chunk_lim(ctx) &&
+                                ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], 32));
+    if (!split && dst->op == GGML_OP_MUL_MAT && src1->ne[2] > 1 && src1->ne[3] == 1 && flat_cols &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
         dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && dst->ne[1] == src1->ne[1] &&
         dst->ne[2] == src1->ne[2] && dst->ne[3] == 1) {
@@ -6080,11 +6093,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // 301.2 -> 292.7, 313.4 -> 330.9 ms with chunks) and at 161 on one card (144 / 160 / 192: 322.3 -> 285.6,
     // 325.5 -> 303.2, 332.5 -> 362.3; a limit by matrix height instead lost 3-7% at 176 to 224).
     // Chunks of 8 columns past 32 lose to them (64 columns: +13 ms for 11 matrices).
-    // GGML_SYCL_CHUNK_MAX_COLS sets the limit for both layouts, 32 turns the wide chunks off.
+    // GGML_SYCL_CHUNK_MAX_COLS sets the limit for both layouts (ggml_sycl_chunk_lim), 32 turns the wide chunks off.
     const int64_t ncols_y   = src1->ne[1];
     const int64_t chunk_min = ggml_sycl_chunk_cols_from_9(src0) ? 8 : MMVQ_MAX_BATCH_SIZE;
-    static const int64_t chunk_max = ggml_sycl_get_env("GGML_SYCL_CHUNK_MAX_COLS", 0);
-    const int64_t chunk_lim = chunk_max > 0 ? chunk_max : ctx.row_split ? 224 : 160;
+    const int64_t chunk_lim = ggml_sycl_chunk_lim(ctx);
     // the widest launch the XMX mat-vec takes for this matrix: 64 columns on tall ones (ggml_sycl_dmmv_dpas), else 32
     const int64_t wide_cols = ggml_sycl_dmmv_dpas_supported(ctx.device, src0->type, src0->ne[0], src0->ne[1], 64) ? 64 : 32;
     const bool chunk_wide = ncols_y > wide_cols && ncols_y <= chunk_lim &&
