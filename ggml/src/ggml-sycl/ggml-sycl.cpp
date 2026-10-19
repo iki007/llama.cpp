@@ -9407,6 +9407,19 @@ struct ggml_backend_sycl_comm_context {
     uint32_t * hflag         = nullptr;
     uint32_t   hseq          = 0;
 
+    // per device a second in-order queue whose copies run on the copy engine next to the main queue's kernels
+    std::unique_ptr<sycl::queue> xq[2];
+    sycl::event                  xev[2];
+    bool                         xev_set[2] = { false, false };
+
+    void wait_xq() {
+        for (auto & q : xq) {
+            if (q) {
+                q->wait();
+            }
+        }
+    }
+
     void free_host() {
         for (int i = 0; i < 2; ++i) {
             const sycl::context sctx = ((ggml_backend_sycl_context *) backends[i]->context)->stream()->get_context();
@@ -9509,12 +9522,30 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     // GGML_SYCL_COMM_Q8_BLOCK=0: bf16 at every size
     static const bool q8b_on   = ggml_sycl_get_env("GGML_SYCL_COMM_Q8_BLOCK", 1) != 0;
     const bool    q8b      = block && q8b_on && nelem % 64 == 0 && nelem >= 65536;
+    // Card 1's x4 link moves data both ways at once only through two engines: its own 8-bit partial goes up on the
+    // copy engine (a second queue) while the add kernel reads the peer's partial straight from host memory on the
+    // compute engine, where before the upload, the download and the add ran one after the other. The copy engine
+    // raises the flag too, from a sequence word the compress kernel leaves in the stage, so the second queue holds
+    // no kernel (a kernel there would share the compute engine with the main queue's wait). Card 1's link then
+    // carries ~10 instead of ~7 GB/s. Qwen3.8-27B on two Arc Pro B70, ms per batch of 32 / 64 / 2048 rows: 50.6 ->
+    // 50.0, 80.3 -> 77.7, 1163 -> 1086. Same values as the copy path, the adds not contracted to fma: KL divergence
+    // 0 (max 5e-5), the same top token everywhere. Uploading on the main queue of the card with the fast link
+    // (the copy engine starts ~17 us after the kernel across queues, ~1.5 us inside one) gained nothing: card 1's
+    // link sets the time. GGML_SYCL_COMM_DUPLEX=0: off
+    static const bool duplex_on = ggml_sycl_get_env("GGML_SYCL_COMM_DUPLEX", 1) != 0;
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    const bool    duplex   = q8 && duplex_on && nelem % 64 == 0 && comm_ctx->xq[0] && comm_ctx->xq[1];
+#else
+    const bool    duplex   = false;
+#endif
     const size_t  xbytes   = q8 || q8b ? nelem + nelem / 32 * sizeof(float) :
                              compress || block ? nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
+    const size_t  seq_off  = (xbytes + 63) / 64 * 64;
 
     if (comm_ctx->hbox_bytes < xbytes) {
         q0->wait();
         q1->wait();
+        comm_ctx->wait_xq();
         for (auto & dev : comm_ctx->hbox) {
             for (auto & box : dev) {
                 if (box != nullptr) {
@@ -9530,28 +9561,62 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     uint32_t *     flags = comm_ctx->hflag;
     comm_ctx->hslot ^= 1;
 
+    // leaving the second queue: the main queue waits for the copy engine's last payload and flag, or its flag below
+    // could land before that older flag (and the stage be rewritten while still being copied)
+    if (!duplex) {
+        const queue_ptr qs[2] = { q0, q1 };
+        for (int dev = 0; dev < 2; ++dev) {
+            if (comm_ctx->xev_set[dev]) {
+                qs[dev]->ext_oneapi_submit_barrier({ comm_ctx->xev[dev] });
+                comm_ctx->xev_set[dev] = false;
+            }
+        }
+    }
+
     // big path device staging: [0, xbytes) the compressed own partial, [xbytes, 2 xbytes) the peer's partial
     auto publish = [&](queue_ptr q, int dev, const void * out, uint8_t * stage) {
         uint8_t * box = comm_ctx->hbox[dev][slot];
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-        if (q8b) {
-            // per 64 values: one 64-byte line of int8 at qs + 64 w, two f32 scales at ds + 2 w
-            q->parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
-                using namespace sycl::ext::intel::esimd;
-                const float *   x  = (const float *) out + (size_t) w[0] * 64;
-                simd<float, 32> v0 = block_load<float, 32>(x, element_aligned_tag{});
-                simd<float, 32> v1 = block_load<float, 32>(x + 32, element_aligned_tag{});
-                const float     a0 = hmax<float>(abs(v0));
-                const float     a1 = hmax<float>(abs(v1));
-                simd<int8_t, 64> qv;
-                qv.template select<32, 1>(0)  = convert<int8_t>(rnde<float>(v0 * (a0 > 0.0f ? 127.0f / a0 : 0.0f)));
-                qv.template select<32, 1>(32) = convert<int8_t>(rnde<float>(v1 * (a1 > 0.0f ? 127.0f / a1 : 0.0f)));
-                block_store<uint32_t, 16>((uint32_t *) box + (size_t) w[0] * 16, qv.template bit_cast_view<uint32_t>().read(), overaligned_tag<64>{});
-                simd<float, 2> d;
-                d[0] = a0 / 127.0f;
-                d[1] = a1 / 127.0f;
-                block_store<float, 2>((float *) (box + nelem) + (size_t) w[0] * 2, d, element_aligned_tag{});
+        if (q8b || duplex) {
+            // per 64 values: one 64-byte line of int8 at qs + 64 w, two f32 scales at ds + 2 w; duplex: into the
+            // stage, which the copy engine then moves (the stage is free again once its previous copy is done)
+            uint8_t *  dst  = duplex ? stage : box;
+            uint32_t * sseq = (uint32_t *) (stage + seq_off);
+            sycl::event ec = q->submit([&](sycl::handler & h) {
+                if (duplex && comm_ctx->xev_set[dev]) {
+                    h.depends_on(comm_ctx->xev[dev]);
+                }
+                h.parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
+                    using namespace sycl::ext::intel::esimd;
+                    const float *   x  = (const float *) out + (size_t) w[0] * 64;
+                    simd<float, 32> v0 = block_load<float, 32>(x, element_aligned_tag{});
+                    simd<float, 32> v1 = block_load<float, 32>(x + 32, element_aligned_tag{});
+                    const float     a0 = hmax<float>(abs(v0));
+                    const float     a1 = hmax<float>(abs(v1));
+                    simd<int8_t, 64> qv;
+                    qv.template select<32, 1>(0)  = convert<int8_t>(rnde<float>(v0 * (a0 > 0.0f ? 127.0f / a0 : 0.0f)));
+                    qv.template select<32, 1>(32) = convert<int8_t>(rnde<float>(v1 * (a1 > 0.0f ? 127.0f / a1 : 0.0f)));
+                    block_store<uint32_t, 16>((uint32_t *) dst + (size_t) w[0] * 16, qv.template bit_cast_view<uint32_t>().read(), overaligned_tag<64>{});
+                    simd<float, 2> d;
+                    d[0] = a0 / 127.0f;
+                    d[1] = a1 / 127.0f;
+                    block_store<float, 2>((float *) (dst + nelem) + (size_t) w[0] * 2, d, element_aligned_tag{});
+                    if (duplex && w[0] == 0) {
+                        *sseq = seq;
+                    }
+                });
             });
+            if (duplex) {
+                // in order on the copy engine: the payload, then the flag (no flag kernel on the main queue)
+                sycl::queue & xq = *comm_ctx->xq[dev];
+                xq.submit([&](sycl::handler & h) {
+                    h.depends_on(ec);
+                    h.memcpy(box, stage, xbytes);
+                });
+                comm_ctx->xev[dev]     = xq.memcpy(flags + dev * 16, sseq, sizeof(uint32_t));
+                comm_ctx->xev_set[dev] = true;
+                return;
+            }
         } else if (block) {
             // value i of a block in the low half of word i, value 16 + i in its high half
             q->parallel_for(sycl::range<1>(nelem / 32), [=](sycl::id<1> blk) SYCL_ESIMD_KERNEL {
@@ -9610,7 +9675,7 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
         const uint32_t * flag = flags + (dev ^ 1) * 16;
         const uint8_t *  box  = comm_ctx->hbox[dev ^ 1][slot];
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-        if (q8b) {
+        if (q8b || duplex) {
             q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
             q->parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
@@ -9708,6 +9773,10 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
         ctx->hflag = sycl::malloc_host<uint32_t>(32, sycl_ctx);
         memset(ctx->hflag, 0, 32 * sizeof(uint32_t));
         ctx->host_exchange = true;
+        for (int i = 0; i < 2; ++i) {
+            const queue_ptr s = ((ggml_backend_sycl_context *) backends[i]->context)->stream();
+            ctx->xq[i] = std::make_unique<sycl::queue>(s->get_context(), s->get_device(), sycl::property::queue::in_order{});
+        }
     }
     return ctx;
 }
@@ -9728,6 +9797,7 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
         try {
             sctx0->stream()->wait();
             sctx1->stream()->wait();
+            comm_ctx->wait_xq();
             comm_ctx->free_host();
             const sycl::context sycl_ctx = sctx0->stream()->get_context();
             for (auto & dev : comm_ctx->hbox) {
@@ -9790,6 +9860,7 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
         // the previous allreduce may still be using them
         q0->wait();
         q1->wait();
+        comm_ctx->wait_xq();
         comm_ctx->buf0->realloc(nelem * 4);
         comm_ctx->buf1->realloc(nelem * 4);
         comm_ctx->buf_nelem = nelem;
