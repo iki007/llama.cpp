@@ -54,6 +54,13 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
+    // per-tap width of the target features, as for EAGLE3: n_embd by default, n_streams*n_embd for a hyper-connection target
+    uint32_t n_embd_tgt = hparams.n_embd;
+    ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, n_embd_tgt, false);
+    if (n_embd_tgt == 0) {
+        throw std::runtime_error("DFlash 'target_hidden_size' must be positive");
+    }
+
     if (ml.get_tensor_meta("dspark_hidden_out.weight")) {
         const auto rank = ml.require_tensor_meta("markov_w1.weight")->ne[0];
         ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab_padded);
@@ -67,7 +74,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         }
         hparams.dspark_context_rank = (uint32_t) rank;
     }
-    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
 
     std::string layers;
     const char * sep = "";
@@ -76,7 +83,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         layers += std::to_string(id);
         sep = ", ";
     }
-    LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s]\n", __func__, layers.c_str());
+    LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s], n_embd_tgt = %u\n", __func__, layers.c_str(), n_embd_tgt);
 
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
