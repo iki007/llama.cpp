@@ -708,6 +708,42 @@ template <> struct dpas_tile_traits<GGML_TYPE_Q8_0> {
         }
     }
 
+    // Coded weights (block_coded): q + 128 written into the mantissa of 256.0 (spacing 0.25 there), i.e. B = 384 + q
+    // without a conversion; each block of 32 is one chunk with scale d and offset -384 * d
+    static constexpr bool coded = true;
+    template <typename FS, typename FF>
+    static ESIMD_INLINE void block_coded(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, FS && step,
+                                         FF && fold) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs = (const uint8_t *) vx;
+        const uint8_t * d  = qs + nb * QK_K;
+
+#pragma unroll
+        for (int s = 0; s < QK_K / QK8_0; ++s) {
+            simd<uint16_t, 16>    dbit = convert<uint16_t>(dpas_gather_u16(d + 2 * s, bi * (uint32_t) (QK_K / QK8_0)));
+            const simd<float, 16> drow = convert<float>(simd<sycl::half, 16>(dbit.bit_cast_view<sycl::half>().read()));
+
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                simd<uint32_t, 64>    w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) QK_K + 32 * s + 16 * h);
+                simd<sycl::half, 256> b;
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g) ^ 0x80808080u;
+                    auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                    for (int j = 0; j < 4; j += 2) {
+                        simd<uint8_t, 32>  q  = wm.select<16, 1, 2, 1>(0, j);
+                        simd<uint16_t, 32> u  = (convert<uint16_t>(q) << 2) | 0x5C00;
+                        const int          kp = (4 * g + j) / 2;
+                        b.select<32, 1>(kp * 32) = u.bit_cast_view<sycl::half>().read();
+                    }
+                }
+                step(s & 1, 32 * s + 16 * h, b);
+            }
+            fold(s & 1, drow, drow * -384.0f);
+        }
+    }
 };
 
 #endif // __INTEL_LLVM_COMPILER

@@ -2658,7 +2658,9 @@ static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, in
 // matrices (<= 31 MB) stay in L2 there; in the model, streaming from memory, it pays only from 5: the
 // 27B's 4-row batch took 32.2 ms with q5_K on DPAS vs 31.2 on ESIMD, its 8-row one 38.3 vs 39.3.
 // q8_0 replaces the chunks of 8 columns past 8 (17408x5120 / 5120x17408: 3.5x / 4.7x at 9 columns,
-// 2.4x / 3.0x at 32); below 9 it is behind ESIMD on one of those two shapes. q4_0 and iq4_nl, which have
+// 2.4x / 3.0x at 32), and with coded weights it takes 8 columns from MMVQ too (17408x5120 / 5120x17408 / 32768x6144:
+// 224 -> 196 / 242 -> 189 / 496 -> 429 us; the DFlash drafters' 8-row batches); at 5-7 the tall shapes stay faster on
+// ESIMD (17408x5120 168 vs 190 us). q4_0 and iq4_nl, which have
 // no ESIMD kernel, against MMVQ (98304x5120 / 17408x5120): q4_0 1.12x / 1.0x at 5, 1.42x / 1.16x at 8,
 // 0.96x / 0.91x at 3; iq4_nl (codebook per column on MMVQ) 1.40x / 1.14x at 3, 1.75x / 1.47x at 8.
 // q4_K and q5_K, whose weights go into the tile without a conversion (dpas_q4_k_block_coded), from 2 columns: in
@@ -2673,7 +2675,7 @@ static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64
     const bool whole_qk = ncols % QK_K == 0;
     const int  min_cols = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 2 :
                           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ? 3 :
-                          type == GGML_TYPE_Q3_K ? 5 : type == GGML_TYPE_Q8_0 && whole_qk ? 9 :
+                          type == GGML_TYPE_Q3_K ? 5 : type == GGML_TYPE_Q8_0 && whole_qk ? 8 :
                           type == GGML_TYPE_Q4_0 && whole_qk ? 5 : type == GGML_TYPE_IQ4_NL && whole_qk ? 3 : 0;
     return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= GGML_SYCL_DPAS_MAX_COLS &&
            ncols * nrows >= 8 * 1024 * 1024 &&
