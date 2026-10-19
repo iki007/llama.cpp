@@ -199,6 +199,10 @@ public:
     // TODO: extend to support multiple _full_ sequences in the ubatch
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // whole sequences as split_seq, but sequences of equal length share a ubatch while they fit (sequential: only
+    // consecutive sequence ids, as split_equal)
+    llama_ubatch split_seq_whole(uint32_t n_ubatch, bool sequential);
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);

@@ -828,6 +828,34 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     return ubatch_add(idxs, n_seqs, true);
 }
 
+// A non-causal model (a DFlash draft decodes one block per sequence) needs each sequence whole in one ubatch, not
+// each in its own: with 8 sequences, 8 passes of a few rows that each read the weights again.
+llama_ubatch llama_batch_allocr::split_seq_whole(uint32_t n_ubatch, bool sequential) {
+    if (!has_cpl) {
+        std::unordered_map<llama_seq_id, uint32_t> n_left;
+        bool single = true;
+        for (int32_t i = 0; i < batch.n_tokens && single; ++i) {
+            if (!used[i]) {
+                single = batch.n_seq_id[i] == 1;
+                n_left[batch.seq_id[i][0]]++;
+            }
+        }
+        if (single && n_left.size() > 1) {
+            const uint32_t n = n_left.begin()->second;
+            bool equal = n * n_left.size() <= n_ubatch;
+            for (const auto & [seq_id, n_seq] : n_left) {
+                equal = equal && n_seq == n;
+            }
+            // every sequence set is one sequence of n tokens and they all fit: split_equal takes them whole
+            if (equal) {
+                return split_equal(n_ubatch, sequential, 0);
+            }
+        }
+    }
+
+    return split_seq(n_ubatch);
+}
+
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     // find the first unused token
     uint32_t cur_idx = 0;
