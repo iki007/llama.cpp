@@ -66,7 +66,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         layers += std::to_string(id);
         sep = ", ";
     }
-    LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s]\n", __func__, layers.c_str());
+    LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s], n_embd_tgt = %u\n", __func__, layers.c_str(), n_embd_tgt);
 
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {

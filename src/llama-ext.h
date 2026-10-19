@@ -154,6 +154,9 @@ LLAMA_API int32_t llama_model_n_embd_layer_inp(const struct llama_model * model)
 // model/context data extraction
 //
 
+// width of the fused target features a draft encoder expects per token (EAGLE3 / DFlash)
+LLAMA_API int32_t llama_model_n_embd_inp_enc(const struct llama_model * model);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out
