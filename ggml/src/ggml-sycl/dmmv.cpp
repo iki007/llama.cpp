@@ -10,6 +10,7 @@
     #endif
     #include <sycl/ext/intel/esimd.hpp>
     #include <sycl/ext/intel/experimental/esimd/memory.hpp>
+    #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
     #include "esimd.hpp"
     #include "dpas.hpp"
 #endif
@@ -2463,7 +2464,7 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
 template <ggml_type T, int NG, int TPW>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
-                                                   const int64_t dst_stride, const bool a2d,
+                                                   const int64_t dst_stride, const bool a2d, const int ntile,
                                                    sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx    = sycl::ext::intel::esimd::xmx;
@@ -2472,10 +2473,14 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
     constexpr int NC   = 8;
 
+    // a work-group holds ntile tiles of 16 rows; the threads of a tile split its k blocks, and the threads of
+    // different tiles that take the same k blocks read the same activations at about the same time (from L1)
     const int    nb_row = ncols / QK_K;
     const size_t nb     = (size_t) nrows * nb_row;
-    const int    tid    = it.get_local_id(0);
-    const int    row0   = it.get_group(0) * ROWS;
+    const int    tile   = it.get_local_id(0) / TPW;
+    const int    tid    = it.get_local_id(0) % TPW;
+    const int    row0   = (it.get_group(0) * ntile + tile) * ROWS;
+    const int    lbase  = tile * TPW * NG * NC * ROWS;
 
     // rows past the end read the last row; their sums are not written
     simd<uint32_t, ROWS> rows(row0, 1);
@@ -2519,7 +2524,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
         for (int g = 0; g < NG; ++g) {
 #pragma unroll
             for (int c = 0; c < NC; ++c) {
-                block_store<float, ROWS>(lmem, (uint32_t) (((tid * NG + g) * NC + c) * ROWS * sizeof(float)),
+                block_store<float, ROWS>(lmem, (uint32_t) ((lbase + ((tid * NG + g) * NC + c) * ROWS) * sizeof(float)),
                                          acc[g].template select<ROWS, 1>(c * ROWS).read());
             }
         }
@@ -2533,7 +2538,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
                     acc[g].template select<ROWS, 1>(c * ROWS) +=
-                        block_load<float, ROWS>(lmem, (uint32_t) (((t * NG + g) * NC + c) * ROWS * sizeof(float)));
+                        block_load<float, ROWS>(lmem, (uint32_t) ((lbase + ((t * NG + g) * NC + c) * ROWS) * sizeof(float)));
                 }
             }
 #pragma unroll
@@ -2554,21 +2559,40 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
     }
 }
 
+// Past 4 groups the accumulators alone take 8 x NG registers: those tiles run with 256 GRF (half the threads per XVE).
+template <typename F> struct dmmv_dpas_grf256 {
+    F f;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL { f(it); }
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    }
+};
+
 template <ggml_type T, int NG, int TPW>
 static void dequantize_mul_mat_vec_dpas_wide_sycl(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                   const int nrows, const int ncols_y, const int64_t y_stride,
                                                   const int64_t dst_stride, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     constexpr int ROWS = GGML_SYCL_DPAS_ROWS;
-    const int     workgroups = (nrows + ROWS - 1) / ROWS;
+    // 4 tiles per work-group past 16 columns on grids of 512+ tiles (Arc Pro B70, us per call, 1 -> 4 tiles: q4_K /
+    // q6_K 8704 x 5120 at 32 columns 78.2 -> 64.4 / 121.3 -> 104.2; with one launch for 64 columns, 17408 x 5120
+    // q4_K / q5_K / q6_K / iq4_xs 323.4 / 372.7 / 401.6 / 332.6 -> 269.8 / 307.9 / 337.6 / 280.3). At 16 columns, or
+    // with 320 tiles (5120 x 17408, 5120 x 8704) the larger work-groups spread unevenly over the cores: up to +8%.
+    const int     ntile      = NG >= 3 && (nrows + ROWS - 1) / ROWS >= 512 ? 4 : 1;
+    const int     workgroups = (nrows + ROWS * ntile - 1) / (ROWS * ntile);
     const bool    a2d        = ggml_sycl_dpas_a2d(y, y_stride);
     stream->submit([&](sycl::handler & h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NG * 8 * ROWS), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
-                       [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                           dequantize_mul_mat_vec_dpas_wide<T, NG, TPW>(vx, y, dst, ncols, nrows, ncols_y, y_stride,
-                                                                        dst_stride, a2d, lmem, it);
-                       });
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(ntile * TPW * NG * 8 * ROWS), h);
+        const sycl::nd_range<1> range(sycl::range<1>((size_t) workgroups * ntile * TPW), sycl::range<1>(ntile * TPW));
+        auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
+            dequantize_mul_mat_vec_dpas_wide<T, NG, TPW>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, a2d,
+                                                         ntile, lmem, it);
+        };
+        if constexpr (NG > 4) {
+            h.parallel_for(range, dmmv_dpas_grf256<decltype(kern)>{ kern });
+        } else {
+            h.parallel_for(range, [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL { kern(it); });
+        }
     });
 }
 
@@ -2611,6 +2635,10 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
                 case 2: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 2>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
                 case 3: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 3>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
                 case 4: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 4>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                case 5: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 5>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                case 6: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 6>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                case 7: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 7>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
+                case 8: dequantize_mul_mat_vec_dpas_wide_tpw_sycl<T, 8>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, tpw, stream); break;
                 default: GGML_ABORT("unsupported column count %d", ncols_y);
             }
     }
@@ -2627,7 +2655,8 @@ static void dequantize_mul_mat_vec_dpas_ncols_sycl(const void * vx, const sycl::
 // taller at 16 columns lose 3-13% at 5, and the 27B's 32-row batch takes 77.9 ms on one card with 5 on its
 // one-wave grids against 74.4 with 4 (two cards 61.6 / 60.2).
 static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
-    const int64_t wave  = (int64_t) ggml_sycl_info().devices[device].nsm * 16 * 8;
+    // tiles of more than 32 columns run with 256 GRF: 4 threads per XVE instead of 8
+    const int64_t wave  = (int64_t) ggml_sycl_info().devices[device].nsm * 16 * (ncols_y > 32 ? 4 : 8);
     const int64_t tiles = (nrows + GGML_SYCL_DPAS_ROWS - 1) / GGML_SYCL_DPAS_ROWS;
     const int64_t nb    = ncols / QK_K;
     if (tiles * 4 > wave && tiles * 3 <= wave) {
@@ -2677,7 +2706,14 @@ static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64
                           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ? 3 :
                           type == GGML_TYPE_Q3_K ? 5 : type == GGML_TYPE_Q8_0 && whole_qk ? 8 :
                           type == GGML_TYPE_Q4_0 && whole_qk ? 5 : type == GGML_TYPE_IQ4_NL && whole_qk ? 3 : 0;
-    return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= GGML_SYCL_DPAS_MAX_COLS &&
+    // One launch takes up to 64 columns (the verify batch of 8 sequences) on grids of 512+ tiles, where it reads the
+    // weights once instead of twice (us per call against two launches of 32, 17408 x 5120 at 64 columns: q4_K 353.9
+    // -> 269.8, q5_K 497.9 -> 307.9, q6_K 495.1 -> 337.6, iq4_xs 372.2 -> 280.3, with 4 tiles per work-group). With 320
+    // tiles (5120 x 17408) a 256-GRF launch holds too few threads: 291.8 -> 415.3 for q4_K, so those stay at 32.
+    // GGML_SYCL_DPAS_COLS=32 turns the 64-column launch off.
+    static const int max_wide = std::min<int>(GGML_SYCL_DPAS_MAX_COLS, ggml_sycl_get_env("GGML_SYCL_DPAS_COLS", 64));
+    const int        max_cols = (nrows + GGML_SYCL_DPAS_ROWS - 1) / GGML_SYCL_DPAS_ROWS >= 512 ? max_wide : 32;
+    return g_ggml_sycl_enable_esimd && min_cols > 0 && ncols_y >= min_cols && ncols_y <= max_cols &&
            ncols * nrows >= 8 * 1024 * 1024 &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
 }
