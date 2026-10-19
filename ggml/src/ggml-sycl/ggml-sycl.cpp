@@ -9494,8 +9494,16 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     // prefill-sized payloads go through the copy engine: a kernel reading 5 MB of host memory element by element
     // is ~50x slower; decode-sized ones are written and read by the kernels directly (lowest latency)
     const bool    big      = !block && nelem >= 32768;
-    const bool    compress = big && !f16;
-    const size_t  xbytes   = compress || block ? nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
+    // Large f32 partials cross as 8-bit blocks (32 int8 + an f32 scale per 32 values, 1.125 bytes per value
+    // instead of bf16's 2), as low-bit tensor-parallel all-reduce does: the transfer over card 1's x4 link is the
+    // cost. Qwen3.8-27B on two Arc Pro B70, ms per batch of 64 / 1024 rows: 92.7 -> 81.8, 812 -> 658; 8 sessions
+    // decoding together 203.6 -> 226.4 t/s. KL divergence against bf16 1.8e-4 / 1.3e-4 (96 / 1024-row batches),
+    // the same top token at 99.9% of positions. GGML_SYCL_COMM_Q8=0: bf16
+    static const bool q8_on    = ggml_sycl_get_env("GGML_SYCL_COMM_Q8", 1) != 0;
+    const bool    q8       = big && !f16 && q8_on && nelem % 32 == 0;
+    const bool    compress = big && !f16 && !q8;
+    const size_t  xbytes   = q8 ? nelem + nelem / 32 * sizeof(float) :
+                             compress || block ? nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
 
     if (comm_ctx->hbox_bytes < xbytes) {
         q0->wait();
@@ -9535,7 +9543,23 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
             });
         } else
 #endif
-        if (compress) {
+        if (q8) {
+            // [nelem int8][nelem / 32 f32 scales], one work-item per block of 32
+            q->parallel_for(sycl::range<1>(nelem / 32), [=](sycl::id<1> b) {
+                const float * x    = (const float *) out + (size_t) b[0] * 32;
+                float         amax = 0.0f;
+                for (int j = 0; j < 32; ++j) {
+                    amax = sycl::fmax(amax, sycl::fabs(x[j]));
+                }
+                const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+                int8_t *    qs = (int8_t *) stage + (size_t) b[0] * 32;
+                for (int j = 0; j < 32; ++j) {
+                    qs[j] = (int8_t) sycl::rint(x[j] * id);
+                }
+                ((float *) (stage + nelem))[b[0]] = amax / 127.0f;
+            });
+            q->memcpy(box, stage, xbytes);
+        } else if (compress) {
             q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
                 ((uint16_t *) stage)[i] = (uint16_t) (sycl::bit_cast<uint32_t>(((const float *) out)[i]) >> 16);
             });
@@ -9583,6 +9607,12 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
             uint8_t * in = stage + xbytes;
             q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
             q->memcpy(in, box, xbytes);
+            if (q8) {
+                q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+                    ((float *) out)[i] += ((const int8_t *) in)[i] * ((const float *) (in + nelem))[i / 32];
+                });
+                return;
+            }
             q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
                 ggml_sycl_comm_add_elem(out, in, i, compress, f16);
             });
