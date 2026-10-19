@@ -1261,6 +1261,62 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // rows of every sequence share the draft ubatches: the verify batch of n sequences is one draft pass instead
+        // of n passes of a few rows that each read the draft weights again (LiliCorr keeps its per-sequence path,
+        // its projected rows are stored per sequence below)
+        if (!is_lilicorr) {
+            std::vector<const float *> layers(target_layer_ids_n);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                layers[k] = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layers[k]) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+            }
+            features_buf.resize((size_t) n_ubatch * n_embd_enc);
+            batch_inject.clear();
+            int32_t n_cur = 0;
+            auto flush = [&]() {
+                if (n_cur == 0) {
+                    return true;
+                }
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, rc, (int) n_cur);
+                    return false;
+                }
+                batch_inject.clear();
+                n_cur = 0;
+                return true;
+            };
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                const int32_t n_rows     = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                const bool    pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
+                if (has_embeddings && n_rows > 1 && pos_pinned) {
+                    continue;
+                }
+                for (int32_t offset = 0; offset < n_rows; ++offset) {
+                    const int32_t row = i_batch_beg[seq_id] + offset;
+                    const llama_pos p = batch_in.tokens[row].pos[0];
+                    if (p < pos_inject[seq_id]) {
+                        continue;
+                    }
+                    float * dst = features_buf.data() + (size_t) n_cur * n_embd_enc;
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        std::memcpy(dst + k * (size_t) n_embd_tgt, layers[k] + (size_t) row * n_embd_tgt, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                    const llama_pos pos_arr[4] = { p, p, p, 0 };
+                    batch_inject.add_embd({ dst, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    if (++n_cur == n_ubatch && !flush()) {
+                        return false;
+                    }
+                }
+            }
+            return flush();
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
