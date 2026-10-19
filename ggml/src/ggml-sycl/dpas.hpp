@@ -430,6 +430,65 @@ template <> struct dpas_tile_traits<GGML_TYPE_IQ4_XS> {
             fn(32 * s + 16, b_hi);
         }
     }
+
+    // Coded weights (block_coded): 1536 + the codebook value, without converting an integer. q enters as the f16 bit
+    // pattern of 2 + q / 8; a degree-6 polynomial in u = (q - 7.5) / 8 then lands within 0.28 of every entry in f16
+    // (fused or not) or f32, and adding 1536 rounds it to the integer, f16 having a spacing of 1 in [1024, 2048).
+    static ESIMD_INLINE sycl::ext::intel::esimd::simd<sycl::half, 32> codebook_coded(sycl::ext::intel::esimd::simd<uint8_t, 32> q) {
+        using namespace sycl::ext::intel::esimd;
+        using h = sycl::half;
+        simd<uint16_t, 32> x = (convert<uint16_t>(q) << 6) | 0x4000;
+        simd<h, 32>        u = x.bit_cast_view<h>().read() - h(2.9375f);
+        simd<h, 32>        p = u * h(14.4921875f) + h(1.3486328125f);
+        p = p * u + h(-13.515625f);
+        p = p * u + h(39.59375f);
+        p = p * u + h(-2.15625f);
+        p = p * u + h(91.875f);
+        p = p * u + h(-4.4921875f);
+        return p + h(1536.0f);
+    }
+
+    // sub-block s is one chunk of 32 k: B = 1536 + codebook, scale d * (ls - 32), offset -1536 * scale
+    static constexpr bool coded = true;
+    template <typename FS, typename FF>
+    static ESIMD_INLINE void block_coded(const void * vx, size_t nb, sycl::ext::intel::esimd::simd<uint32_t, 16> bi, FS && step,
+                                         FF && fold) {
+        using namespace sycl::ext::intel::esimd;
+        const uint8_t * qs       = (const uint8_t *) vx;
+        const uint8_t * scales_l = qs + nb * (QK_K / 2);
+        const uint8_t * scales_h = scales_l + nb * (QK_K / 64);
+        const uint8_t * d        = scales_h + nb * sizeof(uint16_t);
+
+        const simd<uint32_t, 16> sl   = gather<uint32_t, 16>((const uint32_t *) scales_l, bi * (uint32_t) (QK_K / 64));
+        const simd<uint32_t, 16> sh   = dpas_gather_u16(scales_h, bi);
+        simd<uint16_t, 16>       dbit = convert<uint16_t>(dpas_gather_u16(d, bi));
+        const simd<float, 16>    drow = convert<float>(simd<sycl::half, 16>(dbit.bit_cast_view<sycl::half>().read()));
+
+#pragma unroll
+        for (int s = 0; s < QK_K / 32; ++s) {
+            const simd<uint32_t, 16> ls = ((sl >> (4 * s)) & 0xF) | (((sh >> (2 * s)) & 3) << 4);
+            const simd<float, 16>    sc = (convert<float>(ls) - 32.0f) * drow;
+
+            simd<uint32_t, 64>    w4 = gather<uint32_t, 64, 4>((const uint32_t *) qs, bi * (uint32_t) (QK_K / 2) + 16 * s);
+            simd<sycl::half, 256> b_lo;
+            simd<sycl::half, 256> b_hi;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                simd<uint32_t, 16> w  = w4.select<16, 1>(16 * g);
+                auto               wm = w.bit_cast_view<uint8_t, 16, 4>();
+#pragma unroll
+                for (int j = 0; j < 4; j += 2) {
+                    simd<uint8_t, 32> q  = wm.select<16, 1, 2, 1>(0, j);
+                    const int         kp = (4 * g + j) / 2;
+                    b_lo.select<32, 1>(kp * 32) = codebook_coded(simd<uint8_t, 32>(q & 0x0F));
+                    b_hi.select<32, 1>(kp * 32) = codebook_coded(simd<uint8_t, 32>(q >> 4));
+                }
+            }
+            step(s & 1, 32 * s, b_lo);
+            step(s & 1, 32 * s + 16, b_hi);
+            fold(s & 1, sc, sc * -1536.0f);
+        }
+    }
 };
 
 // Q3_K, reorder layout [qs: nb*(QK_K/4)] [hmask: nb*(QK_K/8)] [scales: nb*12] [d: nb*half]. A block is two halves n
@@ -648,6 +707,7 @@ template <> struct dpas_tile_traits<GGML_TYPE_Q8_0> {
             }
         }
     }
+
 };
 
 #endif // __INTEL_LLVM_COMPILER

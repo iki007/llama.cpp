@@ -2589,6 +2589,7 @@ static void dequantize_mul_mat_vec_dpas_tpw_sycl(const void * vx, const sycl::ha
     switch (tpw) {
         case 3: dequantize_mul_mat_vec_dpas_sycl<T, NC, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
         case 5: dequantize_mul_mat_vec_dpas_sycl<T, NC, 5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 6: dequantize_mul_mat_vec_dpas_sycl<T, NC, 6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
         default: dequantize_mul_mat_vec_dpas_sycl<T, NC, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
     }
 }
@@ -2633,6 +2634,14 @@ static int ggml_sycl_dmmv_dpas_tpw(int device, ggml_type type, int64_t ncols, in
         return 3;
     }
     const bool five = type != GGML_TYPE_Q6_K && ncols_y <= 8 && (nb + 4) / 5 < (nb + 3) / 4;
+    // iq4_xs (coded weights) also 6 where that gives fewer blocks per thread than 5 in no more waves than 4: its fold
+    // per chunk lengthens each thread's work, which a one-wave grid waits out (5120 x 17408 at 8 columns: 127 -> 113 us
+    // at 6, the f32 decode 120); q4_K there 96.5 -> 97.7, q5_K 120 -> 119.3
+    const bool six = type == GGML_TYPE_IQ4_XS && five && (nb + 5) / 6 < (nb + 4) / 5 &&
+                     (tiles * 6 + wave - 1) / wave == (tiles * 4 + wave - 1) / wave;
+    if (six) {
+        return 6;
+    }
     return five && (tiles * 5 + wave - 1) / wave == (tiles * 4 + wave - 1) / wave ? 5 : 4;
 }
 
