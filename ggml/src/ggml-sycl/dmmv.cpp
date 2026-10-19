@@ -2496,24 +2496,55 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
     // rows (columns of y) past ncols_y read as zero through the 2D load; their sums are not written
     esimd_x::config_2d_mem_access<sycl::half, 16, NC, 1> a_desc(y, (unsigned) ncols * 2 - 1, (unsigned) ncols_y - 1,
                                                                  (unsigned) y_stride * 2 - 1, 0, 0);
+    // one 2D load of 32 columns (1 KB, the largest 2D block of 16 halves per row) feeds 4 groups, one of 16 / 24 the
+    // remaining 2 / 3
+    esimd_x::config_2d_mem_access<sycl::half, 16, 4 * NC, 1> a4_desc(y, (unsigned) ncols * 2 - 1, (unsigned) ncols_y - 1,
+                                                                     (unsigned) y_stride * 2 - 1, 0, 0);
+    constexpr int NQ = NG / 4;
+    constexpr int NR = NG % 4 > 1 ? NG % 4 : 4;  // groups of the remainder load (4 = none)
+    esimd_x::config_2d_mem_access<sycl::half, 16, NR * NC, 1> ar_desc(y, (unsigned) ncols * 2 - 1, (unsigned) ncols_y - 1,
+                                                                      (unsigned) y_stride * 2 - 1, 0, 0);
     for (int ib = tid; ib < nb_row; ib += TPW) {
         const sycl::half * yb = y + (size_t) ib * QK_K;
         traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
-            a_desc.set_x(ib * QK_K + koff);
+            if (a2d) {
+                a4_desc.set_x(ib * QK_K + koff);
+                a_desc.set_x(ib * QK_K + koff);
 #pragma unroll
-            for (int g = 0; g < NG; ++g) {
-                simd<sycl::half, NC * 16> a;
-                if (a2d) {
-                    a_desc.set_y(g * NC);
-                    a = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
-                } else {
+                for (int q = 0; q < NQ; ++q) {
+                    a4_desc.set_y(q * 4 * NC);
+                    simd<sycl::half, 4 * NC * 16> a4 = esimd_x::lsc_load_2d<sycl::half, 16, 4 * NC, 1, false, false>(a4_desc);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        simd<sycl::half, NC * 16> a = a4.template select<NC * 16, 1>(j * NC * 16);
+                        acc[4 * q + j] = xmx::dpas<8, NC, float, float>(acc[4 * q + j], b, a);
+                    }
+                }
+                if constexpr (NG % 4 > 1) {
+                    ar_desc.set_x(ib * QK_K + koff);
+                    ar_desc.set_y(NQ * 4 * NC);
+                    simd<sycl::half, NR * NC * 16> ar = esimd_x::lsc_load_2d<sycl::half, 16, NR * NC, 1, false, false>(ar_desc);
+#pragma unroll
+                    for (int j = 0; j < NR; ++j) {
+                        simd<sycl::half, NC * 16> a = ar.template select<NC * 16, 1>(j * NC * 16);
+                        acc[4 * NQ + j] = xmx::dpas<8, NC, float, float>(acc[4 * NQ + j], b, a);
+                    }
+                } else if constexpr (NG % 4 == 1) {
+                    a_desc.set_y((NG - 1) * NC);
+                    simd<sycl::half, NC * 16> a = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
+                    acc[NG - 1] = xmx::dpas<8, NC, float, float>(acc[NG - 1], b, a);
+                }
+            } else {
+#pragma unroll
+                for (int g = 0; g < NG; ++g) {
+                    simd<sycl::half, NC * 16> a;
 #pragma unroll
                     for (int c = 0; c < NC; ++c) {
                         const int col = g * NC + c < ncols_y ? g * NC + c : ncols_y - 1;
                         a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + col * y_stride + koff);
                     }
+                    acc[g] = xmx::dpas<8, NC, float, float>(acc[g], b, a);
                 }
-                acc[g] = xmx::dpas<8, NC, float, float>(acc[g], b, a);
             }
         });
     }
