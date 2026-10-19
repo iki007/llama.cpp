@@ -4778,6 +4778,8 @@ void llm_graph_context::build_layer_inp_dev() const {
     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
     ggml_set_input(inp->idxs);
 
+    const int64_t n_embd_li = hparams.n_embd_layer_inp();
+
     // row layout: [layer_0 | layer_1 | ...] in ascending layer id order
     int64_t col = 0;
     for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
@@ -4787,13 +4789,13 @@ void llm_graph_context::build_layer_inp_dev() const {
 
         ggml_tensor * src = res->t_layer_inp[il];
         GGML_ASSERT(src != nullptr && "layer input tensor is null");
-        GGML_ASSERT(src->ne[0] == n_embd);
+        GGML_ASSERT(ggml_nelements(src) == n_embd_li*n_tokens);
 
-        ggml_tensor * dst = ggml_view_2d(ctx0, layer_inp_dev, n_embd, layer_inp_dev->ne[1], layer_inp_dev->nb[1], col*n_embd*ggml_element_size(layer_inp_dev));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd, n_tokens), inp->idxs));
+        ggml_tensor * dst = ggml_view_2d(ctx0, layer_inp_dev, n_embd_li, layer_inp_dev->ne[1], layer_inp_dev->nb[1], col*n_embd_li*ggml_element_size(layer_inp_dev));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd_li, n_tokens), inp->idxs));
         col++;
     }
-    GGML_ASSERT(col*n_embd == layer_inp_dev->ne[0]);
+    GGML_ASSERT(col*n_embd_li == layer_inp_dev->ne[0]);
 
     res->add_input(std::move(inp));
 }
