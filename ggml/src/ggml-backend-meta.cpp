@@ -1743,7 +1743,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    // Maximum number of views per statically allocated tensor that can be created between evals. A graph pair puts the
+    // views of two graphs in one container, and a server with a draft model creates more than llama-bench: 16
+    // overflowed at the first request of the 27B service (DFlash draft, 8 slots).
+    constexpr size_t compute_headroom = 128;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
