@@ -5068,9 +5068,10 @@ private:
         std::vector<spec_verify> verify(slots.size());
         {
             static const bool par = [] { const char * e = getenv("LLAMA_SRV_PAR_SAMPLE"); return !e || atoi(e) != 0; }();
-            const bool synth = !common_speculative_get_synth_probs(spec.get()).empty();
+            // no speculative context (no draft configured): nothing to verify
+            const bool synth = spec && !common_speculative_get_synth_probs(spec.get()).empty();
             std::vector<size_t> work;
-            for (size_t k = 0; par && !synth && k < slots.size(); ++k) {
+            for (size_t k = 0; par && spec && !synth && k < slots.size(); ++k) {
                 const server_slot & slot = slots[k];
                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty() ||
                     slot.spec_i_batch.size() != slot.spec_draft.size() + 1 ||
