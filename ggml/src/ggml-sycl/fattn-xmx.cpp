@@ -40,6 +40,18 @@ template <typename F> struct fa_xmx_grf256 {
     }
 };
 
+// up to 3 row groups fit 128 registers per thread without spills: 8 threads per vector engine instead of 4 hide the
+// per-block barriers and loads better (see fa_xmx_impl)
+template <typename F> struct fa_xmx_grf128 {
+    F f;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL { f(it); }
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<128> };
+    }
+};
+
 struct fa_xmx_args {
     const char * Q;
     const char * K;
@@ -594,23 +606,30 @@ template <int RG, bool COMPACT> static void fa_xmx_list_launch(const fa_xmx_args
     stream->parallel_for(range, fa_xmx_grf256<decltype(kern)>{ kern });
 }
 
-template <int RG, bool SKIP, bool Q8> static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, dpct::queue_ptr stream) {
+template <int RG, bool SKIP, bool Q8>
+static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
     const sycl::nd_range<1> range(sycl::range<1>((size_t) a.n_str * n_kvh * a.nsplit * FA_XMX_T), sycl::range<1>(FA_XMX_T));
     auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<RG, SKIP, Q8>(a, it); };
+    if constexpr (RG <= 3) {
+        if (grf128) {
+            stream->parallel_for(range, fa_xmx_grf128<decltype(kern)>{ kern });
+            return;
+        }
+    }
     stream->parallel_for(range, fa_xmx_grf256<decltype(kern)>{ kern });
 }
 
 template <bool SKIP, bool Q8 = false>
-static void fa_xmx_launch_rg(int RG, const fa_xmx_args & a, int n_kvh, dpct::queue_ptr stream) {
+static void fa_xmx_launch_rg(int RG, const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
     switch (RG) {
-        case 1: fa_xmx_launch<1, SKIP, Q8>(a, n_kvh, stream); break;
-        case 2: fa_xmx_launch<2, SKIP, Q8>(a, n_kvh, stream); break;
-        case 3: fa_xmx_launch<3, SKIP, Q8>(a, n_kvh, stream); break;
-        case 4: fa_xmx_launch<4, SKIP, Q8>(a, n_kvh, stream); break;
-        case 5: fa_xmx_launch<5, SKIP, Q8>(a, n_kvh, stream); break;
-        case 6: fa_xmx_launch<6, SKIP, Q8>(a, n_kvh, stream); break;
-        case 7: fa_xmx_launch<7, SKIP, Q8>(a, n_kvh, stream); break;
-        case 8: fa_xmx_launch<8, SKIP, Q8>(a, n_kvh, stream); break;
+        case 1: fa_xmx_launch<1, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 2: fa_xmx_launch<2, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 3: fa_xmx_launch<3, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 4: fa_xmx_launch<4, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 5: fa_xmx_launch<5, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 6: fa_xmx_launch<6, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 7: fa_xmx_launch<7, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 8: fa_xmx_launch<8, SKIP, Q8>(a, n_kvh, grf128, stream); break;
         default: GGML_ABORT("XMX flash attention: %d row groups", RG);
     }
 }
@@ -1043,9 +1062,18 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
         return;
     }
 
+    // a q8_0 cache read in place with up to 2 row groups, or 3 when several streams share the launch, runs with 128
+    // registers per thread and twice the work-groups (one card, 8 streams x 4 rows: 28k 604 -> 568 us, 128k 2702 ->
+    // 2450 us; one stream x 2 rows: 28k 81 -> 74 us); 4 row groups and more spill, and an f16 cache loses (8 streams x 4
+    // rows at 28k: 796 -> 855 us). GGML_SYCL_FA_XMX_GRF128=0: always 256
+    static const int grf128_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_GRF128", 1);
+    const int        RG_max     = R8_max / 8;
+    const bool       grf128     = grf128_env && direct && (RG_max <= 2 || (RG_max == 3 && n_str > 1));
+
     // split the cache so that about GGML_SYCL_FA_XMX_WGS work-groups run (over all streams)
     const int n_hs   = n_str * n_kvh;
-    int       nsplit = std::max(1, std::min(nblk, (target_wgs + n_hs - 1) / n_hs));
+    const int n_wgs  = grf128 ? 2 * target_wgs : target_wgs;
+    int       nsplit = std::max(1, std::min(nblk, (n_wgs + n_hs - 1) / n_hs));
     const int bps    = (nblk + nsplit - 1) / nsplit;
     nsplit           = (nblk + bps - 1) / bps;
 
@@ -1093,11 +1121,11 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
         a.mask = (const char *) mask->data + j0 * mask->nb[1];
         a.nq   = nqc;
         if (direct) {
-            fa_xmx_launch_rg<true, true>(RG, a, n_kvh, stream);
+            fa_xmx_launch_rg<true, true>(RG, a, n_kvh, grf128, stream);
         } else if (q8) {
-            fa_xmx_launch_rg<true>(RG, a, n_kvh, stream);
+            fa_xmx_launch_rg<true>(RG, a, n_kvh, grf128, stream);
         } else {
-            fa_xmx_launch_rg<false>(RG, a, n_kvh, stream);
+            fa_xmx_launch_rg<false>(RG, a, n_kvh, grf128, stream);
         }
 
         // merge the slices: dst[j][kvh g + c][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp2(m_s - max_s m_s)
