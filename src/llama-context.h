@@ -139,11 +139,13 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // compute == false: build, allocate and set the inputs only (a new graph every time), for graph_compute_pair
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   compute = true);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -255,6 +257,9 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+
+    // two prefill ubatches allocated in sched and sched_pair, computed together (ggml_backend_sched_graph_compute_pair_async)
+    ggml_status graph_compute_pair(ggml_cgraph * gf_a, ggml_cgraph * gf_b);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -368,6 +373,13 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // LLAMA_PREFILL_PAIRS=1 with a tensor split: a second scheduler with its own compute buffers, so that two
+    // consecutive ubatches of a batch are computed together and one ubatch's exchange between the devices runs while
+    // the other computes; the graphs of the second ubatch go to gf_res_pair
+    bool                                prefill_pairs = false;
+    ggml_backend_sched_ptr              sched_pair;
+    std::array<llm_graph_result_ptr, 2> gf_res_pair;
 
     bool sched_need_reserve = true;
 
