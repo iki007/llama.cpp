@@ -1901,6 +1901,43 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// before computing split_id: wait for the previous backend where the split takes no inputs, copy the inputs
+static void ggml_backend_sched_split_prepare(ggml_backend_sched_t sched, int split_id, int prev_backend_id) {
+    struct ggml_backend_sched_split * split = &sched->splits[split_id];
+    int split_backend_id = split->backend_id;
+
+    // ensure the previous split's async work has completed before we start
+    // this split, the allocator may have reused buffer regions across splits
+    if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(sched->backends[prev_backend_id]);
+        }
+    }
+
+    // copy the input tensors to the split backend
+    // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+    for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+            ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+        }
+    }
+    for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+            ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+        }
+    }
+}
+
+// record the event of split_id
+static void ggml_backend_sched_split_record(ggml_backend_sched_t sched, int split_id) {
+    int split_backend_id = sched->splits[split_id].backend_id;
+    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], sched->backends[split_backend_id]);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1912,29 +1949,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
-            }
-        }
-
-        // copy the input tensors to the split backend
-        // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
-            }
-        }
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
-            }
-        }
-
+        ggml_backend_sched_split_prepare(sched, split_id, prev_backend_id);
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1974,10 +1989,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this split
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
-        }
+        ggml_backend_sched_split_record(sched, split_id);
 
         prev_backend_id = split_backend_id;
     }
@@ -2169,6 +2181,61 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
+}
+
+// Two allocated schedulers whose graphs split the same way (two consecutive ubatches of one model): their splits
+// run in lockstep, and where split k of both runs on a meta backend its two graphs are computed with their
+// sub-graphs interleaved (ggml_backend_meta_graph_compute_pair). Anything else runs A, then B.
+enum ggml_status ggml_backend_sched_graph_compute_pair_async(ggml_backend_sched_t sched_a, struct ggml_cgraph * graph_a,
+                                                             ggml_backend_sched_t sched_b, struct ggml_cgraph * graph_b) {
+    GGML_ASSERT(sched_a && sched_b && sched_a != sched_b);
+    ggml_backend_sched_t  scheds[2] = { sched_a, sched_b };
+    struct ggml_cgraph *  graphs[2] = { graph_a, graph_b };
+    for (int s = 0; s < 2; s++) {
+        if (!scheds[s]->is_reset && !scheds[s]->is_alloc) {
+            ggml_backend_sched_reset(scheds[s]);
+        }
+        if (!scheds[s]->is_alloc && !ggml_backend_sched_alloc_graph(scheds[s], graphs[s])) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+    }
+
+    bool pairable = !sched_a->callback_eval && !sched_b->callback_eval && sched_a->n_splits == sched_b->n_splits;
+    for (int k = 0; pairable && k < sched_a->n_splits; k++) {
+        pairable = sched_a->backends[sched_a->splits[k].backend_id] == sched_b->backends[sched_b->splits[k].backend_id];
+    }
+    if (!pairable) {
+        enum ggml_status status = ggml_backend_sched_compute_splits(sched_a);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        return ggml_backend_sched_compute_splits(sched_b);
+    }
+
+    int prev_a = -1;
+    int prev_b = -1;
+    for (int k = 0; k < sched_a->n_splits; k++) {
+        ggml_backend_t backend = sched_a->backends[sched_a->splits[k].backend_id];
+        ggml_backend_sched_split_prepare(sched_a, k, prev_a);
+        ggml_backend_sched_split_prepare(sched_b, k, prev_b);
+        enum ggml_status status;
+        if (ggml_backend_is_meta(backend)) {
+            status = ggml_backend_meta_graph_compute_pair(backend, &sched_a->splits[k].graph, &sched_b->splits[k].graph);
+        } else {
+            status = ggml_backend_graph_compute_async(backend, &sched_a->splits[k].graph);
+            if (status == GGML_STATUS_SUCCESS) {
+                status = ggml_backend_graph_compute_async(backend, &sched_b->splits[k].graph);
+            }
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        ggml_backend_sched_split_record(sched_a, k);
+        ggml_backend_sched_split_record(sched_b, k);
+        prev_a = sched_a->splits[k].backend_id;
+        prev_b = sched_b->splits[k].backend_id;
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

@@ -362,6 +362,10 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // two allocated schedulers with graphs of the same split structure, computed in lockstep (a meta backend
+    // interleaves their sub-graphs)
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_pair_async(ggml_backend_sched_t sched_a, struct ggml_cgraph * graph_a,
+                                                                              ggml_backend_sched_t sched_b, struct ggml_cgraph * graph_b);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

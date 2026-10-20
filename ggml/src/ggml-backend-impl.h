@@ -100,6 +100,9 @@ extern "C" {
 
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
+    // two graphs of the meta backend computed with their sub-graphs interleaved (see ggml-backend-meta.cpp)
+    GGML_API enum ggml_status ggml_backend_meta_graph_compute_pair(ggml_backend_t backend, struct ggml_cgraph * cgraph_a, struct ggml_cgraph * cgraph_b);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
