@@ -34,6 +34,8 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(
 GGML_BACKEND_API void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends);
 GGML_BACKEND_API void   ggml_backend_sycl_comm_free(void * comm_ctx);
 GGML_BACKEND_API bool   ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors);
+GGML_BACKEND_API bool   ggml_backend_sycl_comm_allreduce_tensor_start(void * comm_ctx, struct ggml_tensor ** tensors);
+GGML_BACKEND_API bool   ggml_backend_sycl_comm_allreduce_tensor_finish(void * comm_ctx, struct ggml_tensor ** tensors);
 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 // pins on device 0 - a copy between another device and this memory can fail,
