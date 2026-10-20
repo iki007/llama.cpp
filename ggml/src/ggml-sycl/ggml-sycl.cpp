@@ -31,9 +31,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <thread>
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <dlfcn.h>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
 #include <level_zero/zes_api.h>
@@ -9139,6 +9142,74 @@ static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t re
 // ggml_sycl_comm_allreduce_host.
 // ==========================================================================
 
+// The few Level Zero definitions the copy-engine exchange needs (this build has no Level Zero header), and the
+// functions from the loader the SYCL runtime has already loaded. Layouts as in ze_api.h 1.x.
+namespace ggml_sycl_ze {
+typedef int32_t result_t;
+typedef struct _ze_event_pool_handle_t * event_pool_handle_t;
+struct command_queue_desc_t             { uint32_t stype; const void * pNext; uint32_t ordinal, index, flags, mode, priority; };
+struct command_queue_group_properties_t { uint32_t stype; void * pNext; uint32_t flags; size_t maxMemoryFillPatternSize; uint32_t numQueues; };
+struct event_pool_desc_t                { uint32_t stype; const void * pNext; uint32_t flags; uint32_t count; };
+struct event_desc_t                     { uint32_t stype; const void * pNext; uint32_t index; uint32_t signal; uint32_t wait; };
+struct wait_mem_desc_t                  { uint32_t actionFlag; uint32_t waitScope; };
+struct write_mem_desc_t                 { uint32_t writeScope; };
+constexpr uint32_t STYPE_COMMAND_QUEUE_DESC             = 0xe;
+constexpr uint32_t STYPE_COMMAND_QUEUE_GROUP_PROPERTIES = 0x6;
+constexpr uint32_t STYPE_EVENT_POOL_DESC                = 0x10;
+constexpr uint32_t STYPE_EVENT_DESC                     = 0x11;
+constexpr uint32_t GROUP_COMPUTE = 1u << 0, GROUP_COPY = 1u << 1;
+constexpr uint32_t QUEUE_IN_ORDER = 1u << 1, MODE_ASYNC = 2;
+constexpr uint32_t POOL_HOST_VISIBLE = 1u << 0, SCOPE_DEVICE = 1u << 1, SCOPE_HOST = 1u << 2;
+constexpr uint32_t WAIT_GREATER_EQUAL = 1u << 3, MEM_SCOPE_HOST = 1u << 2;
+
+struct api {
+    result_t (*DeviceGetCommandQueueGroupProperties)(ze_device_handle_t, uint32_t *, command_queue_group_properties_t *) = nullptr;
+    result_t (*CommandListCreateImmediate)(ze_context_handle_t, ze_device_handle_t, const command_queue_desc_t *, ze_command_list_handle_t *) = nullptr;
+    result_t (*CommandListDestroy)(ze_command_list_handle_t) = nullptr;
+    result_t (*CommandListHostSynchronize)(ze_command_list_handle_t, uint64_t) = nullptr;
+    result_t (*EventPoolCreate)(ze_context_handle_t, const event_pool_desc_t *, uint32_t, ze_device_handle_t *, event_pool_handle_t *) = nullptr;
+    result_t (*EventPoolDestroy)(event_pool_handle_t) = nullptr;
+    result_t (*EventCreate)(event_pool_handle_t, const event_desc_t *, ze_event_handle_t *) = nullptr;
+    result_t (*EventDestroy)(ze_event_handle_t) = nullptr;
+    result_t (*CommandListAppendMemoryCopy)(ze_command_list_handle_t, void *, const void *, size_t, ze_event_handle_t, uint32_t, ze_event_handle_t *) = nullptr;
+    result_t (*CommandListAppendWaitOnEvents)(ze_command_list_handle_t, uint32_t, ze_event_handle_t *) = nullptr;
+    result_t (*CommandListAppendEventReset)(ze_command_list_handle_t, ze_event_handle_t) = nullptr;
+    result_t (*DriverGetExtensionFunctionAddress)(ze_driver_handle_t, const char *, void **) = nullptr;
+    result_t (*WaitOnMemory)(ze_command_list_handle_t, wait_mem_desc_t *, void *, uint32_t, ze_event_handle_t) = nullptr;
+    result_t (*WriteToMemory)(ze_command_list_handle_t, write_mem_desc_t *, void *, uint64_t) = nullptr;
+
+    bool load(ze_driver_handle_t drv) {
+        void * lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (lib == nullptr) {
+            return false;
+        }
+        bool ok = true;
+        auto sym = [&](auto & fn, const char * name) {
+            fn = (std::remove_reference_t<decltype(fn)>) dlsym(lib, name);
+            ok = ok && fn != nullptr;
+        };
+        sym(DeviceGetCommandQueueGroupProperties, "zeDeviceGetCommandQueueGroupProperties");
+        sym(CommandListCreateImmediate,           "zeCommandListCreateImmediate");
+        sym(CommandListDestroy,                   "zeCommandListDestroy");
+        sym(CommandListHostSynchronize,           "zeCommandListHostSynchronize");
+        sym(EventPoolCreate,                      "zeEventPoolCreate");
+        sym(EventPoolDestroy,                     "zeEventPoolDestroy");
+        sym(EventCreate,                          "zeEventCreate");
+        sym(EventDestroy,                         "zeEventDestroy");
+        sym(CommandListAppendMemoryCopy,          "zeCommandListAppendMemoryCopy");
+        sym(CommandListAppendWaitOnEvents,        "zeCommandListAppendWaitOnEvents");
+        sym(CommandListAppendEventReset,          "zeCommandListAppendEventReset");
+        sym(DriverGetExtensionFunctionAddress,    "zeDriverGetExtensionFunctionAddress");
+        if (!ok) {
+            return false;
+        }
+        return DriverGetExtensionFunctionAddress(drv, "zexCommandListAppendWaitOnMemory", (void **) &WaitOnMemory) == 0 &&
+               DriverGetExtensionFunctionAddress(drv, "zexCommandListAppendWriteToMemory", (void **) &WriteToMemory) == 0 &&
+               WaitOnMemory != nullptr && WriteToMemory != nullptr;
+    }
+};
+} // namespace ggml_sycl_ze
+
 struct ggml_backend_sycl_comm_context {
     std::vector<ggml_backend_t> backends;
     // ONE persistent per-device byte buffer, 4*nelem bytes.  Both the
@@ -9153,24 +9224,64 @@ struct ggml_backend_sycl_comm_context {
     uint8_t * host_in[2]  = { nullptr, nullptr };
     size_t    host_bytes  = 0;
 
-    // exchange through pinned host memory: per device two mailbox slots used alternately, and a sequence flag on
-    // its own 64-byte line (hflag[16 * device])
+    // exchange through pinned host memory: per device four mailbox slots used in turn, and a sequence flag on its
+    // own 64-byte line (hflag[16 * device])
+    static constexpr int n_slots = 4;
     bool       host_exchange = false;
-    uint8_t *  hbox[2][2]    = {};
+    uint8_t *  hbox[2][n_slots] = {};
     size_t     hbox_bytes    = 0;
     int        hslot         = 0;
     uint32_t * hflag         = nullptr;
     uint32_t   hseq          = 0;
 
-    // per device a second in-order queue whose copies run on the copy engine next to the main queue's kernels
+    // per device a second in-order queue whose copies run on the copy engine next to the main queue's kernels;
+    // per device stage the last copy out of it
     std::unique_ptr<sycl::queue> xq[2];
-    sycl::event                  xev[2];
-    bool                         xev_set[2] = { false, false };
+    sycl::event                  xev[2][2];
+    bool                         xev_set[2][2] = {};
+    int                          xstage        = 0;
+
+    // one exchange: what publish decided, so that its accumulation can be enqueued later
+    struct xfer {
+        int64_t   nelem;
+        bool      f16, block, big, q8, compress, q8b, duplex, ce;
+        size_t    xbytes, seq_off;
+        int       slot;
+        uint32_t  seq;
+        void *    out[2];
+        uint8_t * stage[2];
+        uint8_t * in[2];
+        int       stage_k;
+    };
+
+    // GGML_SYCL_COMM_CE: the started exchanges (graph pairs) run on an own Level Zero immediate list on each
+    // device's copy engine: upload, flag, wait for the peer's flag, download, event; the compute queue only adds
+    static constexpr int n_ce_ring = 1024;
+    bool                             ce = false;
+    ggml_sycl_ze::api                ze;
+    ze_command_list_handle_t         cl[2]        = {};
+    ggml_sycl_ze::event_pool_handle_t ce_pool[2]  = {};
+    ze_event_handle_t                ev_dl[2][2]  = {};
+    sycl::event                      ce_ec[2][n_ce_ring]; // the compress events the lists wait on, kept alive
+    size_t                           buf_bytes    = 0;
+    // guard: a copy engine waiting on a flag that never comes would reach the
+    // driver's 5 s job timeout and an engine reset; a flag behind the last sequence for 2 s gets both flags
+    // raised (the lists run on, the results are wrong) and the next exchange aborts the process
+    std::thread                      ce_dog;
+    std::atomic<bool>                ce_dog_stop{false};
+    std::atomic<bool>                ce_broken{false};
+    // exchanges started and not yet finished, oldest first
+    std::deque<xfer> pending;
 
     void wait_xq() {
         for (auto & q : xq) {
             if (q) {
                 q->wait();
+            }
+        }
+        for (auto & l : cl) {
+            if (l) {
+                ze.CommandListHostSynchronize(l, UINT64_MAX);
             }
         }
     }
@@ -9214,9 +9325,16 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
 // A poll of host memory takes ~1 us, so the wait gives up after roughly 15-30 s: a peer whose process died
 // mid-exchange must not leave this kernel spinning until the driver resets the engine (legitimate waits are
 // at most a few hundred ms, e.g. the peer finishing a draft model's prefill first).
-static inline void ggml_sycl_comm_wait_flag(const uint32_t * flag, uint32_t seq) {
+// GGML_SYCL_COMM_WAIT_MAX_LOG2 (default 25) caps the polls; ~21 ends a lost flag in ~2 s, before the driver's 5 s
+// job timeout resets the engine (for testing new exchange code)
+static uint32_t ggml_sycl_comm_wait_max() {
+    static const uint32_t max = 1u << std::min<int>(31, ggml_sycl_get_env("GGML_SYCL_COMM_WAIT_MAX_LOG2", 25));
+    return max;
+}
+
+static inline void ggml_sycl_comm_wait_flag(const uint32_t * flag, uint32_t seq, uint32_t max = 1u << 25) {
     const volatile uint32_t * f = flag;
-    for (uint32_t n = 0; *f < seq && n < (1u << 25); n++) {
+    for (uint32_t n = 0; *f < seq && n < max; n++) {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
     }
     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -9242,104 +9360,46 @@ static inline void ggml_sycl_comm_add_elem(void * out, const void * in, int64_t 
 // that slot, so two slots suffice. The flags are volatile accesses with system-scope fences: atomic_ref acquire
 // loads of host memory never observed the peer's store on these cards, and cross-device event dependencies abort
 // the default Level Zero adapter.
-static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_ctx, ggml_tensor ** tensors,
-                                          queue_ptr q0, queue_ptr q1, uint8_t * buf0, uint8_t * buf1) {
-    const int64_t nelem    = ggml_nelements(tensors[0]);
-    const bool    f16      = tensors[0]->type == GGML_TYPE_F16;
-    // Decode-sized f32 payloads cross as bf16, rounded to nearest, which the kernels write to and read from the
-    // mailbox in 64-byte blocks, two values per 32-bit word: 16-bit accesses to host memory cost ~15 ns per value on
-    // these cards, 32-bit ones ~1 ns. Qwen3.8-27B on two Arc Pro B70, ms per batch of 1 / 4 / 8 / 16 rows: 21.51 ->
-    // 21.24, 28.95 -> 27.39, 33.26 -> 32.61, 42.80 -> 42.87 (before: f32 by element up to 6 rows, the copy engine
-    // with truncated bf16 above); past ~20 rows of 5120 the copy engine wins (24 rows: +1.5% with blocks). Against
-    // the exact f32 exchange the KL divergence is 0.8e-5 at 4-row batches and 1.1e-5 at 1 row (truncated: 2.6e-5 /
-    // 2.9e-5). GGML_SYCL_COMM_BLOCK=0: off
-#ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    static const bool block_on = ggml_sycl_get_env("GGML_SYCL_COMM_BLOCK", 1) != 0;
-    const bool        block    = block_on && !f16 && nelem % 32 == 0 && nelem < 106496;
-#else
-    const bool        block    = false;
-#endif
-    // prefill-sized payloads go through the copy engine: a kernel reading 5 MB of host memory element by element
-    // is ~50x slower; decode-sized ones are written and read by the kernels directly (lowest latency)
-    const bool    big      = !block && nelem >= 32768;
-    // Large f32 partials cross as 8-bit blocks (32 int8 + an f32 scale per 32 values, 1.125 bytes per value
-    // instead of bf16's 2), as low-bit tensor-parallel all-reduce does: the transfer over card 1's x4 link is the
-    // cost. Qwen3.8-27B on two Arc Pro B70, ms per batch of 64 / 1024 rows: 92.7 -> 81.8, 812 -> 658; 8 sessions
-    // decoding together 203.6 -> 226.4 t/s. KL divergence against bf16 1.8e-4 / 1.3e-4 (96 / 1024-row batches),
-    // the same top token at 99.9% of positions. GGML_SYCL_COMM_Q8=0: bf16
-    static const bool q8_on    = ggml_sycl_get_env("GGML_SYCL_COMM_Q8", 1) != 0;
-    const bool    q8       = big && !f16 && q8_on && nelem % 32 == 0;
-    const bool    compress = big && !f16 && !q8;
-    // From 13 rows of 5120 the kernels' block exchange writes 8-bit blocks too: per 64 values one 64-byte line of
-    // int8 and two f32 scales (1.125 instead of 2 bytes per value). Qwen3.8-27B on two Arc Pro B70, ms per batch of
-    // 16 / 8 rows: 37.9 -> 36.0 (-5%), 28.3 -> 27.7 (-2.4%); KL divergence against bf16 blocks 1.2e-4 / 2.0e-4, the
-    // same top token at 99.9% / 99.6% of positions, so one sequence decoding alone (up to 8 rows) keeps bf16.
-    // GGML_SYCL_COMM_Q8_BLOCK=0: bf16 at every size
-    static const bool q8b_on   = ggml_sycl_get_env("GGML_SYCL_COMM_Q8_BLOCK", 1) != 0;
-    const bool    q8b      = block && q8b_on && nelem % 64 == 0 && nelem >= 65536;
-    // Card 1's x4 link moves data both ways at once only through two engines: its own 8-bit partial goes up on the
-    // copy engine (a second queue) while the add kernel reads the peer's partial straight from host memory on the
-    // compute engine, where before the upload, the download and the add ran one after the other. The copy engine
-    // raises the flag too, from a sequence word the compress kernel leaves in the stage, so the second queue holds
-    // no kernel (a kernel there would share the compute engine with the main queue's wait). Card 1's link then
-    // carries ~10 instead of ~7 GB/s. Qwen3.8-27B on two Arc Pro B70, ms per batch of 32 / 64 / 2048 rows: 50.6 ->
-    // 50.0, 80.3 -> 77.7, 1163 -> 1086. Same values as the copy path, the adds not contracted to fma: KL divergence
-    // 0 (max 5e-5), the same top token everywhere. Uploading on the main queue of the card with the fast link
-    // (the copy engine starts ~17 us after the kernel across queues, ~1.5 us inside one) gained nothing: card 1's
-    // link sets the time. GGML_SYCL_COMM_DUPLEX=0: off
-    static const bool duplex_on = ggml_sycl_get_env("GGML_SYCL_COMM_DUPLEX", 1) != 0;
-#ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    const bool    duplex   = q8 && duplex_on && nelem % 64 == 0 && comm_ctx->xq[0] && comm_ctx->xq[1];
-#else
-    const bool    duplex   = false;
-#endif
-    const size_t  xbytes   = q8 || q8b ? nelem + nelem / 32 * sizeof(float) :
-                             compress || block ? nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
-    const size_t  seq_off  = (xbytes + 63) / 64 * 64;
+enum ggml_sycl_comm_phase {
+    GGML_SYCL_COMM_FULL,   // publish and accumulate
+    GGML_SYCL_COMM_START,  // publish only; the accumulation waits in comm_ctx->pending
+    GGML_SYCL_COMM_FINISH, // accumulate the oldest started exchange
+};
 
-    if (comm_ctx->hbox_bytes < xbytes) {
-        q0->wait();
-        q1->wait();
-        comm_ctx->wait_xq();
-        for (auto & dev : comm_ctx->hbox) {
-            for (auto & box : dev) {
-                if (box != nullptr) {
-                    sycl::free(box, q0->get_context());
-                }
-                box = sycl::aligned_alloc_host<uint8_t>(64, xbytes, q0->get_context()); // the block exchange stores whole 64-byte lines
-            }
-        }
-        comm_ctx->hbox_bytes = xbytes;
-    }
-    const int      slot  = comm_ctx->hslot;
-    const uint32_t seq   = ++comm_ctx->hseq;
-    uint32_t *     flags = comm_ctx->hflag;
-    comm_ctx->hslot ^= 1;
-
-    // leaving the second queue: the main queue waits for the copy engine's last payload and flag, or its flag below
-    // could land before that older flag (and the stage be rewritten while still being copied)
-    if (!duplex) {
-        const queue_ptr qs[2] = { q0, q1 };
-        for (int dev = 0; dev < 2; ++dev) {
-            if (comm_ctx->xev_set[dev]) {
-                qs[dev]->ext_oneapi_submit_barrier({ comm_ctx->xev[dev] });
-                comm_ctx->xev_set[dev] = false;
-            }
-        }
-    }
+// START returns false where it cannot run now (a path that downloads through the device stage, or buffers that
+// would have to grow while exchanges are pending); the caller then runs a FULL exchange, which finishes the pending
+// ones first.
+static bool ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_ctx, ggml_tensor ** tensors,
+                                          queue_ptr q0, queue_ptr q1, uint8_t * buf0, uint8_t * buf1,
+                                          ggml_sycl_comm_phase phase) {
+    using xfer = ggml_backend_sycl_comm_context::xfer;
+    uint32_t * flags = comm_ctx->hflag;
 
     // big path device staging: [0, xbytes) the compressed own partial, [xbytes, 2 xbytes) the peer's partial
-    auto publish = [&](queue_ptr q, int dev, const void * out, uint8_t * stage) {
-        uint8_t * box = comm_ctx->hbox[dev][slot];
+    auto publish = [&](const xfer & x, queue_ptr q, int dev) {
+        const int64_t  nelem    = x.nelem;
+        const size_t   xbytes   = x.xbytes;
+        const size_t   seq_off  = x.seq_off;
+        const uint32_t seq      = x.seq;
+        const bool     f16      = x.f16;
+        const bool     block    = x.block;
+        const bool     big      = x.big;
+        const bool     q8       = x.q8;
+        const bool     compress = x.compress;
+        const bool     q8b      = x.q8b;
+        const bool     duplex   = x.duplex;
+        const void *   out      = x.out[dev];
+        uint8_t *      stage    = x.stage[dev];
+        uint8_t *      box      = comm_ctx->hbox[dev][x.slot];
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-        if (q8b || duplex) {
+        if (q8b || duplex || x.ce) {
             // per 64 values: one 64-byte line of int8 at qs + 64 w, two f32 scales at ds + 2 w; duplex: into the
             // stage, which the copy engine then moves (the stage is free again once its previous copy is done)
-            uint8_t *  dst  = duplex ? stage : box;
+            uint8_t *  dst  = duplex || x.ce ? stage : box;
             uint32_t * sseq = (uint32_t *) (stage + seq_off);
             sycl::event ec = q->submit([&](sycl::handler & h) {
-                if (duplex && comm_ctx->xev_set[dev]) {
-                    h.depends_on(comm_ctx->xev[dev]);
+                if (duplex && comm_ctx->xev_set[dev][x.stage_k]) {
+                    h.depends_on(comm_ctx->xev[dev][x.stage_k]);
                 }
                 h.parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
                     using namespace sycl::ext::intel::esimd;
@@ -9361,6 +9421,26 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
                     }
                 });
             });
+            if (x.ce) {
+                // on this device's copy-engine list, in order: wait for the compress, reset the stage's event (only
+                // now: the add of the exchange that used it last is behind the compress on the main queue), upload,
+                // raise the flag, wait for the peer's flag, download its partial, signal the event
+                auto &            ze  = comm_ctx->ze;
+                ze_command_list_handle_t l = comm_ctx->cl[dev];
+                sycl::event &     ecr = comm_ctx->ce_ec[dev][seq % ggml_backend_sycl_comm_context::n_ce_ring];
+                ecr = ec;
+                ze_event_handle_t hec = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ecr);
+                ze_event_handle_t edl = comm_ctx->ev_dl[dev][x.stage_k];
+                ggml_sycl_ze::write_mem_desc_t wd = { ggml_sycl_ze::MEM_SCOPE_HOST };
+                ggml_sycl_ze::wait_mem_desc_t  wt = { ggml_sycl_ze::WAIT_GREATER_EQUAL, ggml_sycl_ze::MEM_SCOPE_HOST };
+                GGML_ASSERT(ze.CommandListAppendWaitOnEvents(l, 1, &hec) == 0);
+                GGML_ASSERT(ze.CommandListAppendEventReset(l, edl) == 0);
+                GGML_ASSERT(ze.CommandListAppendMemoryCopy(l, box, stage, xbytes, nullptr, 0, nullptr) == 0);
+                GGML_ASSERT(ze.WriteToMemory(l, &wd, flags + dev * 16, seq) == 0);
+                GGML_ASSERT(ze.WaitOnMemory(l, &wt, flags + (dev ^ 1) * 16, seq, nullptr) == 0);
+                GGML_ASSERT(ze.CommandListAppendMemoryCopy(l, x.in[dev], comm_ctx->hbox[dev ^ 1][x.slot], xbytes, edl, 0, nullptr) == 0);
+                return;
+            }
             if (duplex) {
                 // in order on the copy engine: the payload, then the flag (no flag kernel on the main queue)
                 sycl::queue & xq = *comm_ctx->xq[dev];
@@ -9368,8 +9448,8 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
                     h.depends_on(ec);
                     h.memcpy(box, stage, xbytes);
                 });
-                comm_ctx->xev[dev]     = xq.memcpy(flags + dev * 16, sseq, sizeof(uint32_t));
-                comm_ctx->xev_set[dev] = true;
+                comm_ctx->xev[dev][x.stage_k]     = xq.memcpy(flags + dev * 16, sseq, sizeof(uint32_t));
+                comm_ctx->xev_set[dev][x.stage_k] = true;
                 return;
             }
         } else if (block) {
@@ -9426,17 +9506,39 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         });
     };
-    auto accumulate = [&](queue_ptr q, int dev, void * out, uint8_t * stage) {
-        const uint32_t * flag = flags + (dev ^ 1) * 16;
-        const uint8_t *  box  = comm_ctx->hbox[dev ^ 1][slot];
+    auto accumulate = [&](const xfer & x, queue_ptr q, int dev) {
+        const int64_t    nelem    = x.nelem;
+        const size_t     xbytes   = x.xbytes;
+        const uint32_t   seq      = x.seq;
+        const bool       f16      = x.f16;
+        const bool       block    = x.block;
+        const bool       big      = x.big;
+        const bool       q8       = x.q8;
+        const bool       compress = x.compress;
+        const bool       q8b      = x.q8b;
+        const bool       duplex   = x.duplex;
+        void *           out      = x.out[dev];
+        uint8_t *        stage    = x.stage[dev];
+        const uint32_t * flag     = flags + (dev ^ 1) * 16;
+        const uint8_t *  box      = comm_ctx->hbox[dev ^ 1][x.slot];
+        const uint32_t   wait_max = ggml_sycl_comm_wait_max();
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-        if (q8b || duplex) {
-            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
+        if (q8b || duplex || x.ce) {
+            const uint8_t * src = box;
+            if (x.ce) {
+                // the copy-engine list downloaded the peer's partial into this device's memory
+                sycl::event edl = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+                    { comm_ctx->ev_dl[dev][x.stage_k], sycl::ext::oneapi::level_zero::ownership::keep }, q->get_context());
+                q->ext_oneapi_submit_barrier({ edl });
+                src = x.in[dev];
+            } else {
+                q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq, wait_max); });
+            }
             q->parallel_for(sycl::range<1>(nelem / 64), [=](sycl::id<1> w) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
                 float *            x  = (float *) out + (size_t) w[0] * 64;
-                simd<uint32_t, 16> qw = block_load<uint32_t, 16>((const uint32_t *) box + (size_t) w[0] * 16, overaligned_tag<64>{});
-                simd<float, 2>     d  = block_load<float, 2>((const float *) (box + nelem) + (size_t) w[0] * 2, element_aligned_tag{});
+                simd<uint32_t, 16> qw = block_load<uint32_t, 16>((const uint32_t *) src + (size_t) w[0] * 16, overaligned_tag<64>{});
+                simd<float, 2>     d  = block_load<float, 2>((const float *) (src + nelem) + (size_t) w[0] * 2, element_aligned_tag{});
                 simd<int8_t, 64>   qv = qw.template bit_cast_view<int8_t>();
                 const float        d0 = d[0];
                 const float        d1 = d[1];
@@ -9450,7 +9552,7 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
             return;
         }
         if (block) {
-            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
+            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq, wait_max); });
             q->parallel_for(sycl::range<1>(nelem / 32), [=](sycl::id<1> blk) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
                 float *            x  = (float *) out + (size_t) blk[0] * 32;
@@ -9469,7 +9571,7 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
 #endif
         if (big) {
             uint8_t * in = stage + xbytes;
-            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq); });
+            q->single_task([=]() { ggml_sycl_comm_wait_flag(flag, seq, wait_max); });
             q->memcpy(in, box, xbytes);
             if (q8) {
                 q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
@@ -9487,7 +9589,7 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
         const int64_t     ngr = std::min<int64_t>((nelem + wg - 1) / wg, 512);
         q->parallel_for(sycl::nd_range<1>(ngr * wg, wg), [=](sycl::nd_item<1> it) {
             if (it.get_local_id(0) == 0) {
-                ggml_sycl_comm_wait_flag(flag, seq);
+                ggml_sycl_comm_wait_flag(flag, seq, wait_max);
             }
             sycl::group_barrier(it.get_group());
             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -9496,10 +9598,186 @@ static void ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
             }
         });
     };
-    publish(q0, 0, tensors[0]->data, buf0);
-    publish(q1, 1, tensors[1]->data, buf1);
-    accumulate(q0, 0, tensors[0]->data, buf0);
-    accumulate(q1, 1, tensors[1]->data, buf1);
+
+    if (phase == GGML_SYCL_COMM_FINISH) {
+        GGML_ASSERT(!comm_ctx->pending.empty());
+        const xfer x = comm_ctx->pending.front();
+        GGML_ASSERT(x.out[0] == tensors[0]->data && x.out[1] == tensors[1]->data);
+        comm_ctx->pending.pop_front();
+        accumulate(x, q0, 0);
+        accumulate(x, q1, 1);
+        return true;
+    }
+
+    xfer x = {};
+    x.nelem = ggml_nelements(tensors[0]);
+    x.f16   = tensors[0]->type == GGML_TYPE_F16;
+    // Decode-sized f32 payloads cross as bf16, rounded to nearest, which the kernels write to and read from the
+    // mailbox in 64-byte blocks, two values per 32-bit word: 16-bit accesses to host memory cost ~15 ns per value on
+    // these cards, 32-bit ones ~1 ns. Qwen3.8-27B on two Arc Pro B70, ms per batch of 1 / 4 / 8 / 16 rows: 21.51 ->
+    // 21.24, 28.95 -> 27.39, 33.26 -> 32.61, 42.80 -> 42.87 (before: f32 by element up to 6 rows, the copy engine
+    // with truncated bf16 above); past ~20 rows of 5120 the copy engine wins (24 rows: +1.5% with blocks). Against
+    // the exact f32 exchange the KL divergence is 0.8e-5 at 4-row batches and 1.1e-5 at 1 row (truncated: 2.6e-5 /
+    // 2.9e-5). GGML_SYCL_COMM_BLOCK=0: off
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    static const bool block_on = ggml_sycl_get_env("GGML_SYCL_COMM_BLOCK", 1) != 0;
+    x.block = block_on && !x.f16 && x.nelem % 32 == 0 && x.nelem < 106496;
+#else
+    x.block = false;
+#endif
+    // prefill-sized payloads go through the copy engine: a kernel reading 5 MB of host memory element by element
+    // is ~50x slower; decode-sized ones are written and read by the kernels directly (lowest latency)
+    x.big = !x.block && x.nelem >= 32768;
+    // Large f32 partials cross as 8-bit blocks (32 int8 + an f32 scale per 32 values, 1.125 bytes per value
+    // instead of bf16's 2), as low-bit tensor-parallel all-reduce does: the transfer over card 1's x4 link is the
+    // cost. Qwen3.8-27B on two Arc Pro B70, ms per batch of 64 / 1024 rows: 92.7 -> 81.8, 812 -> 658; 8 sessions
+    // decoding together 203.6 -> 226.4 t/s. KL divergence against bf16 1.8e-4 / 1.3e-4 (96 / 1024-row batches),
+    // the same top token at 99.9% of positions. GGML_SYCL_COMM_Q8=0: bf16
+    static const bool q8_on    = ggml_sycl_get_env("GGML_SYCL_COMM_Q8", 1) != 0;
+    x.q8 = x.big && !x.f16 && q8_on && x.nelem % 32 == 0;
+    x.compress = x.big && !x.f16 && !x.q8;
+    // From 13 rows of 5120 the kernels' block exchange writes 8-bit blocks too: per 64 values one 64-byte line of
+    // int8 and two f32 scales (1.125 instead of 2 bytes per value). Qwen3.8-27B on two Arc Pro B70, ms per batch of
+    // 16 / 8 rows: 37.9 -> 36.0 (-5%), 28.3 -> 27.7 (-2.4%); KL divergence against bf16 blocks 1.2e-4 / 2.0e-4, the
+    // same top token at 99.9% / 99.6% of positions, so one sequence decoding alone (up to 8 rows) keeps bf16.
+    // GGML_SYCL_COMM_Q8_BLOCK=0: bf16 at every size
+    static const bool q8b_on   = ggml_sycl_get_env("GGML_SYCL_COMM_Q8_BLOCK", 1) != 0;
+    x.q8b = x.block && q8b_on && x.nelem % 64 == 0 && x.nelem >= 65536;
+    // Card 1's x4 link moves data both ways at once only through two engines: its own 8-bit partial goes up on the
+    // copy engine (a second queue) while the add kernel reads the peer's partial straight from host memory on the
+    // compute engine, where before the upload, the download and the add ran one after the other. The copy engine
+    // raises the flag too, from a sequence word the compress kernel leaves in the stage, so the second queue holds
+    // no kernel (a kernel there would share the compute engine with the main queue's wait). Card 1's link then
+    // carries ~10 instead of ~7 GB/s. Qwen3.8-27B on two Arc Pro B70, ms per batch of 32 / 64 / 2048 rows: 50.6 ->
+    // 50.0, 80.3 -> 77.7, 1163 -> 1086. Same values as the copy path, the adds not contracted to fma: KL divergence
+    // 0 (max 5e-5), the same top token everywhere. Uploading on the main queue of the card with the fast link
+    // (the copy engine starts ~17 us after the kernel across queues, ~1.5 us inside one) gained nothing: card 1's
+    // link sets the time. GGML_SYCL_COMM_DUPLEX=0: off
+    static const bool duplex_on = ggml_sycl_get_env("GGML_SYCL_COMM_DUPLEX", 1) != 0;
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    x.duplex = x.q8 && duplex_on && x.nelem % 64 == 0 && comm_ctx->xq[0] && comm_ctx->xq[1];
+#else
+    x.duplex = false;
+#endif
+    x.xbytes  = x.q8 || x.q8b ? x.nelem + x.nelem / 32 * sizeof(float) :
+                x.compress || x.block ? x.nelem * sizeof(uint16_t) : ggml_nbytes(tensors[0]);
+    x.seq_off = (x.xbytes + 63) / 64 * 64;
+
+
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    x.ce = phase == GGML_SYCL_COMM_START && comm_ctx->ce && x.q8 && x.nelem % 64 == 0;
+#endif
+    if (x.ce) {
+        x.duplex = false;
+    }
+    if (phase == GGML_SYCL_COMM_START && !(x.duplex || x.block || x.ce)) {
+        return false;
+    }
+    if (comm_ctx->hbox_bytes < x.xbytes) {
+        if (!comm_ctx->pending.empty()) {
+            return false;
+        }
+        q0->wait();
+        q1->wait();
+        comm_ctx->wait_xq();
+        for (auto & dev : comm_ctx->hbox) {
+            for (auto & box : dev) {
+                if (box != nullptr) {
+                    sycl::free(box, q0->get_context());
+                }
+                box = sycl::aligned_alloc_host<uint8_t>(64, x.xbytes, q0->get_context()); // the block exchange stores whole 64-byte lines
+            }
+        }
+        comm_ctx->hbox_bytes = x.xbytes;
+    }
+    // two duplex exchanges in flight use two parts of the stage buffer in turn (each 1.125 bytes per value plus the
+    // sequence word, inside the buffer's 4 bytes per value)
+    x.stage_k = phase == GGML_SYCL_COMM_START && (x.duplex || x.ce) ? (comm_ctx->xstage ^= 1) : 0;
+    const size_t stride = (x.seq_off + 64 + 255) / 256 * 256;
+    x.stage[0] = buf0 + x.stage_k * stride;
+    x.stage[1] = buf1 + x.stage_k * stride;
+    // the copy-engine transport downloads the peer's partial behind the two stages (5 bytes per value in all)
+    x.in[0]    = buf0 + (2 + x.stage_k) * stride;
+    x.in[1]    = buf1 + (2 + x.stage_k) * stride;
+    x.out[0]   = tensors[0]->data;
+    x.out[1]   = tensors[1]->data;
+    x.slot     = comm_ctx->hslot;
+    x.seq      = ++comm_ctx->hseq;
+    comm_ctx->hslot = (comm_ctx->hslot + 1) % ggml_backend_sycl_comm_context::n_slots;
+
+    // leaving the second queue: the main queue waits for the copy engine's last payload and flag, or its flag below
+    // could land before that older flag (and the stage be rewritten while still being copied)
+    if (!x.duplex) {
+        const queue_ptr qs[2] = { q0, q1 };
+        for (int dev = 0; dev < 2; ++dev) {
+            for (int k = 0; k < 2; ++k) {
+                if (comm_ctx->xev_set[dev][k]) {
+                    qs[dev]->ext_oneapi_submit_barrier({ comm_ctx->xev[dev][k] });
+                    comm_ctx->xev_set[dev][k] = false;
+                }
+            }
+        }
+    }
+
+    publish(x, q0, 0);
+    publish(x, q1, 1);
+    if (phase == GGML_SYCL_COMM_START) {
+        comm_ctx->pending.push_back(x);
+        return true;
+    }
+    accumulate(x, q0, 0);
+    accumulate(x, q1, 1);
+    return true;
+}
+
+// per device an immediate in-order list on the copy-engine group and two events (one per stage)
+static bool ggml_sycl_comm_ce_init(ggml_backend_sycl_comm_context * ctx, const sycl::context & sycl_ctx) {
+    auto & ze = ctx->ze;
+    ze_driver_handle_t  drv  = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(sycl_ctx.get_platform());
+    ze_context_handle_t zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(sycl_ctx);
+    if (!ze.load(drv)) {
+        return false;
+    }
+    for (int d = 0; d < 2; ++d) {
+        const queue_ptr    s    = ((ggml_backend_sycl_context *) ctx->backends[d]->context)->stream();
+        ze_device_handle_t zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(s->get_device());
+        uint32_t ng = 0;
+        if (ze.DeviceGetCommandQueueGroupProperties(zdev, &ng, nullptr) != 0 || ng == 0) {
+            return false;
+        }
+        std::vector<ggml_sycl_ze::command_queue_group_properties_t> g(ng);
+        for (auto & p : g) {
+            p = { ggml_sycl_ze::STYPE_COMMAND_QUEUE_GROUP_PROPERTIES, nullptr, 0, 0, 0 };
+        }
+        if (ze.DeviceGetCommandQueueGroupProperties(zdev, &ng, g.data()) != 0) {
+            return false;
+        }
+        uint32_t ord = UINT32_MAX;
+        for (uint32_t k = 0; k < ng; ++k) {
+            if ((g[k].flags & ggml_sycl_ze::GROUP_COPY) && !(g[k].flags & ggml_sycl_ze::GROUP_COMPUTE)) {
+                ord = k;
+            }
+        }
+        if (ord == UINT32_MAX) {
+            return false;
+        }
+        const ggml_sycl_ze::command_queue_desc_t qd = { ggml_sycl_ze::STYPE_COMMAND_QUEUE_DESC, nullptr, ord, 0,
+                                                       ggml_sycl_ze::QUEUE_IN_ORDER, ggml_sycl_ze::MODE_ASYNC, 0 };
+        if (ze.CommandListCreateImmediate(zctx, zdev, &qd, &ctx->cl[d]) != 0) {
+            return false;
+        }
+        const ggml_sycl_ze::event_pool_desc_t pd = { ggml_sycl_ze::STYPE_EVENT_POOL_DESC, nullptr, ggml_sycl_ze::POOL_HOST_VISIBLE, 2 };
+        if (ze.EventPoolCreate(zctx, &pd, 1, &zdev, &ctx->ce_pool[d]) != 0) {
+            return false;
+        }
+        for (uint32_t k = 0; k < 2; ++k) {
+            const ggml_sycl_ze::event_desc_t ed = { ggml_sycl_ze::STYPE_EVENT_DESC, nullptr, k, ggml_sycl_ze::SCOPE_DEVICE, ggml_sycl_ze::SCOPE_DEVICE };
+            if (ze.EventCreate(ctx->ce_pool[d], &ed, &ctx->ev_dl[d][k]) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends) try {
@@ -9532,6 +9810,36 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
             const queue_ptr s = ((ggml_backend_sycl_context *) backends[i]->context)->stream();
             ctx->xq[i] = std::make_unique<sycl::queue>(s->get_context(), s->get_device(), sycl::property::queue::in_order{});
         }
+        static const bool ce_on = ggml_sycl_get_env("GGML_SYCL_COMM_CE", 0) != 0;
+        if (ce_on) {
+            ctx->ce = ggml_sycl_comm_ce_init(ctx, sycl_ctx);
+            GGML_LOG_INFO("%s: exchanges of graph pairs on the copy engines: %s\n", __func__, ctx->ce ? "yes" : "no (Level Zero setup failed)");
+            if (ctx->ce) {
+                ctx->ce_dog = std::thread([ctx]() {
+                    auto stuck_since = std::chrono::steady_clock::now();
+                    bool stuck       = false;
+                    while (!ctx->ce_dog_stop) {
+                        const uint32_t seq = __atomic_load_n(&ctx->hseq, __ATOMIC_RELAXED);
+                        const bool behind  = __atomic_load_n(&ctx->hflag[0], __ATOMIC_RELAXED) < seq ||
+                                             __atomic_load_n(&ctx->hflag[16], __ATOMIC_RELAXED) < seq;
+                        if (!behind) {
+                            stuck = false;
+                        } else if (!stuck) {
+                            stuck       = true;
+                            stuck_since = std::chrono::steady_clock::now();
+                        } else if (std::chrono::steady_clock::now() - stuck_since > std::chrono::seconds(2)) {
+                            GGML_LOG_ERROR("ggml_sycl_comm: exchange flags %u / %u behind sequence %u for 2 s: released\n",
+                                           ctx->hflag[0], ctx->hflag[16], seq);
+                            __atomic_store_n(&ctx->hflag[0],  0xfffffff0u, __ATOMIC_SEQ_CST);
+                            __atomic_store_n(&ctx->hflag[16], 0xfffffff0u, __ATOMIC_SEQ_CST);
+                            ctx->ce_broken = true;
+                            stuck          = false;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                });
+            }
+        }
     }
     return ctx;
 }
@@ -9554,6 +9862,23 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
             sctx1->stream()->wait();
             comm_ctx->wait_xq();
             comm_ctx->free_host();
+            if (comm_ctx->ce_dog.joinable()) {
+                comm_ctx->ce_dog_stop = true;
+                comm_ctx->ce_dog.join();
+            }
+            for (int d = 0; d < 2; ++d) {
+                for (auto & e : comm_ctx->ev_dl[d]) {
+                    if (e) {
+                        comm_ctx->ze.EventDestroy(e);
+                    }
+                }
+                if (comm_ctx->ce_pool[d]) {
+                    comm_ctx->ze.EventPoolDestroy(comm_ctx->ce_pool[d]);
+                }
+                if (comm_ctx->cl[d]) {
+                    comm_ctx->ze.CommandListDestroy(comm_ctx->cl[d]);
+                }
+            }
             const sycl::context sycl_ctx = sctx0->stream()->get_context();
             for (auto & dev : comm_ctx->hbox) {
                 for (auto * box : dev) {
@@ -9571,13 +9896,26 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
     delete comm_ctx;
 }
 
-bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) try {
+// FULL: the whole exchange; START / FINISH: its two halves, so that other work can be queued in between (the meta
+// backend computes the other half-batch of a pair there). START returns false where it cannot split the exchange;
+// the caller then runs FULL, which first finishes the started ones in order.
+static bool ggml_sycl_comm_allreduce_phase(void * comm_ctx_v, struct ggml_tensor ** tensors, ggml_sycl_comm_phase phase) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
+    GGML_ASSERT(!static_cast<ggml_backend_sycl_comm_context *>(comm_ctx_v)->ce_broken && "exchange flags were released by the guard");
 
     auto * comm_ctx = static_cast<ggml_backend_sycl_comm_context *>(comm_ctx_v);
     const size_t n_backends = comm_ctx->backends.size();
+
+    if (phase == GGML_SYCL_COMM_FINISH) {
+        auto * ctx0 = (ggml_backend_sycl_context *) comm_ctx->backends[0]->context;
+        auto * ctx1 = (ggml_backend_sycl_context *) comm_ctx->backends[1]->context;
+        return ggml_sycl_comm_allreduce_host(comm_ctx, tensors, ctx0->stream(), ctx1->stream(), nullptr, nullptr, phase);
+    }
+    if (phase == GGML_SYCL_COMM_START && !comm_ctx->host_exchange) {
+        return false;
+    }
 
     // Fast path: N=2, F32/F16, contiguous, matching shapes.
     if (n_backends != 2) {
@@ -9602,7 +9940,7 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
     const int64_t nelem  = ggml_nelements(tensors[0]);
     const size_t  nbytes = ggml_nbytes(tensors[0]);
     if (nelem == 0) {
-        return true;
+        return phase == GGML_SYCL_COMM_FULL;
     }
 
     auto * ctx0 = (ggml_backend_sycl_context *) comm_ctx->backends[0]->context;
@@ -9610,22 +9948,38 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
     queue_ptr q0 = ctx0->stream();
     queue_ptr q1 = ctx1->stream();
 
-    // Grow per-device byte buffers if needed (4 * nelem bytes each).
-    if (comm_ctx->buf_nelem < nelem) {
+    if (phase == GGML_SYCL_COMM_FULL) {
+        while (!comm_ctx->pending.empty()) {
+            ggml_tensor * started[2] = {};
+            ggml_tensor   views[2];
+            for (int dev = 0; dev < 2; ++dev) {
+                views[dev].data = comm_ctx->pending.front().out[dev];
+                started[dev]    = &views[dev];
+            }
+            ggml_sycl_comm_allreduce_host(comm_ctx, started, q0, q1, nullptr, nullptr, GGML_SYCL_COMM_FINISH);
+        }
+    }
+
+    // Grow per-device byte buffers if needed (4 * nelem bytes each, 5 with the copy-engine transport).
+    const size_t buf_need = (size_t) nelem * (comm_ctx->ce ? 5 : 4);
+    if (comm_ctx->buf_bytes < buf_need) {
+        if (!comm_ctx->pending.empty()) {
+            return false;
+        }
         // the previous allreduce may still be using them
         q0->wait();
         q1->wait();
         comm_ctx->wait_xq();
-        comm_ctx->buf0->realloc(nelem * 4);
-        comm_ctx->buf1->realloc(nelem * 4);
+        comm_ctx->buf0->realloc(buf_need);
+        comm_ctx->buf1->realloc(buf_need);
         comm_ctx->buf_nelem = nelem;
+        comm_ctx->buf_bytes = buf_need;
     }
     uint8_t * buf0 = comm_ctx->buf0->get();
     uint8_t * buf1 = comm_ctx->buf1->get();
 
     if (comm_ctx->host_exchange) {
-        ggml_sycl_comm_allreduce_host(comm_ctx, tensors, q0, q1, buf0, buf1);
-        return true;
+        return ggml_sycl_comm_allreduce_host(comm_ctx, tensors, q0, q1, buf0, buf1, phase);
     }
 
     // F16 native path: direct 2-byte cross-device copy + add, skipping the
@@ -9718,6 +10072,22 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 
     return true;
 }
+
+bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) try {
+    return ggml_sycl_comm_allreduce_phase(comm_ctx_v, tensors, GGML_SYCL_COMM_FULL);
+}
+catch (const sycl::exception &) { return false; }
+catch (...)                     { return false; }
+
+bool ggml_backend_sycl_comm_allreduce_tensor_start(void * comm_ctx_v, struct ggml_tensor ** tensors) try {
+    return ggml_sycl_comm_allreduce_phase(comm_ctx_v, tensors, GGML_SYCL_COMM_START);
+}
+catch (const sycl::exception &) { return false; }
+catch (...)                     { return false; }
+
+bool ggml_backend_sycl_comm_allreduce_tensor_finish(void * comm_ctx_v, struct ggml_tensor ** tensors) try {
+    return ggml_sycl_comm_allreduce_phase(comm_ctx_v, tensors, GGML_SYCL_COMM_FINISH);
+}
 catch (const sycl::exception &) { return false; }
 catch (...)                     { return false; }
 
@@ -9737,6 +10107,12 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_sycl_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_start") == 0) {
+        return (void *)ggml_backend_sycl_comm_allreduce_tensor_start;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_finish") == 0) {
+        return (void *)ggml_backend_sycl_comm_allreduce_tensor_finish;
     }
 
     // SYCL doesn't support registering host memory, left here for reference
