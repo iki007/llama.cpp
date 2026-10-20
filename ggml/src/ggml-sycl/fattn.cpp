@@ -304,8 +304,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 }
 
 // Several sequences in one batch arrive as streams along ne[3], each its own attention problem. The XMX kernel
-// reads one stream, so a multi-stream batch fell to the tile kernel (Qwen3.8-27B, 4 sessions x 8 rows at 28k:
-// 1.14 ms per call against 0.15 ms for one stream). Run it once per stream when a stream qualifies.
+// takes all streams in one launch for decode rows (fa_xmx_supported); other batches (prefill rows, a q8_0 cache it
+// cannot read in place) fell to the tile kernel (Qwen3.8-27B, 4 sessions x 8 rows at 28k: 1.14 ms per call against
+// 0.15 ms for one stream). Run those once per stream when a stream qualifies.
 static bool ggml_sycl_flash_attn_ext_streams(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -313,7 +314,8 @@ static bool ggml_sycl_flash_attn_ext_streams(ggml_backend_sycl_context & ctx, gg
     const ggml_tensor * mask = dst->src[3];
     const int64_t       ns   = Q->ne[3];
     // the mask is per stream, or one mask shared by all streams
-    if (ns <= 1 || !mask || K->ne[3] != ns || V->ne[3] != ns || (mask->ne[3] != ns && mask->ne[3] != 1) || dst->ne[3] != ns) {
+    if (ns <= 1 || !mask || K->ne[3] != ns || V->ne[3] != ns || (mask->ne[3] != ns && mask->ne[3] != 1) || dst->ne[3] != ns ||
+        ggml_sycl_flash_attn_ext_xmx_supported(ctx.device, dst)) {
         return false;
     }
 
