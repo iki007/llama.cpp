@@ -601,7 +601,15 @@ struct ggml_backend_sycl_context {
     // on no decode-only one -- decode's ne1 == 1 takes mmvq, never converts src1, and so never
     // populates the cache. The results had already been printed by then, which is exactly what
     // makes it easy to miss.
-    ~ggml_backend_sycl_context() { src1_f16_reset(); }
+    ~ggml_backend_sycl_context() {
+        src1_f16_reset();
+        // the staging slots are released after this body: let every queued upload from them finish first
+        for (size_t i = 0; i < upload_submitted.size(); ++i) {
+            if (upload_submitted[i]) {
+                upload_events[i].wait();
+            }
+        }
+    }
 
     queue_ptr stream(int device, int stream) {
         if (qptrs[device][stream] == nullptr) {
@@ -671,6 +679,13 @@ struct ggml_backend_sycl_context {
     // reused only after the next ids readback has drained the queue.
     ggml_sycl_pinned_buffer mmid_ids_pinned;
     ggml_sycl_pinned_buffer mmid_row_mapping_pinned;
+
+    // set_tensor_async from pageable host memory (the mmap()ed experts of CPU layers, uploaded for each prompt
+    // batch): host threads fill pinned slots that the device pulls while the next slot fills
+    ggml_sycl_pinned_buffer  upload_staging;
+    std::vector<sycl::event> upload_events;
+    std::vector<bool>        upload_submitted;
+    int                      upload_next = 0;
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 

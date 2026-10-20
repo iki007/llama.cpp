@@ -32,6 +32,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 #include <sycl/sycl.hpp>
@@ -7673,6 +7675,109 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// a few host threads for large memcpys: one thread copies ~10 GB/s, the memory bus takes about four times that
+struct ggml_sycl_memcpy_pool {
+    const int                n;
+    std::vector<std::thread> workers;
+    std::mutex               mtx;
+    std::condition_variable  cv_job, cv_done;
+    char *                   dst     = nullptr;
+    const char *             src     = nullptr;
+    size_t                   size    = 0;
+    uint64_t                 gen     = 0;
+    int                      pending = 0;
+    bool                     stop    = false;
+
+    explicit ggml_sycl_memcpy_pool(int n_threads) : n(n_threads) {
+        for (int t = 1; t < n; ++t) {
+            workers.emplace_back([this, t] { run(t); });
+        }
+    }
+
+    ~ggml_sycl_memcpy_pool() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv_job.notify_all();
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
+    void part(int t) const {
+        const size_t per = ((size + n - 1) / n + 63) / 64 * 64;
+        const size_t b   = std::min(size, (size_t) t * per);
+        const size_t e   = std::min(size, b + per);
+        if (b < e) {
+            memcpy(dst + b, src + b, e - b);
+        }
+    }
+
+    void run(int t) {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lk(mtx);
+        for (;;) {
+            cv_job.wait(lk, [&] { return stop || gen != seen; });
+            if (stop) {
+                return;
+            }
+            seen = gen;
+            lk.unlock();
+            part(t);
+            lk.lock();
+            if (--pending == 0) {
+                cv_done.notify_one();
+            }
+        }
+    }
+
+    void copy(char * d, const char * s, size_t sz) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            dst     = d;
+            src     = s;
+            size    = sz;
+            pending = n - 1;
+            ++gen;
+        }
+        cv_job.notify_all();
+        part(0);
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_done.wait(lk, [&] { return pending == 0; });
+    }
+};
+
+// Copies pageable host memory to the device through pinned slots: host threads fill slot k + 1 while the device
+// pulls slot k. The driver's own copy from pageable memory moves ~10.7 GB/s on an Arc Pro B70 (x16), this pipeline
+// ~22 GB/s: host memory bandwidth bound, since every byte is read, written and read again by the device. The source
+// is copied before the call returns; the slots are reused only after their copy finished.
+static void ggml_sycl_upload_staged(ggml_backend_sycl_context & ctx, sycl::queue & q, char * dst, const char * src, size_t size) {
+    static const size_t slot_size = (size_t) std::max(1, ggml_sycl_get_env("GGML_SYCL_ASYNC_STAGE_SLOT_MIB", 32)) << 20;
+    static const int    n_slots   = std::max(2, ggml_sycl_get_env("GGML_SYCL_ASYNC_STAGE_SLOTS", 3));
+    static ggml_sycl_memcpy_pool pool(std::max(1, ggml_sycl_get_env("GGML_SYCL_ASYNC_STAGE_THREADS", 8)));
+    if (ctx.upload_events.empty()) {
+        ctx.upload_staging.reserve(q, n_slots * slot_size);
+        ctx.upload_events.resize(n_slots);
+        ctx.upload_submitted.assign(n_slots, false);
+    }
+    while (size > 0) {
+        const size_t chunk = std::min(size, slot_size);
+        const int    slot  = ctx.upload_next;
+        ctx.upload_next    = (slot + 1) % n_slots;
+        if (ctx.upload_submitted[slot]) {
+            ctx.upload_events[slot].wait_and_throw();
+        }
+        char * stage = (char *) ctx.upload_staging.ptr + (size_t) slot * slot_size;
+        pool.copy(stage, src, chunk);
+        ctx.upload_events[slot]    = q.memcpy(dst, stage, chunk);
+        ctx.upload_submitted[slot] = true;
+        src  += chunk;
+        dst  += chunk;
+        size -= chunk;
+    }
+}
+
 static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
                                                ggml_tensor *tensor,
                                                const void *data, size_t offset,
@@ -7685,6 +7790,14 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    // large copies from pageable host memory (the CPU layers' experts that a prompt batch uploads, e.g. 26.5 GiB per
+    // 1024-token ubatch of Ornith-1.5-122B with 21 CPU layers) are staged; GGML_SYCL_ASYNC_STAGE_MIN_MIB=0 turns it off
+    static const size_t stage_min = (size_t) ggml_sycl_get_env("GGML_SYCL_ASYNC_STAGE_MIN_MIB", 4) << 20;
+    if (stage_min > 0 && size >= stage_min &&
+        sycl::get_pointer_type(data, stream->get_context()) == sycl::usm::alloc::unknown) {
+        ggml_sycl_upload_staged(*sycl_ctx, *stream, (char *) tensor->data + offset, (const char *) data, size);
+        return;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
