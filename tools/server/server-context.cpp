@@ -31,6 +31,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -5053,10 +5054,85 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+
+        // the plain verification of several slots (no synthetic acceptance, replay or rejection sampling) runs on one
+        // thread per slot: each slot clones and samples its own sampler from logits rows resolved here, so the threads
+        // do not call into the context. 8 slots x 4 rows of a 248k vocabulary took 8 ms per round on one thread, with
+        // the GPUs idle (LLAMA_SRV_PAR_SAMPLE=0: one thread)
+        struct spec_verify {
+            std::vector<const float *> logits;
+            common_sampler_ptr         save;
+            std::vector<llama_token>   accepted;
+            std::exception_ptr         err;  // rethrown in the slot's turn below, as if it had sampled there
+        };
+        std::vector<spec_verify> verify(slots.size());
+        {
+            static const bool par = [] { const char * e = getenv("LLAMA_SRV_PAR_SAMPLE"); return !e || atoi(e) != 0; }();
+            const bool synth = !common_speculative_get_synth_probs(spec.get()).empty();
+            std::vector<size_t> work;
+            for (size_t k = 0; par && !synth && k < slots.size(); ++k) {
+                const server_slot & slot = slots[k];
+                if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty() ||
+                    slot.spec_i_batch.size() != slot.spec_draft.size() + 1 ||
+                    (slot.spec_is_replay && slot.use_spec_rejection()) ||
+                    (slot.use_spec_rejection() && !slot.spec_draft_q.empty())) {
+                    continue;
+                }
+                bool rows = true;
+                for (const int idx : slot.spec_i_batch) {
+                    const float * row = nullptr;
+                    if (llama_get_sampled_token_ith(slot.ctx_tgt, idx) == LLAMA_TOKEN_NULL &&
+                        llama_get_sampled_probs_ith(slot.ctx_tgt, idx) == nullptr &&
+                        llama_get_sampled_logits_ith(slot.ctx_tgt, idx) == nullptr) {
+                        row = llama_get_logits_ith(slot.ctx_tgt, idx);
+                    }
+                    if (row == nullptr) {
+                        rows = false;
+                        break;
+                    }
+                    verify[k].logits.push_back(row);
+                }
+                if (rows) {
+                    work.push_back(k);
+                } else {
+                    verify[k].logits.clear();
+                }
+            }
+            if (work.size() >= 2) {
+                const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
+                auto run = [&](size_t k) {
+                    server_slot & slot = slots[k];
+                    try {
+                        verify[k].save.reset(common_sampler_clone(slot.smpl.get()));
+                        verify[k].accepted = common_sampler_sample_and_accept_n_logits(slot.smpl.get(), vocab, verify[k].logits, slot.spec_draft);
+                    } catch (...) {
+                        verify[k].err = std::current_exception();
+                    }
+                };
+                std::vector<std::thread> threads;
+                threads.reserve(work.size() - 1);
+                for (size_t w = 1; w < work.size(); ++w) {
+                    threads.emplace_back(run, work[w]);
+                }
+                run(work[0]);
+                for (auto & th : threads) {
+                    th.join();
+                }
+            } else {
+                for (auto & v : verify) {
+                    v.logits.clear();
+                }
+            }
+        }
+
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
+            }
+            spec_verify & pre = verify[&slot - slots.data()];
+            if (pre.err) {
+                std::rethrow_exception(pre.err);
             }
 
             // save the original draft size
@@ -5069,7 +5145,7 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                common_sampler_ptr smpl_save(pre.save ? std::move(pre.save) : common_sampler_ptr(common_sampler_clone(slot.smpl.get())));
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -5088,6 +5164,8 @@ private:
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else if (!pre.logits.empty()) {
+                    accepted = std::move(pre.accepted);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
