@@ -67,6 +67,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// common_sampler_sample over one row of n_vocab logits instead of an output of a context: no synchronization and no
+// backend-sampled tokens, so different samplers can sample from different threads
+llama_token common_sampler_sample_logits(struct common_sampler * gsmpl, const float * logits, int n_vocab, bool grammar_first = false);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
@@ -84,6 +88,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // returns at least 1 token, up to idxs.size()
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+
+// common_sampler_sample_and_accept_n over rows of logits (logits[i]: the row of draft position i, draft.size() + 1 rows)
+std::vector<llama_token> common_sampler_sample_and_accept_n_logits(struct common_sampler * gsmpl, const llama_vocab * vocab, const std::vector<const float *> & logits, const llama_tokens & draft, bool grammar_first = false);
 
 // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
