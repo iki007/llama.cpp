@@ -432,6 +432,34 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // graph slots: a batch whose shape differs from the previous one finds its graph still allocated in another
+    // scheduler instead of rebuilding it. Slot 0 is the scheduler reserved for full batches, the others are made on
+    // demand for decode-size batches. sched / gf_res_prev / gf_res_prev_active hold the slot gslot_cur, whose entry
+    // in gslots is empty meanwhile.
+    struct graph_slot {
+        ggml_backend_sched_ptr              sched;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *                  gf_res_prev_active = nullptr;
+
+        // the batch the slot was last used for
+        uint32_t n_tokens = 0;
+        bool     outputs  = false;
+        uint64_t t_last   = 0;
+    };
+
+    std::vector<graph_slot> gslots;
+    size_t   gslot_cur   = 0;
+    uint64_t gslot_clock = 0;
+
+    // env: LLAMA_GRAPH_SLOTS (1 = off), LLAMA_GRAPH_SLOT_TOKENS (largest batch that gets a slot of its own)
+    uint32_t gslot_max        = 1;
+    uint32_t gslot_max_tokens = 32;
+
+    void gslot_invalidate();
+    void gslot_switch(size_t i);
+    bool gslot_select(const llama_ubatch & ubatch);
+    void gslot_reset();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

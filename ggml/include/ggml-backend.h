@@ -434,6 +434,11 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // number of graphs a meta backend keeps prepared (default 1: the last graph computed); raises it to at least
+    // n_graphs, no-op for other backends. A caller that alternates between graphs allocated in several schedulers
+    // must keep all of them prepared.
+    GGML_API void ggml_backend_meta_set_n_graphs(ggml_backend_t backend, size_t n_graphs);
+
     //
     // Utils
     //

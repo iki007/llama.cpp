@@ -389,6 +389,17 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_GRAPH_SLOTS       = getenv("LLAMA_GRAPH_SLOTS");
+        const char * LLAMA_GRAPH_SLOT_TOKENS = getenv("LLAMA_GRAPH_SLOT_TOKENS");
+        gslot_max        = LLAMA_GRAPH_SLOTS       ? std::max(1, atoi(LLAMA_GRAPH_SLOTS))       : gslot_max;
+        gslot_max_tokens = LLAMA_GRAPH_SLOT_TOKENS ? std::max(1, atoi(LLAMA_GRAPH_SLOT_TOKENS)) : gslot_max_tokens;
+
+        if (gslot_max > 1) {
+            LLAMA_LOG_INFO("%s: graph slots = %u (batches of up to %u tokens)\n", __func__, gslot_max, gslot_max_tokens);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -538,6 +549,14 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
+        }
+
+        // a multi-device backend keeps its subgraphs per graph: each slot's graph must stay prepared there too
+        // (a graph is one subgraph list per scheduler split)
+        if (gslot_max > 1) {
+            for (auto & backend : backends) {
+                ggml_backend_meta_set_n_graphs(backend.get(), 4 * gslot_max);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -763,6 +782,8 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+
+    gslot_reset();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1038,6 +1059,8 @@ bool llama_context::memory_update(bool optimize) {
                     return false;
                 }
         }
+
+        gslot_switch(0);
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
@@ -1581,6 +1604,98 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// no active graph in the current slot means the graphs were invalidated from outside (memory update, sampler change,
+// reserve): the parked ones are as old
+void llama_context::gslot_invalidate() {
+    if (gf_res_prev_active == nullptr) {
+        for (auto & slot : gslots) {
+            slot.gf_res_prev_active = nullptr;
+        }
+    }
+}
+
+void llama_context::gslot_switch(size_t i) {
+    if (i == gslot_cur || i >= gslots.size()) {
+        return;
+    }
+
+    gslot_invalidate();
+
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
+    auto & out = gslots[gslot_cur];
+    out.sched              = std::move(sched);
+    out.gf_res_prev        = std::move(gf_res_prev);
+    out.gf_res_prev_active = gf_res_prev_active;
+
+    auto & in = gslots[i];
+    sched              = std::move(in.sched);
+    gf_res_prev        = std::move(in.gf_res_prev);
+    gf_res_prev_active = in.gf_res_prev_active;
+
+    in.gf_res_prev_active = nullptr;
+
+    gslot_cur = i;
+}
+
+// picks the slot for a batch that the current slot cannot reuse; returns true if the slot changed
+bool llama_context::gslot_select(const llama_ubatch & ubatch) {
+    if (gslots.empty()) {
+        gslots.resize(1);
+    }
+
+    const bool outputs = n_outputs > 0;
+
+    // full batches belong to the scheduler that was reserved for them
+    size_t pick = 0;
+
+    if (ubatch.n_tokens <= gslot_max_tokens) {
+        // the slot last used for this shape (to reuse its graph, or to replace it if stale), else a new slot, else
+        // the least recently used one
+        pick = gslots.size();
+
+        size_t lru = 0;
+        for (size_t i = 1; i < gslots.size(); ++i) {
+            if (gslots[i].n_tokens == ubatch.n_tokens && gslots[i].outputs == outputs) {
+                pick = i;
+                break;
+            }
+            if (lru == 0 || gslots[i].t_last < gslots[lru].t_last) {
+                lru = i;
+            }
+        }
+
+        if (pick == gslots.size()) {
+            if (gslots.size() < gslot_max) {
+                gslots.emplace_back();
+                gslots.back().sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                            gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+            } else {
+                pick = lru;
+            }
+        }
+    }
+
+    const bool changed = pick != gslot_cur;
+
+    gslot_switch(pick);
+
+    return changed;
+}
+
+// back to slot 0, the other slots are freed
+void llama_context::gslot_reset() {
+    if (gslots.empty()) {
+        gslots.resize(1);
+    }
+
+    gslot_switch(0);
+
+    gslots.resize(1);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool compute) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1588,16 +1703,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    gslot_invalidate();
+
     auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
+
+    // a graph of a pair (compute == false) is always built anew
+    bool reuse = compute && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(graph_params(res, ubatch, mctx, gtype));
+
+    // not the graph of the previous batch: another slot may still hold it
+    if (!reuse && gslot_max > 1 && gslot_select(ubatch)) {
+        res   = get_gf_res_prev();
+        reuse = compute && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(graph_params(res, ubatch, mctx, gtype));
+    }
+
+    auto * gf = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    // a graph of a pair is always built anew: the meta backend keeps the per-device views of both graphs of a
-    // pair only when both were allocated after the previous computation
-    if (compute && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!gslots.empty()) {
+        auto & slot = gslots[gslot_cur];
+        slot.n_tokens = ubatch.n_tokens;
+        slot.outputs  = n_outputs > 0;
+        slot.t_last   = ++gslot_clock;
+    }
+
+    if (reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1632,7 +1764,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-
         gf_res_prev_active = res;
     }
 
@@ -2269,7 +2400,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 const auto * res_b = process_ubatch(ubatch_b, gtype, mctx.get(), status, /*compute =*/ false);
                 std::swap(sched, sched_pair);
                 std::swap(gf_res_prev, gf_res_pair);
-                gf_res_prev_active = nullptr;
+                // the active graph of this scheduler is the first one (null would read as an outside invalidation
+                // to the graph slots)
+                gf_res_prev_active = const_cast<llm_graph_result *>(res_a);
                 if (!res_b) {
                     return ubatch_failed({ &ubatch, &ubatch_b }, status);
                 }
@@ -2288,7 +2421,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 continue;
             }
             // the last ubatch of the batch, alone
-            gf_res_prev_active = nullptr;
             status = graph_compute(res_a->get_gf(), ubatch.n_tokens > 1);
             if (status != GGML_STATUS_SUCCESS) {
                 return ubatch_failed({ &ubatch }, status);
@@ -2769,6 +2901,8 @@ ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
+
+    gslot_switch(0);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
