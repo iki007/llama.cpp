@@ -1456,6 +1456,42 @@ void ggml_sycl_cpy_f32_batch(ggml_backend_sycl_context & ctx, const ggml_tensor 
     const int i_ne00 = ne00, i_ne01 = ne01, i_ne02 = ne02, i_ne10 = ne10, i_ne11 = ne11, i_ne12 = ne12;
     const int i_nb00 = nb00, i_nb01 = nb01, i_nb02 = nb02, i_nb03 = nb03;
     const int i_nb10 = nb10, i_nb11 = nb11, i_nb12 = nb12, i_nb13 = nb13;
+
+    // short contiguous source rows that each land inside one destination row (the conv-state snapshots of a recurrent
+    // layer: 3 values per channel and sequence, the snapshots overlapping windows of one input row): one work-item per
+    // row for all copies, so the index math runs once per row and the copies read the row's cache lines again from L1
+    // (Qwen3.8-27B, 8 snapshots of 8 sequences x 5120 channels per card: 39 us per call with one work-item per value)
+    static const int rows = ggml_sycl_get_env("GGML_SYCL_CPY_BATCH_ROWS", 1);
+    if (rows && nb00 == sizeof(float) && nb10 == sizeof(float) && ne00 <= 8 && ne10 % ne00 == 0) {
+        const int nrows = ne / i_ne00;
+        const int wg    = 256;
+        ctx.stream()->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((nrows + wg - 1) / wg * wg), sycl::range<1>(wg)), [=](sycl::nd_item<1> it) {
+                const int r = it.get_global_id(0);
+                if (r >= nrows) {
+                    return;
+                }
+                const int    i01  = r % i_ne01;
+                const int    i02  = (r / i_ne01) % i_ne02;
+                const int    i03  = r / (i_ne01 * i_ne02);
+                const int    base = r * i_ne00;
+                const int    i10  = base % i_ne10;
+                const int    i11  = (base / i_ne10) % i_ne11;
+                const int    i12  = (base / (i_ne10 * i_ne11)) % i_ne12;
+                const int    i13  = base / (i_ne10 * i_ne11 * i_ne12);
+                const size_t so   = i01 * i_nb01 + i02 * i_nb02 + (size_t) i03 * i_nb03;
+                const size_t dof  = i10 * sizeof(float) + i11 * i_nb11 + i12 * i_nb12 + (size_t) i13 * i_nb13;
+                for (int k = 0; k < n; ++k) {
+                    // 32-bit words: the bits of every value as they are (signed zeros, subnormals)
+                    const uint32_t * sp = (const uint32_t *) (p.x[k] + so);
+                    uint32_t *       dp = (uint32_t *) (p.d[k] + dof);
+                    for (int i = 0; i < i_ne00; ++i) {
+                        dp[i] = sp[i];
+                    }
+                }
+            });
+        return;
+    }
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     ctx.stream()->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, n, num_blocks * SYCL_CPY_BLOCK_SIZE), sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
