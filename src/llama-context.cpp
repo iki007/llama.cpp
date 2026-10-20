@@ -2255,9 +2255,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        if (sched_pair && ubatch.n_tokens > 1) {
-            // prefill pairs: this ubatch and the next one built and allocated (in sched and sched_pair), computed
-            // together, then their outputs read in order
+        // prefill pairs: only for a batch of more than one ubatch and prompt-sized ubatches (a single ubatch, e.g. a
+        // draft verification, keeps its graph reuse)
+        if (sched_pair && n_tokens_all > (int64_t) cparams.n_ubatch && ubatch.n_tokens >= 64) {
+            // this ubatch and the next one built and allocated (in sched and sched_pair), computed together, then
+            // their outputs read in order
             const auto * res_a = process_ubatch(ubatch, gtype, mctx.get(), status, /*compute =*/ false);
             if (!res_a) {
                 return ubatch_failed({ &ubatch }, status);
