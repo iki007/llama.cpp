@@ -381,6 +381,12 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_PREFILL_PAIRS = getenv("LLAMA_PREFILL_PAIRS");
+        prefill_pairs = LLAMA_PREFILL_PAIRS && atoi(LLAMA_PREFILL_PAIRS) != 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+        if (prefill_pairs) {
+            LLAMA_LOG_INFO("%s: prefill pairs: consecutive ubatches of a batch are computed two at a time\n", __func__);
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -865,6 +871,33 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
+    // prefill pairs: the second scheduler gets compute buffers of its own for the same worst-case pp graph
+    sched_pair.reset();
+    for (auto & res : gf_res_pair) {
+        res.reset();
+    }
+    if (prefill_pairs && !model.hparams.no_alloc && !cparams.pipeline_parallel) {
+        sched_pair.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(sched_pair.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(sched_pair.get(), sched_graph_realloc, this);
+        std::swap(sched, sched_pair);
+        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+        std::swap(sched, sched_pair);
+        if (!gf) {
+            LLAMA_LOG_WARN("%s: no memory for a second compute buffer: prefill pairs off\n", __func__);
+            sched_pair.reset();
+        } else {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t size = ggml_backend_sched_get_buffer_size(sched_pair.get(), backend_ptrs[i]);
+                if (size > 1) {
+                    LLAMA_LOG_INFO("%s: %10s pair compute buffer size = %8.2f MiB\n", __func__,
+                            ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0);
+                }
+            }
         }
     }
 
@@ -1550,7 +1583,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool compute) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1564,7 +1597,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // a graph of a pair is always built anew: the meta backend keeps the per-device views of both graphs of a
+    // pair only when both were allocated after the previous computation
+    if (compute && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1611,6 +1646,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (!compute) {
+        ret = GGML_STATUS_SUCCESS;
+        return res;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2028,65 +2068,57 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
-    do {
-        const auto & ubatch = mctx->get_ubatch();
+    // the number of outputs of a ubatch (needs to be set in n_outputs before its graph is built)
+    auto count_outputs = [&](const llama_ubatch & ubatch) -> int32_t {
+        int32_t n_outputs_new = 0;
 
-        // count the outputs in this ubatch
-        {
-            int32_t n_outputs_new = 0;
-
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                }
+        if (n_outputs_all == n_tokens_all) {
+            n_outputs_new = ubatch.n_tokens;
+        } else {
+            for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                n_outputs_new += (int32_t) (ubatch.output[i] != 0);
             }
+        }
+        return n_outputs_new;
+    };
 
-            // needs to happen before the graph is built
-            n_outputs = n_outputs_new;
+    // a failed or aborted ubatch (or pair): remove all positions from its first one on from the memory module
+    auto ubatch_failed = [&](std::initializer_list<const llama_ubatch *> ubatches, ggml_status status) -> int {
+        // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+        llama_pos pos_min[LLAMA_MAX_SEQ];
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            pos_min[s] = std::numeric_limits<llama_pos>::max();
         }
 
-        ggml_status status;
+        for (const llama_ubatch * ub : ubatches) {
+            for (uint32_t i = 0; i < ub->n_tokens; ++i) {
+                const auto & seq_id = ub->seq_id[i][0];
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-
-        if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
-
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
-
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
-
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
-                }
-
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
-            }
-
-            switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
-                case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
-                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                pos_min[seq_id] = std::min(pos_min[seq_id], ub->pos[i]);
             }
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                continue;
+            }
 
+            LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", "decode", s, pos_min[s]);
+
+            memory->seq_rm(s, pos_min[s], -1);
+        }
+
+        switch (status) {
+            case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_ALLOC_FAILED: return -2;
+            case GGML_STATUS_FAILED:       return -3;
+            case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+        }
+        return -3;
+    };
+
+    // read the outputs of a computed ubatch
+    auto extract_outputs = [&](const llm_graph_result * res, const llama_ubatch & ubatch) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2212,6 +2244,75 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+    };
+
+    const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        n_outputs = count_outputs(ubatch);
+
+        ggml_status status;
+
+        if (sched_pair && ubatch.n_tokens > 1) {
+            // prefill pairs: this ubatch and the next one built and allocated (in sched and sched_pair), computed
+            // together, then their outputs read in order
+            const auto * res_a = process_ubatch(ubatch, gtype, mctx.get(), status, /*compute =*/ false);
+            if (!res_a) {
+                return ubatch_failed({ &ubatch }, status);
+            }
+            if (mctx->next()) {
+                const int32_t n_outputs_a = n_outputs;
+                const auto &  ubatch_b    = mctx->get_ubatch();
+                n_outputs = count_outputs(ubatch_b);
+                const int32_t n_outputs_b = n_outputs;
+
+                std::swap(sched, sched_pair);
+                std::swap(gf_res_prev, gf_res_pair);
+                const auto * res_b = process_ubatch(ubatch_b, gtype, mctx.get(), status, /*compute =*/ false);
+                std::swap(sched, sched_pair);
+                std::swap(gf_res_prev, gf_res_pair);
+                gf_res_prev_active = nullptr;
+                if (!res_b) {
+                    return ubatch_failed({ &ubatch, &ubatch_b }, status);
+                }
+
+                status = graph_compute_pair(res_a->get_gf(), res_b->get_gf());
+                if (status != GGML_STATUS_SUCCESS) {
+                    return ubatch_failed({ &ubatch, &ubatch_b }, status);
+                }
+
+                n_outputs = n_outputs_a;
+                extract_outputs(res_a, ubatch);
+                n_outputs = n_outputs_b;
+                std::swap(sched, sched_pair);
+                extract_outputs(res_b, ubatch_b);
+                std::swap(sched, sched_pair);
+                continue;
+            }
+            // the last ubatch of the batch, alone
+            gf_res_prev_active = nullptr;
+            status = graph_compute(res_a->get_gf(), ubatch.n_tokens > 1);
+            if (status != GGML_STATUS_SUCCESS) {
+                return ubatch_failed({ &ubatch }, status);
+            }
+            extract_outputs(res_a, ubatch);
+            continue;
+        }
+
+        const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
+
+        if (!res) {
+            return ubatch_failed({ &ubatch }, status);
+        }
+
+        // plot the computation graph in dot format (for debugging purposes)
+        //if (n_past%100 == 0) {
+        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+        //}
+
+        extract_outputs(res, ubatch);
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2807,6 +2908,27 @@ ggml_status llama_context::graph_compute(
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
+    return status;
+}
+
+ggml_status llama_context::graph_compute_pair(ggml_cgraph * gf_a, ggml_cgraph * gf_b) {
+    if (backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn) {
+            set_threadpool_fn(backend_cpu, threadpool_batch);
+        }
+    }
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads_batch);
+    }
+
+    copy_experts.reset();
+
+    auto status = ggml_backend_sched_graph_compute_pair_async(sched.get(), gf_a, sched_pair.get(), gf_b);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_pair_async failed with error %d\n", __func__, status);
+    }
     return status;
 }
 
