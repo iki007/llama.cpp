@@ -522,8 +522,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        // the candidates are scratch that the next sampling refills (one entry per vocabulary token, 3 MB for a 248k
+        // vocabulary): a clone starts without them
+        /* .cur     = */ {},
+        /* .cur_p   = */ { nullptr, 0, -1, false },
         /* .rng     = */ gsmpl->rng,
     };
 }
