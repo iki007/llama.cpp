@@ -9936,9 +9936,13 @@ static bool ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
         comm_ctx->hbox_bytes = x.xbytes;
     }
     // two duplex exchanges in flight use two parts of the stage buffer in turn (each 1.125 bytes per value plus the
-    // sequence word, inside the buffer's 4 bytes per value)
+    // sequence word, inside the buffer's 4 bytes per value). The parts sit at offsets fixed by the buffer's capacity,
+    // not by this exchange's size: the two ubatches of a pair can differ in size (a batch of several sequences), and
+    // offsets from each one's own size made the second's download overlap the first's parts (garbage answers).
     x.stage_k = phase == GGML_SYCL_COMM_START && (x.duplex || x.ce) ? (comm_ctx->xstage ^= 1) : 0;
-    const size_t stride = (x.seq_off + 64 + 255) / 256 * 256;
+    const size_t cap_x  = (size_t) comm_ctx->buf_nelem + comm_ctx->buf_nelem / 32 * sizeof(float);
+    const size_t stride = ((cap_x + 63) / 64 * 64 + 64 + 255) / 256 * 256;
+    GGML_ASSERT(!(x.duplex || x.ce) || x.seq_off + sizeof(uint32_t) <= stride);
     x.stage[0] = buf0 + x.stage_k * stride;
     x.stage[1] = buf1 + x.stage_k * stride;
     // the copy-engine transport downloads the peer's partial behind the two stages (5 bytes per value in all)
