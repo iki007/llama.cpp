@@ -131,6 +131,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     tok_embd        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,       "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
+    // optional: the mask token's row of the target table, kept unquantized (see the noise block input)
+    dflash_mask_embd = create_tensor(tn(LLM_TENSOR_DFLASH_MASK_EMBD, "weight"), { n_embd }, TENSOR_NOT_REQUIRED);
+
     // reduced draft vocab (optional): d2t maps draft rows to target token ids
     int64_t n_vocab_draft = n_vocab;
     const struct ggml_tensor * d2t_meta = ml->get_tensor_meta("d2t");
@@ -377,6 +380,28 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
+// 1 for the rows of the mask token, 0 for the others
+class llm_graph_input_dflash_mask : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash_mask(llama_token mask_id) : mask_id(mask_id) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        std::vector<float> data(ubatch->n_tokens, 0.0f);
+        for (uint32_t i = 0; ubatch->token && i < ubatch->n_tokens; ++i) {
+            data[i] = ubatch->token[i] == mask_id ? 1.0f : 0.0f;
+        }
+        ggml_backend_tensor_set(is_mask, data.data(), 0, ggml_nbytes(is_mask));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return is_mask->ne[1] == params.ubatch.n_tokens;
+    }
+
+    ggml_tensor * is_mask = nullptr; // F32 [1, n_tokens]
+
+    const llama_token mask_id;
+};
+
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
@@ -955,6 +980,18 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    if (model.dflash_mask_embd) {
+        // the mask token can be a pad token with a tiny embedding row (Ornith-1.5-122B: norm 2.5e-5) that a quantized
+        // target table stores as zeros; the draft's q/k norms amplify that row, so the mask rows take the draft's copy
+        auto inp = std::make_unique<llm_graph_input_dflash_mask>(model.vocab.token_mask());
+        inp->is_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->is_mask);
+        ggml_tensor * is_mask = inp->is_mask;
+        res->add_input(std::move(inp));
+
+        ggml_tensor * delta = ggml_sub(ctx0, ggml_repeat(ctx0, model.dflash_mask_embd, inpL), inpL);
+        inpL = ggml_add(ctx0, inpL, ggml_mul(ctx0, delta, is_mask));
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }

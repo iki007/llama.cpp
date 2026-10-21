@@ -1377,6 +1377,7 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DFLASH_MASK_EMBD       = auto()
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -2253,6 +2254,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DFLASH_MASK_EMBD:          "mask_embd",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -5907,6 +5909,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH_MASK_EMBD,
         MODEL_TENSOR.LILICORR_TOKEN_PROJ,
         MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
         MODEL_TENSOR.LILICORR_SLOT_EMBD,
