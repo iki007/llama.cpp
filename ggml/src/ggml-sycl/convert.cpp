@@ -502,7 +502,8 @@ static void dequantize_row_iq3_xxs_sycl_reorder(const void * vx, dst_t * y, cons
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32),
                                            sycl::range<3>(1, 1, 32)),
                          [=](sycl::nd_item<3> item_ct1) {
-                             dequantize_block_iq3_xxs_reorder(vx, y, item_ct1, nb);
+                             dequantize_block_iq3_xxs_reorder(vx, y + item_ct1.get_group(2) * QK_K, item_ct1.get_group(2),
+                                                             item_ct1, nb);
                          });
     });
 }
@@ -534,7 +535,8 @@ static void dequantize_row_iq3_s_sycl_reorder(const void * vx, dst_t * y, const 
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32),
                                            sycl::range<3>(1, 1, 32)),
                          [=](sycl::nd_item<3> item_ct1) {
-                             dequantize_block_iq3_s_reorder(vx, y, item_ct1, nb);
+                             dequantize_block_iq3_s_reorder(vx, y + item_ct1.get_group(2) * QK_K, item_ct1.get_group(2),
+                                                             item_ct1, nb);
                          });
     });
 }

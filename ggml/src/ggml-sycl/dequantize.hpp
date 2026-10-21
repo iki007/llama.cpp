@@ -1874,15 +1874,14 @@ static void dequantize_block_iq4_xs_reorder_wide(const void * __restrict__ vx, d
 }
 
 template<typename dst_t>
-static void dequantize_block_iq3_xxs_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
+// block i of n_blocks into yy (the block's QK_K outputs): the caller picks the block (get_rows: any row's block)
+static void dequantize_block_iq3_xxs_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t i,
                                              const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
-    const int64_t i = item_ct1.get_group(2);
-
     const int64_t tid = item_ct1.get_local_id(2);
     const int64_t il  = tid / 8;  // 0...3
     const int64_t ib  = tid % 8;  // 0...7
 
-    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
+    dst_t * y = yy + 32 * ib + 8 * il;
 
     const uint8_t * base = static_cast<const uint8_t *>(vx);
 
@@ -1938,15 +1937,14 @@ static void dequantize_block_iq2_s_reorder(const void * __restrict__ vx, dst_t *
 }
 
 template<typename dst_t>
-static void dequantize_block_iq3_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
+// block i of n_blocks into yy (the block's QK_K outputs): the caller picks the block (get_rows: any row's block)
+static void dequantize_block_iq3_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t i,
                                            const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
-    const int64_t i = item_ct1.get_group(2);
-
     const int64_t tid = item_ct1.get_local_id(2);
     const int64_t il  = tid / 8;  // 0...3
     const int64_t ib  = tid % 8;  // 0...7
 
-    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
+    dst_t * y = yy + 32 * ib + 8 * il;
 
     const uint8_t * base = static_cast<const uint8_t *>(vx);
 
