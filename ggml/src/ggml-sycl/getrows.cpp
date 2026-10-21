@@ -576,8 +576,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 const void * vx = dst->src[0]->data;
                 get_rows_sycl_reorder_iq3(ctx, dst->src[0], dst->src[1], dst, src1_i32, (float *) dst->data,
                     [=](float * y, int64_t iblk, const sycl::nd_item<3> & item_ct1, int64_t nb) {
-                        dequantize_block_iq3_xxs_reorder(vx, y, iblk, item_ct1, nb,
-                                                         iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+                        dequantize_block_iq3_xxs_reorder(vx, y, iblk, item_ct1, nb);
                     });
                 break;
             }
@@ -597,8 +596,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 const void * vx = dst->src[0]->data;
                 get_rows_sycl_reorder_iq3(ctx, dst->src[0], dst->src[1], dst, src1_i32, (float *) dst->data,
                     [=](float * y, int64_t iblk, const sycl::nd_item<3> & item_ct1, int64_t nb) {
-                        dequantize_block_iq3_s_reorder(vx, y, iblk, item_ct1, nb,
-                                                       kmask_iq2xs, iq3s_grid);
+                        dequantize_block_iq3_s_reorder(vx, y, iblk, item_ct1, nb);
                     });
                 break;
             }
