@@ -177,8 +177,6 @@ static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int
     dpct::has_capability_or_fail(stream->get_device(),
                                     {sycl::aspect::fp16});
 
-    // flat range<1>, two pairs (4 elements) per item: no nd_range/group math, one vectorized store.
-    // k % QK8_0 == 0 implies k % 4 == 0, so the wide launch covers the row exactly (no tail).
     GGML_ASSERT(k % QK8_0 == 0);
     // One contiguous chunk per work-item, ordinary work-group, no forced sub-group size: the
     // previous wg=32 + reqd_sub_group_size(32) pairing was the slowest arrangement measured.
