@@ -799,6 +799,7 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
+    struct ggml_tensor * dflash_mask_embd       = nullptr; // unquantized embedding row of the mask token
 
     struct ggml_tensor * lilicorr_token_proj          = nullptr;
     struct ggml_tensor * lilicorr_token_proj_b        = nullptr;
