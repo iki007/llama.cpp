@@ -12,6 +12,7 @@
 #include "topk-radix.hpp"
 #include "topk-moe.hpp"
 #include "moe-weighted-reduction.hpp"
+#include "amax-scale.hpp"
 
 // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
 // path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
@@ -615,6 +616,14 @@ int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i)
     }
     if (const int n = ggml_sycl_fuse_cast_add(ctx, cgraph, i)) {
         return n;
+    }
+    if (cgraph->nodes[i]->op == GGML_OP_UNARY) {
+        ggml_sycl_amax_scale_match match;
+        // its own range rule: the div runs in place (x / e over x) as the allocator usually places it
+        if (ggml_sycl_match_amax_scale(cgraph, i, match) && ggml_sycl_amax_scale_ranges_ok(match)) {
+            ggml_sycl_op_amax_scale(ctx, match);
+            return match.node_count - 1;
+        }
     }
     return ggml_sycl_fuse_topk_moe(ctx, cgraph, i);
 }
