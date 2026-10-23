@@ -208,11 +208,16 @@ static void mkl_fa_online_softmax_chunk(
 }
 
 // Write one GQA group's normalized output to its destination head.
+// With attention sinks (one logit per Q head, no value row) the sink joins the softmax denominator as TILE does:
+// max' = max(KQ_max, sink), sum' = KQ_sum * exp(KQ_max - max') + exp(sink - max'), and the accumulator, which is
+// relative to KQ_max, is scaled by exp(KQ_max - max') as well.
 static void mkl_fa_normalize_head(
     dpct::queue_ptr stream,
     float * __restrict dst_batch,
     const float * __restrict VKQ_accum,
     const float * __restrict KQ_sum,
+    const float * __restrict KQ_max,
+    const float * __restrict sinks,
     int iqh, int n_queries, int DV, int n_q_heads,
     int64_t src_offset, int64_t wg_size) {
 
@@ -226,6 +231,13 @@ static void mkl_fa_normalize_head(
 
                 int     ksum_idx = (int)(src_offset / DV) + jc;
                 float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
+                if (sinks) {
+                    const float sink  = sinks[iqh];
+                    const float m_old = KQ_max[ksum_idx];
+                    const float m_new = sycl::fmax(m_old, sink);
+                    const float scale = sycl::native::exp(m_old - m_new);
+                    inv_sum = scale / (KQ_sum[ksum_idx] * scale + sycl::native::exp(sink - m_new));
+                }
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):
@@ -357,10 +369,13 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+    GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
+    const float * sinks_d = sinks ? (const float *) sinks->data : nullptr;
 
     // --- Op params ---
     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
@@ -656,7 +671,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 int     iqh        = kvh_base_head + iqg;
                 int64_t src_offset = (int64_t)iqg * n_queries * DV;
                 mkl_fa_normalize_head(stream,
-                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr, KQ_max_ptr, sinks_d,
                     iqh, n_queries, DV, n_q_heads,
                     src_offset, wg_size);
             }

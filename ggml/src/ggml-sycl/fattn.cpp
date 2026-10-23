@@ -161,7 +161,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    // Attention sinks (one F32 logit per Q head) join the softmax denominator in mkl_fa_normalize_head.
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && (!sinks || sinks->type == GGML_TYPE_F32) && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
