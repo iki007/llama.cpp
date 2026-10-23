@@ -12740,9 +12740,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // Recursive Flint's full-attention layers: 4 KV heads x GQA 8, head 128, attention sinks, q8_0 / f16 cache
+    // Recursive Flint's full-attention layers: 4 KV heads x GQA 8, head 128, attention sinks, q8_0 / f16 cache; the
+    // prompt rows (MKL) and the decode / verify rows (XMX), with and without sinks
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, 64, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        for (int nb : { 1, 4 }) {
+            for (bool sinks : { false, true }) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, nb, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                // the KV cache's own layout (heads interleaved per token): a q8_0 cache is read in place there
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, nb, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            }
+        }
     }
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
@@ -13330,6 +13338,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 100096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 100096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // Recursive Flint decode: a full-attention layer, 4 KV heads x GQA 8, head 128, attention sinks
+    for (int kv : { 32768, 65536, 131072 }) {
+        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            // the KV cache's own layout: the 4 heads interleaved in each token row
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
