@@ -7778,6 +7778,41 @@ enum MoeGatingFunc {
     GATING_FUNC_SQRT_SOFTPLUS,
 };
 
+// llm_graph_context::build_amax_src1_f16: the per-row power-of-two scale of a MoE down-projection input
+// (Recursive Flint); backends may fuse the ten ops. The output adds both results (x / e and e).
+struct test_amax_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float range;
+
+    test_amax_scale(std::array<int64_t, 4> ne = { 512, 6, 1, 1 }, float range = 1.0f) : ne(ne), range(range) {}
+
+    std::string vars() override { return VARS_TO_STR2(ne, range); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AMAX_SCALE"; }
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -range, range);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_tensor * amax = ggml_pool_1d(ctx, ggml_abs(ctx, x), GGML_OP_POOL_MAX, ne[0], ne[0], 0);
+        ggml_tensor * e = ggml_scale(ctx, amax, 1.0f/1024.0f);
+        e = ggml_log  (ctx, e);
+        e = ggml_scale(ctx, e, 1.4426950408889634f);
+        e = ggml_ceil (ctx, e);
+        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
+        e = ggml_scale(ctx, e, 0.6931471805599453f);
+        e = ggml_exp  (ctx, e);
+        ggml_tensor * out = ggml_add(ctx, ggml_div(ctx, x, e), e);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_topk_moe : public test_case {
     const std::array<int64_t, 4> ne;
     const int n_expert_used;
@@ -13056,6 +13091,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
+
+    // Recursive Flint's MoE down-projection input scale (512 x 6 experts), a wider row, and inputs past 1024
+    for (float range : { 1.0f, 3e5f }) {
+        for (int64_t n_tok : { 1, 4, 33 }) {
+            test_cases.emplace_back(new test_amax_scale({ 512, 6, n_tok, 1 }, range));
+        }
+        test_cases.emplace_back(new test_amax_scale({ 2048, 8, 3, 1 }, range));
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
