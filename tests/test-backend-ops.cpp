@@ -12835,10 +12835,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int hs : { 64, 128, 256, }) {
             for (int nb : { 32, 64, }) {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
-                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    for (bool sinks : { false, true }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    }
                 }
             }
         }
+    }
+    // Recursive Flint's full-attention layers: 4 KV heads x GQA 8, head 128, attention sinks, q8_0 / f16 cache
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, 64, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
 
     // KV-head counts that do not divide the device count
