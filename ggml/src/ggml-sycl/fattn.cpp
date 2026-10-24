@@ -519,8 +519,18 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     const bool V_is_K_view = V->view_src &&
         (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
-    size_t need_K = 0, need_V = 0, need_Q = 0, need_out = 0, need_scale = 0;
-    if (onednn_supported) {
+    size_t need_K = 0, need_V = 0, need_Q = 0, need_out = 0, need_scale = 0, need_mask = 0;
+    if (onednn_supported && dst->src[4]) {
+        // sinks: everything staged with the sink dims and tokens (ggml_sycl_flash_attn_ext_onednn_sinks)
+        const int64_t da = d + ONEDNN_SINK_DIMS;
+        const int64_t sa = K->ne[1] + ONEDNN_SINK_TOKS;
+        need_Q     = (size_t) H * q * da;
+        need_out   = (size_t) H * q * da;
+        need_scale = 1;
+        need_K     = (size_t) K->ne[2] * sa * da;
+        need_V     = (size_t) K->ne[2] * sa * da;
+        need_mask  = (size_t) q * sa;
+    } else if (onednn_supported) {
         need_Q     = (size_t) H * q * d;
         need_out   = (size_t) H * q * d;
         need_scale = 1;
@@ -544,6 +554,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
                        : ggml_sycl_fattn_reserve_halves(extra, need_V);
     extra.scale_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_scale);
     extra.out_buffer_ptr   = ggml_sycl_fattn_reserve_halves(extra, need_out);
+    extra.mask_buffer_ptr  = ggml_sycl_fattn_reserve_halves(extra, need_mask);
 
     return extra;
 }
