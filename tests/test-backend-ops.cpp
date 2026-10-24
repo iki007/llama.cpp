@@ -13511,6 +13511,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
         }
     }
+    // Recursive Flint prompt: a 2048-row batch over a q8_0 cache at depth, in the cache's own layout
+    for (int kv : { 8192, 32768 }) {
+        for (bool sinks : { true, false }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 2048, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
