@@ -939,10 +939,19 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
     // whole cache is converted
     const bool list = q8 && fa_xmx_use_list(dst, max_q);
     GGML_ASSERT(!list || (D == FA_XMX_D && !sinks));
+    // a q8_0 cache is read in place (half the bytes of an f16 cache); for the span lists, or a layout the 2D loads
+    // cannot take, the live spans of K and V are converted to contiguous f16 once and every chunk reads the copy
+    static const int q8_direct = ggml_sycl_get_env("GGML_SYCL_FA_XMX_Q8_DIRECT", 1);
+    size_t           k_hb = 0, v_hb = 0;
+    int              k_hx = 0, v_hx = 0;
+    const bool       direct = q8 && !list && q8_direct && fa_xmx_q8_layout(K, k_hb, k_hx) && fa_xmx_q8_layout(V, v_hb, v_hx);
+    // a dense mask (no QSA selection, no n_kv_max hint) leaves dead only the cells past the used end of the cache, which
+    // add exactly 0: a cache read in place reads every span, without the launch that finds the live ones
+    const bool dense = direct && !indices && ggml_get_op_params_i32(dst, 4) <= 0;
     ggml_sycl_pool_alloc<uint8_t> span_live(ctx.pool());
     // (per stream when each stream has its own mask)
-    uint8_t * live = q8 ? span_live.alloc((size_t) n_span * m_str) : nullptr;
-    if (q8 && skip && !list) {
+    uint8_t * live = q8 && !dense ? span_live.alloc((size_t) n_span * m_str) : nullptr;
+    if (live && skip && !list) {
         const char * mp    = (const char *) mask->data;
         const size_t m_nb1 = mask->nb[1];
         const size_t m_nb3 = mask->nb[3];
@@ -960,16 +969,10 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
             }
             live[id[0]] = any;
         });
-    } else if (q8) {
+    } else if (live) {
         stream->memset(live, 1, (size_t) n_span * m_str);
     }
 
-    // a q8_0 cache is read in place (half the bytes of an f16 cache); for the span lists, or a layout the 2D loads
-    // cannot take, the live spans of K and V are converted to contiguous f16 once and every chunk reads the copy
-    static const int q8_direct = ggml_sycl_get_env("GGML_SYCL_FA_XMX_Q8_DIRECT", 1);
-    size_t           k_hb = 0, v_hb = 0;
-    int              k_hx = 0, v_hx = 0;
-    const bool       direct = q8 && !list && q8_direct && fa_xmx_q8_layout(K, k_hb, k_hx) && fa_xmx_q8_layout(V, v_hb, v_hx);
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
     size_t       k_nb1 = K->nb[1], k_nb2 = K->nb[2], v_nb1 = V->nb[1], v_nb2 = V->nb[2];
@@ -1157,7 +1160,9 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
         a.Q    = (const char *) Q->data + j0 * Q->nb[1];
         a.mask = (const char *) mask->data + j0 * mask->nb[1];
         a.nq   = nqc;
-        if (direct) {
+        if (dense) {
+            fa_xmx_launch_rg<false, true>(D, RG, a, n_kvh, grf128, stream);
+        } else if (direct) {
             fa_xmx_launch_rg<true, true>(D, RG, a, n_kvh, grf128, stream);
         } else if (q8) {
             fa_xmx_launch_rg<true>(D, RG, a, n_kvh, grf128, stream);
