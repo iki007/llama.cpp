@@ -11,6 +11,11 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
 // it. Depends only on the types and strides of K and V, so the answer holds for every call.
 bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor * V);
 
+// With attention sinks the oneDNN path stages Q, K, V and the mask with extra dims and tokens that hold the sinks
+// (see ggml_sycl_flash_attn_ext_onednn_sinks): head size d + ONEDNN_SINK_DIMS, n_kv + ONEDNN_SINK_TOKS cells.
+constexpr int ONEDNN_SINK_DIMS = 16;
+constexpr int ONEDNN_SINK_TOKS = 16;
+
 // Run flash attention through oneDNN's fused xmx SDPA
 // execute the cached SDPA partition, write the f32 dst. Falls back to the TILE kernel on any failure.
 void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst);

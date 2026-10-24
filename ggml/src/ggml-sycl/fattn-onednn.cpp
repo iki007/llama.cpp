@@ -90,8 +90,13 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     // 1. if the oneDNN graph Add node has no input --> skip
     // 2. types other than f16 need different logical_tensor declaration
     // 3. the mask must be shape [1, 1, q, seq]
-    // 4. sinks: excludes attention sink (Xiao et al., 2024) that can't be modeled by oneDNN graph
-    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || sinks) {
+    // 4. sinks (Xiao et al., 2024): F32, f16 or q8_0 KV, built into the operands (ggml_sycl_flash_attn_ext_onednn_sinks)
+    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    static const int sinks_ok = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_SINKS", 1);
+    if (sinks && (!sinks_ok || sinks->type != GGML_TYPE_F32 || K->ne[2] == 0 || Q->ne[2] / K->ne[2] > 8 ||
+                  (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) || V->type != K->type)) {
         return false;
     }
     float max_bias = 0.0f, logit_softcap = 0.0f;
@@ -236,7 +241,174 @@ catch (const std::exception & e) {
     return {};
 }
 
+// Attention sinks inside the fused SDPA (its softmax has no sink term, and asking it for the log-sum-exp leaves the
+// fused kernel). Each query head c of a KV head gets two extra dims set to 1 (d + c and d + 8 + c), and each KV head
+// gets 8 extra tokens with V = 0: token j holds sink_j / scale in dim d + j, split into an f16 value and its f16
+// remainder (dim d + 8 + j), and -1000 / scale in the dims of the other heads. Head c then scores exactly its sink on
+// token c and -1000 on the others: the sink joins the softmax sum and adds nothing to the output. Tokens up to
+// seq + 16 are padding (masked). Q, K, V and the mask are staged with these dims and tokens, in the node's reserved
+// space (ggml_sycl_fattn_get_extra) or the pool; d + 16 dims cost 12.5% more score flops at head 128.
+
+static void ggml_sycl_flash_attn_ext_onednn_sinks(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int d   = (int) K->ne[0];
+    const int seq = (int) K->ne[1];
+    const int Hkv = (int) K->ne[2];
+    const int H   = (int) Q->ne[2];
+    const int q   = (int) Q->ne[1];
+    const int rep = H / Hkv;
+    const int da  = d + ONEDNN_SINK_DIMS;
+    const int sa  = seq + ONEDNN_SINK_TOKS;
+
+    float kq_scale = 1.0f;
+    memcpy(&kq_scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    dpct::queue_ptr stream = ctx.stream();
+    dnnl::engine    eng    = ctx.engine_dnnl(stream);
+    dnnl::stream    strm   = ctx.stream_dnnl(stream);
+
+    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+    ggml_sycl_pool_alloc<sycl::half> pool_q(ctx.pool()), pool_k(ctx.pool()), pool_v(ctx.pool()), pool_m(ctx.pool()),
+        pool_o(ctx.pool()), pool_s(ctx.pool());
+    auto stage = [](uintptr_t reserved, ggml_sycl_pool_alloc<sycl::half> & pool, size_t n) {
+        return reserved ? (sycl::half *) reserved : pool.alloc(n);
+    };
+    sycl::half * Qa = stage(extra.Q_buffer_ptr, pool_q, (size_t) H * q * da);
+    sycl::half * Ka = stage(extra.K_buffer_ptr, pool_k, (size_t) Hkv * sa * da);
+    sycl::half * Va = stage(extra.V_buffer_ptr, pool_v, (size_t) Hkv * sa * da);
+    sycl::half * Ma = stage(extra.mask_buffer_ptr, pool_m, (size_t) q * sa);
+    sycl::half * Oa = stage(extra.out_buffer_ptr, pool_o, (size_t) H * q * da);
+    sycl::half * scale_dev = stage(extra.scale_buffer_ptr, pool_s, 1);
+
+    // Q [H][q][da]: the head's two extra dims are 1
+    {
+        const char * src = (const char *) Q->data;
+        const size_t nb1 = Q->nb[1], nb2 = Q->nb[2];
+        sycl::half * out = Qa;
+        stream->parallel_for(sycl::range<3>(H, q, da), [=](sycl::id<3> id) {
+            const int h = id[0], t = id[1], e = id[2];
+            float     v = 0.0f;
+            if (e < d) {
+                v = *(const float *) (src + h * nb2 + t * nb1 + e * sizeof(float));
+            } else if ((e - d) % 8 == h % rep) {
+                v = 1.0f;
+            }
+            out[((size_t) h * q + t) * da + e] = v;
+        });
+    }
+    // K and V [Hkv][sa][da]
+    {
+        const bool   q8   = K->type == GGML_TYPE_Q8_0;
+        const char * ksrc = (const char *) K->data;
+        const char * vsrc = (const char *) V->data;
+        const size_t k1 = K->nb[1], k2 = K->nb[2], v1 = V->nb[1], v2 = V->nb[2];
+        const float * sk  = (const float *) sinks->data;
+        const float   isc = 1.0f / kq_scale;
+        sycl::half * ko = Ka;
+        sycl::half * vo = Va;
+        stream->parallel_for(sycl::range<3>(Hkv, sa, da), [=](sycl::id<3> id) {
+            const int kh = id[0], tok = id[1], e = id[2];
+            float     kv = 0.0f, vv = 0.0f;
+            if (tok < seq) {
+                if (e < d) {
+                    if (q8) {
+                        const block_q8_0 * kb = (const block_q8_0 *) (ksrc + tok * k1 + kh * k2) + e / QK8_0;
+                        const block_q8_0 * vb = (const block_q8_0 *) (vsrc + tok * v1 + kh * v2) + e / QK8_0;
+                        kv = (float) kb->d * kb->qs[e % QK8_0];
+                        vv = (float) vb->d * vb->qs[e % QK8_0];
+                    } else {
+                        kv = *(const sycl::half *) (ksrc + tok * k1 + kh * k2 + e * sizeof(sycl::half));
+                        vv = *(const sycl::half *) (vsrc + tok * v1 + kh * v2 + e * sizeof(sycl::half));
+                    }
+                }
+            } else if (tok - seq < rep && e >= d) {
+                const int   j  = tok - seq;
+                const int   c  = (e - d) % 8;
+                const float hi = (float) (sycl::half) (sk[kh * rep + j] * isc);
+                if (c < rep) {
+                    if (c != j) {
+                        kv = e < d + 8 ? -1000.0f * isc : 0.0f;
+                    } else {
+                        kv = e < d + 8 ? hi : sk[kh * rep + j] * isc - hi;
+                    }
+                }
+            }
+            ko[((size_t) kh * sa + tok) * da + e] = kv;
+            vo[((size_t) kh * sa + tok) * da + e] = vv;
+        });
+    }
+    // mask [q][sa]: 0 for the sink tokens, -inf for the padding
+    {
+        const char * src = (const char *) mask->data;
+        const size_t nb1 = mask->nb[1];
+        sycl::half * out = Ma;
+        stream->parallel_for(sycl::range<2>(q, sa), [=](sycl::id<2> id) {
+            const int t = id[0], col = id[1];
+            sycl::half v;
+            if (col < seq) {
+                v = *(const sycl::half *) (src + t * nb1 + col * sizeof(sycl::half));
+            } else {
+                v = col - seq < rep ? sycl::half(0.0f) : sycl::half(-INFINITY);
+            }
+            out[(size_t) t * sa + col] = v;
+        });
+    }
+    const sycl::half scale_h = (sycl::half) (1.0f / kq_scale);
+    stream->single_task([=]() { *scale_dev = scale_h; });
+
+    static std::unordered_map<std::string, sdpa_partition> cache;
+    char keyb[128];
+    snprintf(keyb, sizeof(keyb), "%d:%d:%d:%d:%d:%d", ggml_sycl_get_device(), H, Hkv, q, sa, da);
+    auto it = cache.find(keyb);
+    if (it == cache.end()) {
+        const std::array<int64_t, 5> str{ (int64_t) Hkv * sa * da, (int64_t) sa * da, (int64_t) sa * da, da, 1 };
+        it = cache.emplace(keyb, build_sdpa(eng, H, Hkv, q, sa, da, str, str)).first;
+    }
+    sdpa_partition & E = it->second;
+    if (!E.ok) {
+        ggml_sycl_flash_attn_ext_tile(ctx, dst);
+        return;
+    }
+    auto id2ptr = [&](size_t r) -> void * {
+        if (r == E.id_q)     return Qa;
+        if (r == E.id_k)     return Ka;
+        if (r == E.id_v)     return Va;
+        if (r == E.id_scale) return scale_dev;
+        if (r == E.id_mask)  return Ma;
+        return nullptr;
+    };
+    std::vector<tensor> ti;
+    ti.reserve(E.ins.size());
+    for (auto & lt : E.ins) {
+        ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
+    }
+    tensor to(E.out, eng, Oa);
+    E.cp.execute(strm, ti, { to });
+
+    // out [H][q][da] -> dst [d][H][q], the extra dims dropped
+    {
+        const sycl::half * src = Oa;
+        float *            out = (float *) dst->data;
+        stream->parallel_for(sycl::range<3>(q, H, d), [=](sycl::id<3> id) {
+            const int t = id[0], h = id[1], e = id[2];
+            out[((size_t) t * H + h) * d + e] = (float) src[((size_t) h * q + t) * da + e];
+        });
+    }
+    if (ggml_sycl_info().device_count > 1) {
+        stream->wait_and_throw();
+    }
+}
+
 void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
+    if (dst->src[4]) {
+        ggml_sycl_flash_attn_ext_onednn_sinks(ctx, dst);
+        return;
+    }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
