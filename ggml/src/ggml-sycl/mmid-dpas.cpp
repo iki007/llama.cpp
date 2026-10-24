@@ -110,8 +110,11 @@ static void mul_mat_id_dpas_sycl(const void * weights, size_t expert_bytes, int 
 
 bool ggml_sycl_mul_mat_id_dpas_supported(const ggml_backend_sycl_context & ctx, ggml_type type) {
 #ifdef GGML_SYCL_HAS_DPAS
+    // Q8_0: Recursive Flint's expert down-projection (512 -> 2048, 6 of 256 experts, Arc Pro B70), against the
+    // per-expert loop: 2048 tokens 3.60 -> 0.94 ms, 512 tokens 4.23 -> 0.66 ms. GGML_SYCL_MMID_DPAS_Q8_0=0: the loop
+    static const bool q8_0 = ggml_sycl_get_env("GGML_SYCL_MMID_DPAS_Q8_0", 1) != 0;
     const auto arch = ggml_sycl_info().devices[ctx.device].hw_info.arch;
-    return g_ggml_sycl_enable_esimd && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) &&
+    return g_ggml_sycl_enable_esimd && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K || (type == GGML_TYPE_Q8_0 && q8_0)) &&
            (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31);
 #else
     GGML_UNUSED(ctx);
@@ -137,6 +140,10 @@ void ggml_sycl_mul_mat_id_dpas(ggml_type type, bool reordered, const void * weig
         case GGML_TYPE_Q6_K:
             GGML_ASSERT(reordered);
             mul_mat_id_dpas_sycl<dpas_tile_traits<GGML_TYPE_Q6_K>, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            GGML_ASSERT(reordered);
+            mul_mat_id_dpas_sycl<dpas_tile_traits<GGML_TYPE_Q8_0>, 4>(weights, expert_bytes, ncols, nrows, y, y_rows, dst, dst_nb1, dst_nb2, row_mapping, tiles, n_tiles, stream);
             break;
         default:
             GGML_ABORT("no XMX mul_mat_id for %s", ggml_type_name(type));
