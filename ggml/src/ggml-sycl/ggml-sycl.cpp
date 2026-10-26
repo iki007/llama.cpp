@@ -52,6 +52,13 @@
 #    include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
 #    define GGML_SYCL_SUPPORT_VMM
 #endif
+// beginning in oneDNN 3.12.3, "Enabled matmul and inner product primitives compatibility with SYCL Graph native recording mode on Intel GPUs."
+#if GGML_SYCL_DNNL
+#    include "dnnl_version.h"
+#    if (DNNL_VERSION_MAJOR > 3 || (DNNL_VERSION_MAJOR == 3 && (DNNL_VERSION_MINOR > 12 || (DNNL_VERSION_MINOR == 12 && DNNL_VERSION_PATCH >= 3))))
+#        define GGML_SYCL_GRAPH_DNNL_SUPPORTED
+#    endif
+#endif
 #if defined(__INTEL_LLVM_COMPILER)
     #include <sycl/ext/intel/esimd.hpp>
 #endif
@@ -117,7 +124,8 @@ int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_gdn_fold = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmvq_wide = 1;
-int g_ggml_sycl_enable_xmx_esimd = 1;
+// upstream's XMX multi-column mat-vec (#29864): opt-in on this branch, whose own XMX kernels serve these batches
+int g_ggml_sycl_enable_xmx_esimd = 0;
 int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
 int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
 int g_ggml_sycl_prioritize_dmmv = 0;
@@ -449,7 +457,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_gdn_fold = ggml_sycl_get_env("GGML_SYCL_GDN_FOLD", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
-        g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
+        g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 0);
         g_ggml_sycl_xmx_max_cols = std::max(0, ggml_sycl_get_env("GGML_SYCL_XMX_MAX_COLS", GGML_SYCL_XMX_MAX_COLS_DEFAULT));
         g_ggml_sycl_xmx_glu_max_cols =
             std::clamp(ggml_sycl_get_env("GGML_SYCL_XMX_GLU_MAX_COLS", GGML_SYCL_XMX_GLU_MAX_COLS), 0, GGML_SYCL_XMX_GLU_MAX_COLS);
@@ -927,49 +935,6 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
 #else
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
 #endif
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-// Copy n_copies rows in one call. -sm tensor uploads split weights this way; the generic fallback does one set_tensor per row.
-static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
-                                                   const void * data, size_t offset, size_t size,
-                                                   size_t n_copies, size_t stride_tensor,
-                                                   size_t stride_data) try {
-    ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
-    const char * src = (const char *) data;
-    ggml_sycl_set_device(ctx->device);
-
-    if (stride_tensor != size || size > ctx->staging_slot_size || !ggml_sycl_buffer_init_staging(ctx)) {
-        // dst rows not contiguous, row larger than a staging slot, or no staging: same as the generic fallback
-        for (size_t i = 0; i < n_copies; ++i) {
-            ggml_backend_sycl_buffer_set_tensor(buffer, tensor, src + i * stride_data, offset + i * stride_tensor, size);
-        }
-        return;
-    }
-
-    // dst rows are contiguous: pack as many rows as fit into a staging slot and copy each slot with one memcpy
-    // a slot is only waited on when it is reused, so packing the next slot overlaps with the previous copies
-    queue_ptr    stream        = ctx->stream;
-    char *       dst           = (char *) tensor->data + offset;
-    const size_t rows_per_slot = ctx->staging_slot_size / size;
-    for (size_t i0 = 0; i0 < n_copies; i0 += rows_per_slot) {
-        const size_t n    = std::min(rows_per_slot, n_copies - i0);
-        const int    slot = ctx->staging.next;
-        ctx->staging.next = (ctx->staging.next + 1) % (int) ctx->staging.submitted.size();
-        if (ctx->staging.submitted[slot]) {
-            ctx->staging.events[slot].wait_and_throw();
-        }
-        char * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
-        for (size_t i = 0; i < n; ++i) {
-            memcpy(stage + i * size, src + (i0 + i) * stride_data, size);
-        }
-        ctx->staging.events[slot]    = stream->memcpy(dst + i0 * size, stage, n * size);
-        ctx->staging.submitted[slot] = true;
-    }
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -3297,6 +3262,11 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+#if GGML_SYCL_DNNL
+// F32 GEMMs below this size (row_diff * src1_ncols * ne10) call oneMKL directly instead of oneDNN
+static constexpr int64_t SYCL_F32_DNNL_MIN_GEMM_FLOPS = 256 * 256 * 256;
+#endif
+
 // 0 disables the src1 f16 conversion cache, restoring a fresh conversion per matmul.
 static inline bool ggml_sycl_src1_cache_enabled() {
     static const int e = ggml_sycl_get_env("GGML_SYCL_SRC1_CACHE", 1);
@@ -4871,6 +4841,16 @@ static bool reorder_qw_planar(const char * name, uint8_t * data_device, size_t s
     return true;
 }
 
+static bool reorder_qw_q4_0(uint8_t * data_device, const int ncols, const int nrows, size_t size, size_t offset,
+                            dpct::queue_ptr stream) {
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT((size_t) ncols * nrows / 2 == size / sizeof(block_q4_0) * (QK4_0 / 2));
+    return reorder_qw_planar<block_q4_0>(__func__, data_device, size, offsetof(block_q4_0, qs), QK4_0 / 2,
+        [](const block_q4_0 & x, int64_t ib, uint8_t * tail, int64_t) {
+            ((sycl::half *) tail)[ib] = x.d;
+        }, stream);
+}
+
 static bool reorder_qw_iq4_nl(uint8_t * data_device, const int ncols, const int nrows, size_t size, size_t offset,
                              dpct::queue_ptr stream) {
     GGML_ASSERT(size % sizeof(block_iq4_nl) == 0);
@@ -4914,18 +4894,6 @@ static bool reorder_qw_q8_0(uint8_t * data_device, const int ncols, const int nr
     return reorder_qw_planar<block_q8_0>(__func__, data_device, size, offsetof(block_q8_0, qs), QK8_0,
         [](const block_q8_0 & x, int64_t ib, uint8_t * tail, int64_t) {
             ((sycl::half *) tail)[ib] = x.d;
-        }, stream);
-}
-
-static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-    GGML_ASSERT(offset == 0);
-    return reorder_qw_planar<block_q4_K>(__func__, data_device, size, offsetof(block_q4_K, qs), QK_K / 2,
-        [](const block_q4_K & x, int64_t ib, uint8_t * tail, int64_t nblocks) {
-            uint8_t * scales = tail;
-            for (int j = 0; j < K_SCALE_SIZE; ++j) {
-                scales[ib * K_SCALE_SIZE + j] = x.scales[j];
-            }
-            ((sycl::half2 *) (scales + K_SCALE_SIZE * nblocks))[ib] = x.dm;
         }, stream);
 }
 
@@ -4975,6 +4943,18 @@ static bool reorder_qw_q8_0_moe(uint8_t * data_device, size_t expert_bytes, int6
         }
     }
     return true;
+}
+
+static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+    GGML_ASSERT(offset == 0);
+    return reorder_qw_planar<block_q4_K>(__func__, data_device, size, offsetof(block_q4_K, qs), QK_K / 2,
+        [](const block_q4_K & x, int64_t ib, uint8_t * tail, int64_t nblocks) {
+            uint8_t * scales = tail;
+            for (int j = 0; j < K_SCALE_SIZE; ++j) {
+                scales[ib * K_SCALE_SIZE + j] = x.scales[j];
+            }
+            ((sycl::half2 *) (scales + K_SCALE_SIZE * nblocks))[ib] = x.dm;
+        }, stream);
 }
 
 // Reorder each expert slice into a self-contained SoA layout.
@@ -5294,9 +5274,6 @@ static bool reorder_qw_iq3_s(uint8_t * data_device, size_t size, size_t offset, 
     return true;
 }
 
-// The MoE variants below lay each expert out as its dense counterpart above lays out a whole tensor, so an expert
-// slice stays self-contained for the reorder GEMV and the reorder-aware dequantization.
-
 static bool reorder_qw_iq3_xxs_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
     GGML_ASSERT(expert_bytes % sizeof(block_iq3_xxs) == 0);
     const int    blocks_per_expert = (int) (expert_bytes / sizeof(block_iq3_xxs));
@@ -5482,52 +5459,44 @@ static bool reorder_qw_q4_0_moe(uint8_t * data_device, size_t expert_bytes, int6
 
 static bool reorder_qw_q4_k_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
     GGML_ASSERT(expert_bytes % sizeof(block_q4_K) == 0);
-    const int     blocks_per_expert = (int) (expert_bytes / sizeof(block_q4_K));
-    const size_t  max_chunk_bytes   = 32u << 20;
-    const int64_t chunk_experts     = std::max<int64_t>(1, std::min<int64_t>(n_expert, (int64_t) (max_chunk_bytes / expert_bytes)));
+    const int    blocks_per_expert = (int) (expert_bytes / sizeof(block_q4_K));
+    const size_t total_bytes       = expert_bytes * (size_t) n_expert;
 
-    sycl_reorder_temp_buffer tmp(stream, (size_t) chunk_experts * expert_bytes);
+    sycl_reorder_temp_buffer tmp(stream, total_bytes);
     if (!tmp) {
-        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__,
-                      (size_t) chunk_experts * expert_bytes);
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, total_bytes);
         return false;
     }
     uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
 
-    // the queue is in-order: each chunk's copy into tmp_buf waits for the previous chunk's kernel
-    for (int64_t e0 = 0; e0 < n_expert; e0 += chunk_experts) {
-        const int64_t n_chunk = std::min(chunk_experts, n_expert - e0);
-        uint8_t *     chunk   = data_device + (size_t) e0 * expert_bytes;
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, total_bytes)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
 
-        sycl::event copy_event;
-        SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, chunk, (size_t) n_chunk * expert_bytes)));
-        if (!g_ggml_sycl_use_async_mem_op) {
-            copy_event.wait();
+    const int total_blocks = blocks_per_expert * (int) n_expert;
+    auto reorder_event = stream->parallel_for(total_blocks, [=](auto gb_) {
+        const int          gb   = gb_;
+        const int          e    = gb / blocks_per_expert;
+        const int          ib   = gb % blocks_per_expert;
+        const block_q4_K * x    = (const block_q4_K *) (tmp_buf + (size_t) e * expert_bytes);
+        uint8_t *          base = data_device + (size_t) e * expert_bytes;
+
+        auto * qs_ptr     = base;
+        auto * scales_ptr = qs_ptr + QK_K / 2 * blocks_per_expert;
+        auto * dm_ptr     = (sycl::half2 *) (scales_ptr + K_SCALE_SIZE * blocks_per_expert);
+
+        for (int j = 0; j < QK_K / 2; ++j) {
+            qs_ptr[ib * (QK_K / 2) + j] = x[ib].qs[j];
         }
-
-        const int total_blocks = blocks_per_expert * (int) n_chunk;
-        auto reorder_event = stream->parallel_for(total_blocks, [=](auto gb_) {
-            const int          gb   = gb_;
-            const int          e    = gb / blocks_per_expert;
-            const int          ib   = gb % blocks_per_expert;
-            const block_q4_K * x    = (const block_q4_K *) (tmp_buf + (size_t) e * expert_bytes);
-            uint8_t *          base = chunk + (size_t) e * expert_bytes;
-
-            auto * qs_ptr     = base;
-            auto * scales_ptr = qs_ptr + QK_K / 2 * blocks_per_expert;
-            auto * dm_ptr     = (sycl::half2 *) (scales_ptr + K_SCALE_SIZE * blocks_per_expert);
-
-            for (int j = 0; j < QK_K / 2; ++j) {
-                qs_ptr[ib * (QK_K / 2) + j] = x[ib].qs[j];
-            }
-            for (int j = 0; j < K_SCALE_SIZE; ++j) {
-                scales_ptr[ib * K_SCALE_SIZE + j] = x[ib].scales[j];
-            }
-            dm_ptr[ib] = x[ib].dm;
-        });
-        if (!g_ggml_sycl_use_async_mem_op) {
-            reorder_event.wait_and_throw();
+        for (int j = 0; j < K_SCALE_SIZE; ++j) {
+            scales_ptr[ib * K_SCALE_SIZE + j] = x[ib].scales[j];
         }
+        dm_ptr[ib] = x[ib].dm;
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
     }
     return true;
 }
@@ -6312,6 +6281,35 @@ static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, gg
     GGML_UNUSED(gate);
 }
 
+// Gate and up weights of one type on the XMX engines: one launch reads the activations once and applies the GLU.
+// Both weights must already be in the reorder layout. Returns false if the kernel declined.
+static bool ggml_sycl_mul_mat_glu_xmx(ggml_backend_sycl_context & ctx,
+                                      ggml_tensor *               glu,
+                                      ggml_tensor *               up,
+                                      const ggml_tensor *         wu,
+                                      const ggml_tensor *         wg,
+                                      const ggml_tensor *         act) {
+    const int64_t ne00 = wu->ne[0];
+    const int64_t ne11 = act->ne[1];
+
+    const queue_ptr stream           = ctx.stream();
+    const int       src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
+    const int       stride_y_bytes   = src1_padded_cols * (int) sizeof(block_q8_1) / QK8_1;
+
+    // log the up mat-mul: glu's own srcs are the two intermediates the fusion never materialises
+    scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/2, " : fused with gate + GLU (XMX)");
+
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(), (size_t) ne11 * stride_y_bytes);
+    char *                     src1_ddq = src1_q8_alloc.get();
+
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne00, (int) ne11,
+                                                          src1_padded_cols, stream);
+
+    return ggml_sycl_mul_mat_vec_q_glu_xmx(ctx.device, wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
+                                           (float *) glu->data, (int) ne00, (int) wu->ne[1], (int) ne11, stride_y_bytes,
+                                           /*stride_col_dst=*/(int) glu->ne[0], stream);
+}
+
 // Fused dense-FFN mat-vec for the {mul_mat(gate), mul_mat(up), GLU} subgraph at node_idx.
 // Returns false if it declined, in which case the caller runs the three nodes normally.
 static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
@@ -6522,6 +6520,14 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     }
 }
 
+// returns true when ggml_sycl_mul_mat_id may take a path that waits on the host (SYCL graph recording must skip it).
+// This branch's MUL_MAT_ID picks the fused kernel or the per-expert loop (host id readback) from the batch shape
+// (ggml_sycl_mul_mat_id_prefer_fused), so any MUL_MAT_ID node keeps a graph off.
+static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
+    GGML_UNUSED(dst);
+    return true;
+}
+
 // The fused kernel reads the whole expert once per routed row. The per-expert loop pays a fixed cost per expert
 // (host id sync, a launch and quantize per expert) but shares each expert's weights across its rows. On an Arc
 // Pro B70 the fused kernel wins up to 4 rows per expert while those rows touch at most ~40M weights, and loses
@@ -6555,8 +6561,6 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
 {
-    if (ggml_sycl_mul_mat_id_needs_sync(dst)) return false;
-
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
@@ -6627,8 +6631,7 @@ static void mmid_counting_sort_rows(
         int64_t n_ids, int64_t n_as, int64_t n_routed_rows,
         std::vector<int64_t> & expert_counts,
         std::vector<int64_t> & expert_row_offsets,
-        std::vector<mmid_row_mapping> & routed_row_src,
-        std::vector<mmid_row_mapping> & skipped_row_dst) {
+        std::vector<mmid_row_mapping> & routed_row_src) {
 
     // frequencies: how many routed rows each expert "owns"
     expert_counts.assign(n_as, 0);
@@ -6648,7 +6651,6 @@ static void mmid_counting_sort_rows(
 
     std::vector<int64_t> expert_row_next = expert_row_offsets;
     routed_row_src.resize(n_routed_rows);
-    skipped_row_dst.clear();
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
         for (int64_t id = 0; id < n_ids; id++) {
             const int32_t row_id_i = ids_host[iid1*n_ids + id];
@@ -6661,7 +6663,6 @@ static void mmid_counting_sort_rows(
             routed_row_src[routed_row] = {(int32_t) id, (int32_t) iid1};
         }
     }
-    routed_row_src.resize(expert_row_offsets[n_as]);
 }
 
 // Reads ids back into pinned host memory as a dense [ids->ne[0], ids->ne[1]] array and drains the queue, which also
@@ -6974,7 +6975,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             return;
         }
     }
-    GGML_ASSERT(ggml_sycl_mul_mat_id_needs_sync(dst));
 
     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
     if (src0->type == GGML_TYPE_MXFP4) {
@@ -7017,12 +7017,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
-
-            if (i02 == -1) { // skipped slot
-                SYCL_CHECK(CHECK_TRY_ERROR(
-                        stream->memset(dst_original + i1*nb1 + i2*nb2, 0, ne0*sizeof(float))));
-                continue;
-            }
 
             src0_row.data = src0_original + i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
@@ -8252,7 +8246,6 @@ static int ggml_sycl_fuse_mmv_epilogue(ggml_backend_sycl_context & ctx, ggml_cgr
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
-    ggml_sycl_set_main_device(sycl_ctx->device);
     // A tensor's bytes can be written between graphs (ggml_backend_tensor_set), and buffer
     // addresses are reused across graphs, so nothing survives the boundary.
     sycl_ctx->src1_f16_reset();

@@ -900,7 +900,7 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_pair) {
         res.reset();
     }
-    if (prefill_pairs && !model.hparams.no_alloc && !cparams.pipeline_parallel) {
+    if (prefill_pairs && !model.no_alloc() && !cparams.pipeline_parallel) {
         sched_pair.reset(ggml_backend_sched_new(
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_copy_callback(sched_pair.get(), sched_copy_experts, this);

@@ -1179,6 +1179,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // reseed per request rather than per round, or two identical requests differ
+        dflash2_seed[seq_id] = -1;
+
         // the limit is for prompt rows only (a context shift moves later rows below it)
         pos_inject[seq_id] = 0;
 
@@ -1385,6 +1388,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 const float p_min_eff = std::max(params.p_min, dp.p_min);
 
+                // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
+                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
+
+                // greedy keeps temperature 1, sampling uses the target's
+                const float temp = sample ? dp.temp : 1.0f;
+
+                if (sample && dflash2_seed[seq_id] != dp.seed) {
+                    dflash2_seed[seq_id] = dp.seed;
+                    // the default seed means random; mixed so it differs from the target's, as in spec_retune
+                    dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                }
+
+                std::vector<float>   probs;
+                std::vector<int32_t> sorted_idx;
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1393,8 +1411,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (p_min_eff > 0.0f) {
-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                    if (p_min_eff > 0.0f || sample) {
+                        // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
+                        probs.resize(top_k);
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);

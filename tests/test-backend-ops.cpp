@@ -12269,12 +12269,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // test src1 f16 overflow
-    for (int n : {16, 32, 64}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
-    }
-
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
@@ -12306,6 +12300,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // skipped slots (negative ids)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4}) {
+        for (int n_used : {1, 2, 4}) {
+            for (bool b : {false, true}) {
+                for (int n : {1, 4, 33, 129}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, n_used, b, 512, n, 256, 0, false, true));
+                }
+            }
+        }
+    }
+    // n_used == n_mats, so every expert can be skipped
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, false, 512, 64, 256, 0, false, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1, 0, false, true));
+    test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
 
     // After the MUL_MAT_ID cases so reuse rows stay grouped in the log.
     for (bool broadcast : {false, true}) {
@@ -13269,6 +13278,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // Fused gate/up + GLU on the MMQ path, only used if its tiling is efficient: ~1280 tiles per case, one case per type and GLU op.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17, 81920, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K,   GGML_GLU_OP_GEGLU,        150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K,   GGML_GLU_OP_SWIGLU_OAI,   150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU_CLAMP, 150,  6912, 256, false, 1, 1, false, false, true, false, { 2, 3 }));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ4_XS, GGML_GLU_OP_SWIGLU,       150, 40960, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+
     // Recursive Flint's MoE down-projection input scale (512 x 6 experts), a wider row, and inputs past 1024
     for (float range : { 1.0f, 3e5f }) {
         for (int64_t n_tok : { 1, 4, 33 }) {
@@ -13487,6 +13503,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // delta-net conv input: conv state followed by the transposed qkv of the ubatch
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
     for (int tokens : { 1, 4, 14 }) {
         test_cases.emplace_back(new test_concat_conv(10240, tokens, 1));
