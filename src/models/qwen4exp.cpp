@@ -709,13 +709,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the attention has stored K and V for every token; a draft context reads only the output rows from here on,
     // so the FFN does not run on the rest of a prompt batch
     if (inp_out_ids && cparams.embeddings_nextn_masked) {
-        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+        cur             = ggml_get_rows(ctx0, cur,             inp_out_ids);
+        attn_mix.inject = ggml_get_rows(ctx0, attn_mix.inject, inp_out_ids);
         res_hc = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens), inp_out_ids);
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
         inp_out_ids = nullptr;
     }
-    res_hc = build_hc_combine(res_hc, cur, inject, il);
+    res_hc = build_hc_combine(res_hc, cur, attn_mix.inject, il);
 
     hc_mix ffn_mix = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, il);
     cur    = ffn_mix.cur;
