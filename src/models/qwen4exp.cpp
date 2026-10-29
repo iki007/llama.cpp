@@ -1044,12 +1044,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_build_forward_expand(gf, sel_idx);
 
     // Keep the mask chain together so backends can omit its expanded intermediates.
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, type_mask, n_kv + n_sel, 1, 1, 1);
     mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
     mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
     mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
 
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, type_mask, n_sel, 1, 1, 1);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
     zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
     zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
