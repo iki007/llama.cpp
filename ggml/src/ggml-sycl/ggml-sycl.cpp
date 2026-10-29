@@ -6633,13 +6633,15 @@ static void mmid_counting_sort_rows(
         std::vector<int64_t> & expert_row_offsets,
         std::vector<mmid_row_mapping> & routed_row_src) {
 
-    // frequencies: how many routed rows each expert "owns"
+    // frequencies: how many routed rows each expert "owns"; an id of -1 skips the slot (no row, see ggml_mul_mat_id)
     expert_counts.assign(n_as, 0);
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
         for (int64_t id = 0; id < n_ids; id++) {
             const int32_t row_id_i = ids_host[iid1*n_ids + id];
-            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-            expert_counts[row_id_i]++;
+            GGML_ASSERT(row_id_i == -1 || (row_id_i >= 0 && row_id_i < n_as));
+            if (row_id_i != -1) {
+                expert_counts[row_id_i]++;
+            }
         }
     }
 
@@ -6648,13 +6650,16 @@ static void mmid_counting_sort_rows(
     for (int64_t i02 = 0; i02 < n_as; i02++) {
         expert_row_offsets[i02 + 1] = expert_row_offsets[i02] + expert_counts[i02];
     }
+    GGML_ASSERT(expert_row_offsets[n_as] <= n_routed_rows);
 
     std::vector<int64_t> expert_row_next = expert_row_offsets;
-    routed_row_src.resize(n_routed_rows);
+    routed_row_src.resize(expert_row_offsets[n_as]);
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
         for (int64_t id = 0; id < n_ids; id++) {
             const int32_t row_id_i = ids_host[iid1*n_ids + id];
-            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+            if (row_id_i == -1) {
+                continue;
+            }
 
             // find and validate the next free row for a given expert (row_id_i)
             const int64_t routed_row = expert_row_next[row_id_i]++;
@@ -6663,6 +6668,35 @@ static void mmid_counting_sort_rows(
             routed_row_src[routed_row] = {(int32_t) id, (int32_t) iid1};
         }
     }
+}
+
+// Zeroes the dst row (slot, token) of every slot whose id is -1. Reads ids on the device, so it needs no host list:
+// the routes above compute the other rows and leave these untouched.
+static void ggml_sycl_mul_mat_id_zero_skipped(ggml_backend_sycl_context & ctx, const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    const char *   ids_d   = (const char *) ids->data;
+    char *         dst_d   = (char *) dst->data;
+    const size_t   ids_nb0 = ids->nb[0];
+    const size_t   ids_nb1 = ids->nb[1];
+    const size_t   nb1     = dst->nb[1];
+    const size_t   nb2     = dst->nb[2];
+    const int64_t  n_ids   = ids->ne[0];
+    const int64_t  n_slots = ids->ne[0] * ids->ne[1];
+    const int64_t  ne0     = dst->ne[0];
+    const uint32_t wg      = (uint32_t) std::min<int64_t>(ne0, 256);
+    ctx.stream()->parallel_for(sycl::nd_range<2>(sycl::range<2>(n_slots, wg), sycl::range<2>(1, wg)),
+                               [=](sycl::nd_item<2> it) {
+        const int64_t s  = it.get_group(0);
+        const int64_t id = s % n_ids;
+        const int64_t t  = s / n_ids;
+        if (*(const int32_t *) (ids_d + id*ids_nb0 + t*ids_nb1) != -1) {
+            return;
+        }
+        float * row = (float *) (dst_d + id*nb1 + t*nb2);
+        for (int64_t i = it.get_local_id(1); i < ne0; i += wg) {
+            row[i] = 0.0f;
+        }
+    });
 }
 
 // Reads ids back into pinned host memory as a dense [ids->ne[0], ids->ne[1]] array and drains the queue, which also
@@ -6783,6 +6817,13 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
     mmid_counting_sort_rows(ids, ids_host, n_ids, n_as, n_routed_rows,
                             expert_row_counts, expert_row_offsets, routed_row_src);
 
+    // slots with an id of -1 have no row: only the valid rows are gathered, multiplied and scattered (the caller zeroes
+    // the skipped ones); with none left there is nothing to scatter
+    const int64_t n_valid_rows = (int64_t) routed_row_src.size();
+    if (n_valid_rows == 0) {
+        return true;
+    }
+
     // one grouped XMX GEMM per weight instead of the per-expert loop (reordered weights of a type it
     // covers): it reads the expert tiles from a small table uploaded with the row mapping
     bool use_dpas = src1->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0;
@@ -6817,7 +6858,7 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
     ggml_sycl_pool_alloc<ggml_sycl_mmid_tile> dev_tiles(ctx.pool(), std::max<size_t>(tiles_host.size(), 1));
 
     // async upload from pinned memory: the buffer stays untouched until the next ids readback drains the queue
-    const size_t mapping_nbytes = n_routed_rows*sizeof(mmid_row_mapping);
+    const size_t mapping_nbytes = n_valid_rows*sizeof(mmid_row_mapping);
     const size_t tiles_nbytes   = tiles_host.size()*sizeof(ggml_sycl_mmid_tile);
     char *       mapping_host   = (char *) ctx.mmid_row_mapping_pinned.reserve(*stream, mapping_nbytes + tiles_nbytes);
     std::memcpy(mapping_host, routed_row_src.data(), mapping_nbytes);
@@ -6847,7 +6888,7 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         const ggml_tensor src0_expert = expert_row(src0, 0);
         if (use_dpas || (fp16_weights && ggml_is_contiguous(&src0_expert) && dst->op_params[0] == GGML_PREC_DEFAULT &&
             src1->type == GGML_TYPE_F32 &&
-            n_routed_rows >= 2*n_as && std::count_if(expert_row_counts.begin(), expert_row_counts.end(),
+            n_valid_rows >= 2*n_as && std::count_if(expert_row_counts.begin(), expert_row_counts.end(),
                                                   [=](int64_t rows) { return rows > fp16_min_rows; }) > 1)) {
             src1_as_f16.alloc(n_routed_rows*ne10);
         }
@@ -6859,7 +6900,7 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
 
     {
         sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
-        sycl::range<3> grid_dims(1, 1, n_routed_rows);
+        sycl::range<3> grid_dims(1, 1, n_valid_rows);
         stream->submit([&](sycl::handler &cgh) {
             char *__restrict src1_contiguous_get =
                 use_dpas ? nullptr : src1_contiguous.get();
@@ -6885,7 +6926,7 @@ static bool ggml_sycl_mul_mat_id_sorted(ggml_backend_sycl_context & ctx, ggml_te
         for (size_t w = 0; w < weights.size(); w++) {
             const ggml_tensor * wt = weights.begin()[w];
             ggml_sycl_mul_mat_id_dpas(wt->type, !dpas_plain(wt), wt->data, wt->nb[2], (int) ne00, (int) ne01, src1_as_f16.get(),
-                                      (int) n_routed_rows, (float *) dst_final.begin()[w], nb1, nb2, dev_row_mapping,
+                                      (int) n_valid_rows, (float *) dst_final.begin()[w], nb1, nb2, dev_row_mapping,
                                       dev_tiles.get(), (int) tiles_host.size(), stream);
         }
         return true;
@@ -7007,10 +7048,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
     if (ne12 == 1) {
+        bool skipped = false;
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = ids_host[iid1*n_ids + id];
-                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                GGML_ASSERT(i02 == -1 || (i02 >= 0 && i02 < n_as));
+                if (i02 == -1) {
+                    skipped = true;
+                    continue;
+                }
 
                 const int64_t i11 = id % ne11;
                 const int64_t i12 = iid1;
@@ -7025,6 +7071,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
             }
         }
+        if (skipped) {
+            ggml_sycl_mul_mat_id_zero_skipped(ctx, ids, dst);
+        }
     } else {
         const int64_t n_routed_rows = ids->ne[1] * n_ids;
         ggml_sycl_pool_alloc<char>             dst_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
@@ -7032,7 +7081,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
         if (!ggml_sycl_mul_mat_id_sorted(ctx, dst, src1, ids, ids_host, { src0 }, { dst_contiguous.get() },
                                          { (char *) dst->data }, dev_row_mapping.get())) {
-            ggml_sycl_mul_mat_id_scatter(ctx, dst, dst_contiguous.get(), dev_row_mapping.get(), n_routed_rows);
+            ggml_sycl_mul_mat_id_scatter(ctx, dst, dst_contiguous.get(), dev_row_mapping.get(),
+                                         (int64_t) ctx.mmid_row_mapping_host.size());
+        }
+        if ((int64_t) ctx.mmid_row_mapping_host.size() < n_routed_rows) {
+            ggml_sycl_mul_mat_id_zero_skipped(ctx, ids, dst);
         }
     }
 }
@@ -7082,8 +7135,13 @@ static bool ggml_sycl_mul_mat_id_glu_loop(ggml_backend_sycl_context & ctx, ggml_
         stream->parallel_for(sycl::range<1>(n_routed_rows*ne0), [=](sycl::id<1> i) { u[i] = op_gelu(g[i]) * u[i]; });
     }
 
+    const int64_t n_valid_rows = (int64_t) ctx.mmid_row_mapping_host.size();
     if (!in_place) {
-        ggml_sycl_mul_mat_id_scatter(ctx, glu, up_sorted.get(), dev_row_mapping.get(), n_routed_rows);
+        ggml_sycl_mul_mat_id_scatter(ctx, glu, up_sorted.get(), dev_row_mapping.get(), n_valid_rows);
+    }
+    // slots with an id of -1: glu(0, 0) = 0 (the in-place GLU above also ran over their unwritten rows)
+    if (n_valid_rows < n_routed_rows) {
+        ggml_sycl_mul_mat_id_zero_skipped(ctx, ids, glu);
     }
     return true;
 }

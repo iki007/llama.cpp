@@ -3475,8 +3475,6 @@ static void mul_mat_vec_q_moe_reorder_rows(
     const int expert_idx = item_ct1.get_group(1);
     const int i02        = ids_dev[(size_t) token * ids_token_stride + expert_idx];
 
-    const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
-    [[maybe_unused]] const char * vgate = has_fusion ? (const char *) vgate_base + (size_t) i02 * expert_weight_stride : nullptr;
     const char * vy  = (const char *) vy_base + (size_t) token * src1_token_stride + (size_t) expert_idx * src1_row_stride;
     float *      dst = (float *) ((char *) dst_base + (size_t) token * dst_token_stride + (size_t) expert_idx * dst_row_stride);
 
@@ -3486,6 +3484,18 @@ static void mul_mat_vec_q_moe_reorder_rows(
     if (row0 >= nrows) {
         return;
     }
+
+    if (i02 == -1) { // skipped slot: its rows are zero, with or without the fused GLU (glu(0, 0) = 0)
+        if (sg.leader()) {
+            for (int r = 0; r < MOE_ROWS_PER_SG && row0 + r < nrows; r++) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+    [[maybe_unused]] const char * vgate = has_fusion ? (const char *) vgate_base + (size_t) i02 * expert_weight_stride : nullptr;
 
     const int     blocks_per_row              = ncols / block_traits::qk;
     constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
