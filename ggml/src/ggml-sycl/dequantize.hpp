@@ -1300,10 +1300,14 @@ inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __res
     const float m2 = dmin * m;
 
     sycl::vec<uint8_t, n> q_vec = vec_aligned_load<uint8_t, n>(qs_ptr + 32 * il + n * ir);
+
+    sycl::vec<dst_t, n> lo, hi;
     for (int l = 0; l < n; ++l) {
-        y[l + 0]  = d1 * (q_vec[l] & 0xF) - m1;
-        y[l + 32] = d2 * (q_vec[l] >> 4) - m2;
+        lo[l] = d1 * (q_vec[l] & 0xF) - m1;
+        hi[l] = d2 * (q_vec[l] >> 4) - m2;
     }
+    *reinterpret_cast<sycl::vec<dst_t, n> *>(y +  0) = lo;
+    *reinterpret_cast<sycl::vec<dst_t, n> *>(y + 32) = hi;
 }
 
 template <typename dst_t>
@@ -1375,13 +1379,15 @@ static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * 
                                           uint8_t * scales_local, const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
 
 #if QK_K == 256
-    // assume 64 threads
+    // remapped decomposition: 32 threads, each emitting two aligned vec<dst_t,4>
+    // from four consecutive ql/qh bytes; a 4-element run shares one scale pair,
+    // so the per-element math and output are identical to the 64-thread kernel.
     const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t il  = tid / 16;   // 0...3
-    const int64_t ir  = tid % 16;   // 0...15
+    const int64_t il  = tid / 8;   // 0...3
+    const int64_t ir  = tid % 8;   // 0...7
     const int64_t is  = 2 * il;
 
-    dst_t * y = yy + 64 * il + 2 * ir;
+    dst_t * y = yy + 64 * il + 4 * ir;
 
     const uint8_t * base = static_cast<const uint8_t *>(vx);
 
@@ -1399,8 +1405,8 @@ static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * 
     const float dall = dm_values.x();
     const float dmin = dm_values.y();
 
-    const uint8_t * ql = qs_ptr + 32 * il + 2 * ir;
-    const uint8_t * qh = qh_ptr + 2 * ir;
+    const uint8_t * ql = qs_ptr + 32 * il + 4 * ir;   // four consecutive bytes
+    const uint8_t * qh = qh_ptr + 4 * ir;             // four consecutive bytes
 
     if (tid < K_SCALE_SIZE) {
         scales_local[tid] = scales_ptr[tid];
@@ -1414,12 +1420,18 @@ static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * 
     get_scale_min_k4(is + 1, scales_local, sc, m);
     const float d2 = dall * sc; const float m2 = dmin * m;
 
-    uint8_t hm  = 1 << (2 * il);
-    y[ 0] = d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1;
-    y[ 1] = d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1;
-    hm <<= 1;
-    y[32] = d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2;
-    y[33] = d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2;
+    const uint8_t hm_lo = 1 << (2 * il);
+    const uint8_t hm_hi = 1 << (2 * il + 1);
+
+    sycl::vec<dst_t, 4> lo, hi;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        lo[j] = d1 * ((ql[j] & 0xF) + (qh[j] & hm_lo ? 16 : 0)) - m1;
+        hi[j] = d2 * ((ql[j] >>  4) + (qh[j] & hm_hi ? 16 : 0)) - m2;
+    }
+
+    *reinterpret_cast<sycl::vec<dst_t, 4> *>(y +  0) = lo;
+    *reinterpret_cast<sycl::vec<dst_t, 4> *>(y + 32) = hi;
 #else
     GGML_UNUSED(ib); GGML_UNUSED(tid); GGML_UNUSED(yy); GGML_UNUSED(scales_local); GGML_UNUSED(n_blocks);
     GGML_ABORT("Q5_K reorder dequantize not supported for QK_K != 256");
@@ -1550,11 +1562,13 @@ static void dequantize_block_q6_K_reorder(const void * __restrict__ vx, dst_t * 
 template <typename dst_t>
 static void dequantize_block_q6_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t ib,
                                           const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
-
+    // remapped decomposition: each of the 64 threads emits one aligned vec<dst_t,4>
+    // instead of four scalars strided 32 apart. The four elements of a run share one
+    // 16-element scale group, one ql nibble source and one qh bit pair, so the
+    // per-element math and the output are identical to the scalar kernel.
     const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t ip  = tid / 32;       // ip is 0 or 1
-    const int64_t il  = tid - 32 * ip;  // 0...32
-    const int64_t is  = 8 * ip + il / 16;
+    const int64_t ip  = tid / 32;             // 128-element half: 0 or 1
+    const int64_t eh0 = 4 * (tid - 32 * ip);  // base element within the half
 
     const uint8_t *   base_ptr           = static_cast<const uint8_t *>(vx);
     const auto        ql_offset          = ib * (QK_K / 2);
@@ -1566,16 +1580,18 @@ static void dequantize_block_q6_K_reorder(const void * __restrict__ vx, dst_t * 
     const uint8_t *   scales_ptr         = base_ptr + base_scales_offset;
     const ggml_half * d                  = (const ggml_half *) (base_ptr + base_d_offset) + ib;
 
-    dst_t * y = yy + 128 * ip + il;
+    const int        shift = eh0 >= 64 ? 4 : 0;      // low or high ql nibble
+    const int        qb    = 2 * (eh0 / 32);         // qh bit pair: 0/2/4/6
+    const int8_t     sc0   = reinterpret_cast<const int8_t *>(scales_ptr + 8 * ip + eh0 / 16)[0];
+    const uint8_t *  ql4   = ql_ptr + 64 * ip + (eh0 & 63);
+    const uint8_t *  qh4   = qh_ptr + 32 * ip + (eh0 & 31);
 
-    const uint8_t * ql = ql_ptr + 64 * ip + il;
-    const uint8_t   qh = *(qh_ptr + 32 * ip + il);
-    const int8_t *  sc = reinterpret_cast<const int8_t *>(scales_ptr + is);
-
-    y[0]  = *d * sc[0] * ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
-    y[32] = *d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
-    y[64] = *d * sc[4] * ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32);
-    y[96] = *d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+    sycl::vec<dst_t, 4> v;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j] = *d * sc0 * ((int8_t) (((ql4[j] >> shift) & 0xF) | ((((qh4[j] >> qb) & 3)) << 4)) - 32);
+    }
+    *reinterpret_cast<sycl::vec<dst_t, 4> *>(yy + 128 * ip + eh0) = v;
 }
 
 template<typename dst_t>
