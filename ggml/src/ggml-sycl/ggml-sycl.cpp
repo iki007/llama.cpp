@@ -10173,18 +10173,24 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
                 ctx->ce_dog = std::thread([ctx]() {
                     auto stuck_since = std::chrono::steady_clock::now();
                     bool stuck       = false;
+                    uint32_t last0 = 0, last1 = 0;
                     while (!ctx->ce_dog_stop) {
                         const uint32_t seq = __atomic_load_n(&ctx->hseq, __ATOMIC_RELAXED);
-                        const bool behind  = __atomic_load_n(&ctx->hflag[0], __ATOMIC_RELAXED) < seq ||
-                                             __atomic_load_n(&ctx->hflag[16], __ATOMIC_RELAXED) < seq;
-                        if (!behind) {
+                        const uint32_t f0  = __atomic_load_n(&ctx->hflag[0], __ATOMIC_RELAXED);
+                        const uint32_t f1  = __atomic_load_n(&ctx->hflag[16], __ATOMIC_RELAXED);
+                        // a long graph keeps the flags behind the host while they still advance: only a flag that
+                        // stops moving for 2 s is lost (a 2-session 52k prefill batch ran > 2 s behind and was released)
+                        const bool moved = f0 != last0 || f1 != last1;
+                        last0 = f0;
+                        last1 = f1;
+                        if ((f0 >= seq && f1 >= seq) || moved) {
                             stuck = false;
                         } else if (!stuck) {
                             stuck       = true;
                             stuck_since = std::chrono::steady_clock::now();
                         } else if (std::chrono::steady_clock::now() - stuck_since > std::chrono::seconds(2)) {
-                            GGML_LOG_ERROR("ggml_sycl_comm: exchange flags %u / %u behind sequence %u for 2 s: released\n",
-                                           ctx->hflag[0], ctx->hflag[16], seq);
+                            GGML_LOG_ERROR("ggml_sycl_comm: exchange flags %u / %u behind sequence %u, unchanged for 2 s: released\n",
+                                           f0, f1, seq);
                             __atomic_store_n(&ctx->hflag[0],  0xfffffff0u, __ATOMIC_SEQ_CST);
                             __atomic_store_n(&ctx->hflag[16], 0xfffffff0u, __ATOMIC_SEQ_CST);
                             ctx->ce_broken = true;
