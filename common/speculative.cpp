@@ -1265,8 +1265,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // of n passes of a few rows that each read the draft weights again (LiliCorr keeps its per-sequence path,
         // its projected rows are stored per sequence below)
         if (!is_lilicorr) {
-            std::vector<const float *> layers(target_layer_ids_n);
-            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            // device features: each row is the target batch row in the target's device buffer, no host copy
+            std::vector<const float *> layers(use_dev_features ? 0 : target_layer_ids_n);
+            for (uint32_t k = 0; k < layers.size(); ++k) {
                 layers[k] = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                 if (!layers[k]) {
                     GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
@@ -1303,12 +1304,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (p < pos_inject[seq_id]) {
                         continue;
                     }
-                    float * dst = features_buf.data() + (size_t) n_cur * n_embd_enc;
-                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                        std::memcpy(dst + k * (size_t) n_embd_tgt, layers[k] + (size_t) row * n_embd_tgt, (size_t) n_embd_tgt * sizeof(float));
-                    }
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ dst, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    if (use_dev_features) {
+                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                    } else {
+                        float * dst = features_buf.data() + (size_t) n_cur * n_embd_enc;
+                        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                            std::memcpy(dst + k * (size_t) n_embd_tgt, layers[k] + (size_t) row * n_embd_tgt, (size_t) n_embd_tgt * sizeof(float));
+                        }
+                        batch_inject.add_embd({ dst, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    }
                     if (++n_cur == n_ubatch && !flush()) {
                         return false;
                     }
