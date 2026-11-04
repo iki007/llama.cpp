@@ -1034,7 +1034,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_swa_all = 0;
     // per seq: prompt rows before this position are not injected (the draft never reads them)
     std::vector<llama_pos> pos_inject;
-    // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
+    // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=1 enables;
+    // off by default here: under -sm tensor the buffer sits on the Meta device and the 27B decoded 4.6x slower,
+    // one card measured no gain)
     bool use_dev_features = false;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -1163,7 +1165,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const bool ascending = std::adjacent_find(target_layer_ids, target_layer_ids + target_layer_ids_n,
                     [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
 
-            use_dev_features = !is_lilicorr && ascending && (env == nullptr || atoi(env) != 0);
+            use_dev_features = !is_lilicorr && ascending && env != nullptr && atoi(env) != 0;
             if (use_dev_features) {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
                 use_dev_features = llama_supports_embd_row(ctx_dft);
