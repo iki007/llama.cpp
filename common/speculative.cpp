@@ -1034,6 +1034,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_swa_all = 0;
     // per seq: prompt rows before this position are not injected (the draft never reads them)
     std::vector<llama_pos> pos_inject;
+    // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
+    bool use_dev_features = false;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1649,9 +1651,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 backend_chains[seq_id] = chain;
             }
         }
-
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         // Qwen drafts borrow weights and keep their own KV cache.
         char arch[64] = {};

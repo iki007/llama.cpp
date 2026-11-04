@@ -9701,6 +9701,11 @@ struct ggml_backend_sycl_comm_context {
             }
         }
     }
+    // SYCL_ENABLE_DEFAULT_CONTEXTS=1 sets comm_exchange_fast on Linux - PR #30956
+    using exchange_fn_t = void (*)(ggml_backend_sycl_comm_context * comm, queue_ptr q0, queue_ptr q1,
+                                   void * dst0, const void * src1, void * dst1, const void * src0,
+                                   size_t nbytes);
+    exchange_fn_t comm_exchange = nullptr; // Moves same context check out of hot path; tests only once
 
     void free_host() {
         for (int i = 0; i < 2; ++i) {
@@ -10302,6 +10307,15 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
             }
         }
     }
+
+#if defined(_WIN32) || defined(_WIN64) // Not supported on Windows
+    ctx->comm_exchange = ggml_sycl_comm_exchange;
+#else
+    // SYCL_ENABLE_DEFAULT_CONTEXTS=1 sets comm_exchange_fast on Linux - PR #30956
+    ctx->comm_exchange = (sctx0->stream()->get_context() == sctx1->stream()->get_context())
+                       ? ggml_sycl_comm_exchange_fast
+                       : ggml_sycl_comm_exchange;
+#endif
     return ctx;
 }
 catch (const sycl::exception &) { return nullptr; }

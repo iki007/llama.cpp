@@ -2429,54 +2429,6 @@ static bool ggml_sycl_dmmv_dpas(int device, ggml_type type, int64_t ncols, int64
 
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
-static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
-                                                     float *dst, const int ncols,
-                                                     const int nrows,
-                                                     dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
-    const int ny = 2 / K_QUANTS_PER_ITERATION;
-    const int block_num_y = (nrows + ny - 1) / ny;
-    const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, ny, WARP_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(block_nums * block_dims, block_dims),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            dequantize_mul_mat_vec_q4_k_reorder(vx, y, dst, ncols, nrows, item_ct1);
-        });
-}
-
-static void dequantize_mul_mat_vec_q5_K_sycl_reorder(const void *vx, const float *y,
-                                                     float *dst, const int ncols,
-                                                     const int nrows,
-                                                     dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
-    const int ny = 2 / K_QUANTS_PER_ITERATION;
-    const int block_num_y = (nrows + ny - 1) / ny;
-    const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, ny, WARP_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(block_nums * block_dims, block_dims),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            dequantize_mul_mat_vec_q5_k_reorder(vx, y, dst, ncols, nrows, item_ct1);
-        });
-}
-
-static void dequantize_mul_mat_vec_q6_K_sycl_reorder(const void *vx, const float *y,
-                                                     float *dst, const int ncols,
-                                                     const int nrows,
-                                                     dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
-    const int ny = 2 / K_QUANTS_PER_ITERATION;
-    const int block_num_y = (nrows + ny - 1) / ny;
-    const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, ny, WARP_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(block_nums * block_dims, block_dims),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            dequantize_mul_mat_vec_q6_k_reorder(vx, y, dst, ncols, nrows, item_ct1);
-        });
-}
-
 bool ggml_sycl_dmmv_dpas_supported(int device, ggml_type type, int64_t ncols, int64_t nrows, int64_t ncols_y) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     return ggml_sycl_dmmv_dpas(device, type, ncols, nrows, ncols_y);

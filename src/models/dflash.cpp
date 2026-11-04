@@ -477,7 +477,7 @@ public:
     const llama_token mask_id;
 };
 
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 

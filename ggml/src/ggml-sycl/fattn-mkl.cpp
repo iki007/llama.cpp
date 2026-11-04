@@ -281,7 +281,6 @@ struct mkl_fa_kv_desc {
     int64_t              D    = 0;      // ne[0]
     int64_t              nb1  = 0;      // byte stride, seq dim
     int64_t              nb2  = 0;      // byte stride, head dim
-    int64_t              nb3  = 0;      // byte stride, batch dim
     mkl_fa_kv_desc_mode  mode = MKL_FA_KV_MODE_F16_DENSE;
     int64_t              ts   = 0;      // type size (mode 3 base offset)
     int64_t              s01  = 0;      // nc row stride in blocks (mode 3)
@@ -295,7 +294,6 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
     d.D    = T->ne[0];
     d.nb1  = (int64_t)T->nb[1];
     d.nb2  = (int64_t)T->nb[2];
-    d.nb3  = (int64_t)T->nb[3];
     d.ts   = (int64_t)ggml_type_size(T->type);
 
     if (T->type == GGML_TYPE_F16) {
@@ -318,20 +316,19 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
 // Dequant one KV-head chunk into a dense [this_chunk x D] fp16 buffer.
 static void mkl_fa_dequant_chunk(
     dpct::queue_ptr stream, const mkl_fa_kv_desc & d, ggml_tensor * dst_ctx,
-    sycl::half * out, int ikvh, int ib, int chunk_start, int this_chunk) {
+    sycl::half * out, int ikvh, int chunk_start, int this_chunk) {
 
     const int64_t D = d.D;
     switch (d.mode) {
         case MKL_FA_KV_MODE_F16_DENSE: {
-            // ib * nb3 selects this batch's KV (nb[3] != ne[1]*nb[1] for batched KV views)
             const char * base = d.data + (int64_t)ikvh * d.nb2
-                + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
+                + (int64_t)chunk_start * d.nb1;
             stream->memcpy(out, base, (size_t)this_chunk * D * sizeof(sycl::half));
             break;
         }
         case MKL_FA_KV_MODE_F16_INTERLEAVED: {
             const char * base = d.data + (int64_t)ikvh * d.nb2
-                + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
+                + (int64_t)chunk_start * d.nb1;
             const int64_t row_halfs = d.nb1 / (int64_t)sizeof(sycl::half);
             const sycl::half * src = (const sycl::half *)base;
             stream->parallel_for(
@@ -345,7 +342,7 @@ static void mkl_fa_dequant_chunk(
         }
         case MKL_FA_KV_MODE_QUANT_CONTIG: {
             const char * base = d.data + (int64_t)ikvh * d.nb2
-                + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
+                + (int64_t)chunk_start * d.nb1;
             to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(d.type, dst_ctx);
             to_fp16(base, out, (int64_t)this_chunk * D, stream);
             break;
@@ -353,7 +350,7 @@ static void mkl_fa_dequant_chunk(
         default: {  // MKL_FA_KV_MODE_QUANT_NC
             to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(d.type);
             const int64_t base_blocks = (int64_t)ikvh * d.s02
-                + (int64_t)chunk_start * d.s01 + (int64_t)ib * d.nb3 / d.ts;
+                + (int64_t)chunk_start * d.s01;
             const char * base = d.data + base_blocks * d.ts;
             // ne02 = ne03 = 1 → s02/s03 inert; head+chunk offset carried by base.
             to_fp16(base, out, D, this_chunk, 1, 1, d.s01, d.s02, d.s02, stream);
