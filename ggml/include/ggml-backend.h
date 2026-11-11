@@ -377,6 +377,10 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // two allocated schedulers with graphs of the same split structure, computed in lockstep (a meta backend
+    // interleaves their sub-graphs)
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_pair_async(ggml_backend_sched_t sched_a, struct ggml_cgraph * graph_a,
+                                                                              ggml_backend_sched_t sched_b, struct ggml_cgraph * graph_b);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
@@ -444,6 +448,11 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // number of graphs a meta backend keeps prepared (default 1: the last graph computed); raises it to at least
+    // n_graphs, no-op for other backends. A caller that alternates between graphs allocated in several schedulers
+    // must keep all of them prepared.
+    GGML_API void ggml_backend_meta_set_n_graphs(ggml_backend_t backend, size_t n_graphs);
 
     //
     // Utils

@@ -154,11 +154,13 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // compute == false: build, allocate and set the inputs only (a new graph every time), for graph_compute_pair
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   compute = true);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -279,6 +281,9 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // two prefill ubatches allocated in sched and sched_pair, computed together (ggml_backend_sched_graph_compute_pair_async)
+    ggml_status graph_compute_pair(ggml_cgraph * gf_a, ggml_cgraph * gf_b);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -367,6 +372,9 @@ private:
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
 
+        // backend node count of each sequence's sampler that the last scheduler reserve made room for
+        std::map<llama_seq_id, uint32_t> n_nodes_reserved;
+
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
@@ -404,6 +412,13 @@ private:
     ggml_backend_sched_ptr sched;
 
     sched_params sched_params_cur;
+
+    // LLAMA_PREFILL_PAIRS=1 with a tensor split: a second scheduler with its own compute buffers, so that two
+    // consecutive ubatches of a batch are computed together and one ubatch's exchange between the devices runs while
+    // the other computes; the graphs of the second ubatch go to gf_res_pair
+    bool                                prefill_pairs = false;
+    ggml_backend_sched_ptr              sched_pair;
+    std::array<llm_graph_result_ptr, 2> gf_res_pair;
 
     bool sched_need_reserve = true;
 
@@ -455,6 +470,34 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // graph slots: a batch whose shape differs from the previous one finds its graph still allocated in another
+    // scheduler instead of rebuilding it. Slot 0 is the scheduler reserved for full batches, the others are made on
+    // demand for decode-size batches. sched / gf_res_prev / gf_res_prev_active hold the slot gslot_cur, whose entry
+    // in gslots is empty meanwhile.
+    struct graph_slot {
+        ggml_backend_sched_ptr              sched;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *                  gf_res_prev_active = nullptr;
+
+        // the batch the slot was last used for
+        uint32_t n_tokens = 0;
+        bool     outputs  = false;
+        uint64_t t_last   = 0;
+    };
+
+    std::vector<graph_slot> gslots;
+    size_t   gslot_cur   = 0;
+    uint64_t gslot_clock = 0;
+
+    // env: LLAMA_GRAPH_SLOTS (1 = off), LLAMA_GRAPH_SLOT_TOKENS (largest batch that gets a slot of its own)
+    uint32_t gslot_max        = 1;
+    uint32_t gslot_max_tokens = 32;
+
+    void gslot_invalidate();
+    void gslot_switch(size_t i);
+    bool gslot_select(const llama_ubatch & ubatch);
+    void gslot_reset();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
