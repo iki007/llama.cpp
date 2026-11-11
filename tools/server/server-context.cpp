@@ -595,6 +595,12 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // a request may ask for a shorter draft than the server was launched with. It cannot ask
+        // for a longer one: the implementations size their draft from the launch-time value.
+        if (task->params.speculative.draft.n_max > 0) {
+            n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -3918,6 +3924,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .p_min    = */ slot.task->params.speculative.draft.p_min,
                         };
 
                         drafting.push_back(&slot);
@@ -4396,6 +4403,10 @@ private:
                                 wait_shared = true;
                             }
                         }
+                    }
+
+                    if (slot.can_speculate()) {
+                        common_speculative_set_pos_end(spec.get(), slot.id, input_tokens.pos_next());
                     }
 
                     // If using an alora, there may be uncached tokens that come

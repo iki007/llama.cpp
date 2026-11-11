@@ -242,7 +242,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -403,6 +403,23 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_PREFILL_PAIRS = getenv("LLAMA_PREFILL_PAIRS");
+        prefill_pairs = LLAMA_PREFILL_PAIRS && atoi(LLAMA_PREFILL_PAIRS) != 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+        if (prefill_pairs) {
+            LLAMA_LOG_INFO("%s: prefill pairs: consecutive ubatches of a batch are computed two at a time\n", __func__);
+        }
+    }
+
+    {
+        const char * LLAMA_GRAPH_SLOTS       = getenv("LLAMA_GRAPH_SLOTS");
+        const char * LLAMA_GRAPH_SLOT_TOKENS = getenv("LLAMA_GRAPH_SLOT_TOKENS");
+        gslot_max        = LLAMA_GRAPH_SLOTS       ? std::max(1, atoi(LLAMA_GRAPH_SLOTS))       : gslot_max;
+        gslot_max_tokens = LLAMA_GRAPH_SLOT_TOKENS ? std::max(1, atoi(LLAMA_GRAPH_SLOT_TOKENS)) : gslot_max_tokens;
+
+        if (gslot_max > 1) {
+            LLAMA_LOG_INFO("%s: graph slots = %u (batches of up to %u tokens)\n", __func__, gslot_max, gslot_max_tokens);
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -459,12 +476,26 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+        auto init_gpu_backend = [&](ggml_backend_dev_t dev) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev) {
+                    return;
+                }
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
             }
             backends.emplace_back(backend);
+        };
+        for (const auto & dev : model.devices) {
+            init_gpu_backend(dev.dev);
+        }
+        // Borrowed weights or KV can live on other target devices.
+        if (cparams.ctx_other) {
+            for (const auto & dev : llama_get_model(cparams.ctx_other)->devices) {
+                init_gpu_backend(dev.dev);
+            }
         }
 
         // tensors of ctx_other (e.g. a shared KV cache) can be on devices that this model does not use
@@ -566,6 +597,14 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
+        }
+
+        // a multi-device backend keeps its subgraphs per graph: each slot's graph must stay prepared there too
+        // (a graph is one subgraph list per scheduler split)
+        if (gslot_max > 1) {
+            for (auto & backend : backends) {
+                ggml_backend_meta_set_n_graphs(backend.get(), 4 * gslot_max);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -792,9 +831,16 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    sampling.n_nodes_reserved.clear();
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        sampling.n_nodes_reserved[seq_id] = llama_sampler_backend_n_nodes(sampler);
+    }
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+
+    gslot_reset();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -913,6 +959,34 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
+    // prefill pairs: the second scheduler gets compute buffers of its own for the same worst-case pp graph
+    sched_pair.reset();
+    // allocated, not cleared: process() swaps them in as gf_res_prev, which must never be null
+    for (auto & res : gf_res_pair) {
+        res = std::make_unique<llm_graph_result>(max_nodes);
+    }
+    if (prefill_pairs && !model.no_alloc() && !cparams.pipeline_parallel) {
+        sched_pair.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(sched_pair.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(sched_pair.get(), sched_graph_realloc, this);
+        std::swap(sched, sched_pair);
+        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+        std::swap(sched, sched_pair);
+        if (!gf) {
+            LLAMA_LOG_WARN("%s: no memory for a second compute buffer: prefill pairs off\n", __func__);
+            sched_pair.reset();
+        } else {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t size = ggml_backend_sched_get_buffer_size(sched_pair.get(), backend_ptrs[i]);
+                if (size > 1) {
+                    LLAMA_LOG_INFO("%s: %10s pair compute buffer size = %8.2f MiB\n", __func__,
+                            ggml_backend_buft_name(backend_buft[i]), size / 1024.0 / 1024.0);
+                }
+            }
         }
     }
 
@@ -1054,6 +1128,8 @@ bool llama_context::memory_update(bool optimize) {
                     return false;
                 }
         }
+
+        gslot_switch(0);
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
@@ -1729,9 +1805,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        // every request brings a new chain: when the last reserve made room for one at least this large on this
+        // sequence, the scheduler grows the compute buffers by itself if needed, so only stop reusing graphs built
+        // with an older sampler (freed by now, and the new one may have its address)
+        const auto it = sampling.n_nodes_reserved.find(seq_id);
+        if (it != sampling.n_nodes_reserved.end() && llama_sampler_backend_n_nodes(sampler) <= it->second) {
+            gf_res_prev_active = nullptr;
+        } else {
+            sched_need_reserve = true;
+        }
 
-        sched_need_reserve = true;
+        sampling.samplers[seq_id] = sampler;
 
         return true;
     }
@@ -1750,7 +1834,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    // the room reserved for the removed sampler stays, so the next request's sampler needs no reserve either
+    gf_res_prev_active = nullptr;
 
     return true;
 }
@@ -1814,21 +1899,139 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+// no active graph in the current slot means the graphs were invalidated from outside (memory update, sampler change,
+// reserve): the parked ones are as old
+void llama_context::gslot_invalidate() {
+    if (gf_res_prev_active == nullptr) {
+        for (auto & slot : gslots) {
+            slot.gf_res_prev_active = nullptr;
+        }
+    }
+}
+
+void llama_context::gslot_switch(size_t i) {
+    if (i == gslot_cur || i >= gslots.size()) {
+        return;
+    }
+
+    gslot_invalidate();
+
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
+    auto & out = gslots[gslot_cur];
+    out.sched              = std::move(sched);
+    out.gf_res_prev        = std::move(gf_res_prev);
+    out.gf_res_prev_active = gf_res_prev_active;
+
+    auto & in = gslots[i];
+    sched              = std::move(in.sched);
+    gf_res_prev        = std::move(in.gf_res_prev);
+    gf_res_prev_active = in.gf_res_prev_active;
+
+    in.gf_res_prev_active = nullptr;
+
+    // a slot that never held graphs brings no results; get_gf_res_prev() expects them allocated
+    for (auto & res : gf_res_prev) {
+        if (!res) {
+            res = std::make_unique<llm_graph_result>(gf_res_reserve->get_max_nodes());
+        }
+    }
+
+    gslot_cur = i;
+}
+
+// picks the slot for a batch that the current slot cannot reuse; returns true if the slot changed
+bool llama_context::gslot_select(const llama_ubatch & ubatch) {
+    if (gslots.empty()) {
+        gslots.resize(1);
+    }
+
+    const bool outputs = n_outputs > 0;
+
+    // full batches belong to the scheduler that was reserved for them
+    size_t pick = 0;
+
+    if (ubatch.n_tokens <= gslot_max_tokens) {
+        // the slot last used for this shape (to reuse its graph, or to replace it if stale), else a new slot, else
+        // the least recently used one
+        pick = gslots.size();
+
+        size_t lru = 0;
+        for (size_t i = 1; i < gslots.size(); ++i) {
+            if (gslots[i].n_tokens == ubatch.n_tokens && gslots[i].outputs == outputs) {
+                pick = i;
+                break;
+            }
+            if (lru == 0 || gslots[i].t_last < gslots[lru].t_last) {
+                lru = i;
+            }
+        }
+
+        if (pick == gslots.size()) {
+            if (gslots.size() < gslot_max) {
+                gslots.emplace_back();
+                gslots.back().sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                            gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+            } else {
+                pick = lru;
+            }
+        }
+    }
+
+    const bool changed = pick != gslot_cur;
+
+    gslot_switch(pick);
+
+    return changed;
+}
+
+// back to slot 0, the other slots are freed
+void llama_context::gslot_reset() {
+    if (gslots.empty()) {
+        gslots.resize(1);
+    }
+
+    gslot_switch(0);
+
+    gslots.resize(1);
+}
+
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool compute) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    gslot_invalidate();
+
     auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
+
+    // a graph of a pair (compute == false) is always built anew
+    bool reuse = compute && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(graph_params(res, ubatch, mctx, gtype));
+
+    // not the graph of the previous batch: another slot may still hold it
+    if (!reuse && gslot_max > 1 && gslot_select(ubatch)) {
+        res   = get_gf_res_prev();
+        reuse = compute && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(graph_params(res, ubatch, mctx, gtype));
+    }
+
+    auto * gf = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!gslots.empty()) {
+        auto & slot = gslots[gslot_cur];
+        slot.n_tokens = ubatch.n_tokens;
+        slot.outputs  = n_outputs > 0;
+        slot.t_last   = ++gslot_clock;
+    }
+
+    if (reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1863,7 +2066,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-
         gf_res_prev_active = res;
     }
 
@@ -1875,6 +2077,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (!compute) {
+        ret = GGML_STATUS_SUCCESS;
+        return res;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2343,65 +2550,57 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
 
-    do {
-        const auto & ubatch = mctx->get_ubatch();
+    // the number of outputs of a ubatch (needs to be set in n_outputs before its graph is built)
+    auto count_outputs = [&](const llama_ubatch & ubatch) -> int32_t {
+        int32_t n_outputs_new = 0;
 
-        // count the outputs in this ubatch
-        {
-            int32_t n_outputs_new = 0;
-
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                }
+        if (n_outputs_all == n_tokens_all) {
+            n_outputs_new = ubatch.n_tokens;
+        } else {
+            for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                n_outputs_new += (int32_t) (ubatch.output[i] != 0);
             }
+        }
+        return n_outputs_new;
+    };
 
-            // needs to happen before the graph is built
-            n_outputs = n_outputs_new;
+    // a failed or aborted ubatch (or pair): remove all positions from its first one on from the memory module
+    auto ubatch_failed = [&](std::initializer_list<const llama_ubatch *> ubatches, ggml_status status) -> int {
+        // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+        llama_pos pos_min[LLAMA_MAX_SEQ];
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            pos_min[s] = std::numeric_limits<llama_pos>::max();
         }
 
-        ggml_status status;
+        for (const llama_ubatch * ub : ubatches) {
+            for (uint32_t i = 0; i < ub->n_tokens; ++i) {
+                const auto & seq_id = ub->seq_id[i][0];
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-
-        if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
-
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
-
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
-
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
-                }
-
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
-            }
-
-            switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
-                case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
-                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                pos_min[seq_id] = std::min(pos_min[seq_id], ub->pos[i]);
             }
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                continue;
+            }
 
+            LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", "decode", s, pos_min[s]);
+
+            memory->seq_rm(s, pos_min[s], -1);
+        }
+
+        switch (status) {
+            case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_ALLOC_FAILED: return -2;
+            case GGML_STATUS_FAILED:       return -3;
+            case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+        }
+        return -3;
+    };
+
+    // read the outputs of a computed ubatch
+    auto extract_outputs = [&](const llm_graph_result * res, const llama_ubatch & ubatch) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2528,6 +2727,78 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+    };
+
+    const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        n_outputs = count_outputs(ubatch);
+
+        ggml_status status;
+
+        // prefill pairs: only for a batch of more than one ubatch and prompt-sized ubatches (a single ubatch, e.g. a
+        // draft verification, keeps its graph reuse)
+        if (sched_pair && n_tokens_all > (int64_t) cparams.n_ubatch && ubatch.n_tokens >= 64) {
+            // this ubatch and the next one built and allocated (in sched and sched_pair), computed together, then
+            // their outputs read in order
+            const auto * res_a = process_ubatch(ubatch, gtype, mctx.get(), status, /*compute =*/ false);
+            if (!res_a) {
+                return ubatch_failed({ &ubatch }, status);
+            }
+            if (mctx->next()) {
+                const int32_t n_outputs_a = n_outputs;
+                const auto &  ubatch_b    = mctx->get_ubatch();
+                n_outputs = count_outputs(ubatch_b);
+                const int32_t n_outputs_b = n_outputs;
+
+                std::swap(sched, sched_pair);
+                std::swap(gf_res_prev, gf_res_pair);
+                const auto * res_b = process_ubatch(ubatch_b, gtype, mctx.get(), status, /*compute =*/ false);
+                std::swap(sched, sched_pair);
+                std::swap(gf_res_prev, gf_res_pair);
+                // the active graph of this scheduler is the first one (null would read as an outside invalidation
+                // to the graph slots)
+                gf_res_prev_active = const_cast<llm_graph_result *>(res_a);
+                if (!res_b) {
+                    return ubatch_failed({ &ubatch, &ubatch_b }, status);
+                }
+
+                status = graph_compute_pair(res_a->get_gf(), res_b->get_gf());
+                if (status != GGML_STATUS_SUCCESS) {
+                    return ubatch_failed({ &ubatch, &ubatch_b }, status);
+                }
+
+                n_outputs = n_outputs_a;
+                extract_outputs(res_a, ubatch);
+                n_outputs = n_outputs_b;
+                std::swap(sched, sched_pair);
+                extract_outputs(res_b, ubatch_b);
+                std::swap(sched, sched_pair);
+                continue;
+            }
+            // the last ubatch of the batch, alone
+            status = graph_compute(res_a->get_gf(), ubatch.n_tokens > 1);
+            if (status != GGML_STATUS_SUCCESS) {
+                return ubatch_failed({ &ubatch }, status);
+            }
+            extract_outputs(res_a, ubatch);
+            continue;
+        }
+
+        const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status);
+
+        if (!res) {
+            return ubatch_failed({ &ubatch }, status);
+        }
+
+        // plot the computation graph in dot format (for debugging purposes)
+        //if (n_past%100 == 0) {
+        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+        //}
+
+        extract_outputs(res, ubatch);
     } while (mctx->next());
 
     if (layer_inp_dev && ev_layer_inp_written) {
@@ -3013,6 +3284,8 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+    gslot_switch(0);
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -3148,6 +3421,27 @@ ggml_status llama_context::graph_compute(
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
+    return status;
+}
+
+ggml_status llama_context::graph_compute_pair(ggml_cgraph * gf_a, ggml_cgraph * gf_b) {
+    if (backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn) {
+            set_threadpool_fn(backend_cpu, threadpool_batch);
+        }
+    }
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads_batch);
+    }
+
+    copy_experts.reset();
+
+    auto status = ggml_backend_sched_graph_compute_pair_async(sched.get(), gf_a, sched_pair.get(), gf_b);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_pair_async failed with error %d\n", __func__, status);
+    }
     return status;
 }
 

@@ -152,14 +152,16 @@ extern float ggml_table_f32_f8_e4m3[1 << 8];
 // force FP16 -> FP32 conversion to use LUT instead
 // see: https://github.com/ggml-org/llama.cpp/issues/30342
 //#define GGML_CPU_FP16_TO_FP32(x) GGML_CPU_COMPUTE_FP16_TO_FP32(x)
-#define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
+// FP32 -> FP16 stays off F16C on this branch as well: the instruction made Flash-Next's CPU expert layers 5.5% slower
+// on an i9-12900KF (2026-10-12, revert of 1cf776776), so both directions take the fallbacks below
+//#define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 #endif
 
 // a branch that defines a GGML_CPU_COMPUTE_* macro must also select it, or the fallback takes over silently
 #if defined(GGML_CPU_COMPUTE_FP16_TO_FP32) && !defined(GGML_CPU_FP16_TO_FP32) && !defined(__F16C__) // see: https://github.com/ggml-org/llama.cpp/issues/30342
 #error "a branch defined GGML_CPU_COMPUTE_FP16_TO_FP32 without selecting it as GGML_CPU_FP16_TO_FP32"
 #endif
-#if defined(GGML_CPU_COMPUTE_FP32_TO_FP16) && !defined(GGML_CPU_FP32_TO_FP16)
+#if defined(GGML_CPU_COMPUTE_FP32_TO_FP16) && !defined(GGML_CPU_FP32_TO_FP16) && !defined(__F16C__) // F16C: see above
 #error "a branch defined GGML_CPU_COMPUTE_FP32_TO_FP16 without selecting it as GGML_CPU_FP32_TO_FP16"
 #endif
 

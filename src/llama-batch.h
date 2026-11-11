@@ -128,6 +128,9 @@ struct llama_batch_ext {
     std::vector<float> embd;
     std::vector<float> state;
 
+    // rows of an old-API llama_batch borrowed for one call (the compat path), in token order; used instead of embd
+    const float * embd_ext = nullptr;
+
     llama_batch_ext(llama_context * ctx);
 
     // build without a llama_context, used by tests
@@ -229,6 +232,7 @@ private:
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
+    const float *               embd_ptr = nullptr; // embeddings of the llama_batch_ext, valid during the call
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
     std::vector<int32_t>        embd_row_vec; // owned embd rows built from llama_batch_ext, llama_batch has no slot for them
     std::vector<int32_t>        state_row_vec; // owned state rows built from llama_batch_ext, llama_batch has no slot for them
@@ -279,5 +283,8 @@ struct llama_batch_compat {
 
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation
-    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    // borrow_embd: point the (empty) batch at batch_inp's embedding rows instead of copying them; batch_inp must
+    // then outlive every use of the batch, as it does for one encode/decode call
+    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0,
+                     bool borrow_embd = false);
 };

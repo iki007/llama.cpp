@@ -671,6 +671,9 @@ extern "C" {
     // (the packed lattice also holds the top_k x top_k pairwise transition scores); 0 if the model has no selector head
     LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
+    // returns the attention window when every layer uses sliding-window attention, else 0
+    LLAMA_API int32_t llama_model_n_swa_all(const struct llama_model * model);
+
     // returns pointer to the target-model layer indices
     LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
     // returns the number of extracted layers from target model
