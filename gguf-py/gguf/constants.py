@@ -1558,6 +1558,7 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DFLASH_MASK_EMBD       = auto()
     DFLASH_CTX_MIX         = auto()  # per-layer target feature mix
     DFLASH_CTX_NORM        = auto()  # per-layer target feature norm
     DFLASH_ATTN_K_CTX      = auto()  # per-layer context K projection
@@ -2627,6 +2628,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DFLASH_MASK_EMBD:          "mask_embd",
     MODEL_TENSOR.DFLASH_CTX_MIX:            "blk.{bid}.ctx_mix",
     MODEL_TENSOR.DFLASH_CTX_NORM:           "blk.{bid}.ctx_norm",
     MODEL_TENSOR.DFLASH_ATTN_K_CTX:         "blk.{bid}.attn_k_ctx",
@@ -6616,6 +6618,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH_MASK_EMBD,
         MODEL_TENSOR.DFLASH_CTX_MIX,
         MODEL_TENSOR.DFLASH_CTX_NORM,
         MODEL_TENSOR.DFLASH_ATTN_K_CTX,
