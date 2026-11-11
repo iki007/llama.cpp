@@ -4288,6 +4288,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKUP_CTX"));
     add_opt(common_arg(
+        {"--spec-draft-lookup-round"}, "N",
+        string_format("draft a round from the context alone, without the drafter, when the context's tail matches an earlier "
+                      "occurrence for at least N tokens, up to --spec-draft-lookup-n-max tokens, at any context length "
+                      "(needs --spec-draft-lookup-n-min; default: %d, 0 = off)", params.speculative.draft.lookup_round),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.lookup_round = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_LOOKUP_ROUND"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {

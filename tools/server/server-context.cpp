@@ -3982,6 +3982,17 @@ private:
                             dp.lookup_n_min = slot.task->params.speculative.draft.lookup_n_min;
                             dp.lookup_n_max = std::min(params_base.speculative.draft.lookup_n_max, n_room);
                         }
+                        // lookup rounds at any context length; the snapshots are sized for lookup_n_max via lookup_n_min
+                        if (params_base.speculative.draft.lookup_round > 0 && params_base.speculative.draft.lookup_n_min > 0 &&
+                            slot.task->params.speculative.draft.lookup_n_min > 0) {
+                            int n_room = slot.n_ctx - slot.prompt.n_tokens() - 2;
+                            if (slot.n_remaining() > 0) {
+                                n_room = std::min(n_room, slot.n_remaining() - 1);
+                            }
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dp.lookup_round = params_base.speculative.draft.lookup_round;
+                            dp.lookup_n_max = std::min(params_base.speculative.draft.lookup_n_max, n_room);
+                        }
 
                         drafting.push_back(&slot);
                     }

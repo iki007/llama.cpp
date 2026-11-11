@@ -360,6 +360,8 @@ struct common_params_speculative_draft {
     int32_t lookup_n_min = 0;
     int32_t lookup_n_max = 14;
     int32_t lookup_n_ctx = 0; // only once the context holds this many tokens (where drafts are short and verifying is slow)
+    // a match of at least lookup_round tokens drafts the round from the context alone, without the drafter (0 = off)
+    int32_t lookup_round = 0;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

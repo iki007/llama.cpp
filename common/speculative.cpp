@@ -2594,6 +2594,8 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    int64_t n_lookup_rounds = 0; // rounds drafted from the context alone (lookup_round)
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3305,6 +3307,24 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // lookup rounds: where the context's tail matches an earlier occurrence for at least lookup_round tokens, the tokens
+    // that followed it are the draft and the drafter does not run for that sequence. The drafter's cache stays complete:
+    // process() injects the target features of every verified batch, whoever drafted it
+    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+        auto & dp = dparams[seq_id];
+        if (!dp.drafting || dp.lookup_round <= 0 || dp.lookup_n_max <= 0 || !dp.result->empty() || spec->impls.empty()) {
+            continue;
+        }
+        common_speculative_lookup_extend(*dp.prompt, dp.id_last, *dp.result, dp.lookup_round, dp.lookup_n_max);
+        if (!dp.result->empty()) {
+            dp.drafting = false;
+            // the accepted count of this round goes to the drafter's statistics (common_speculative_accept needs one)
+            spec->impl_last[seq_id] = spec->impls[0].get();
+            spec->n_lookup_rounds++;
+            SPC_DBG("lookup round: %zu tokens from the context\n", dp.result->size());
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3440,6 +3460,10 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->n_lookup_rounds > 0) {
+        LOG_INF("statistics lookup rounds: %" PRId64 " rounds drafted from the context\n", spec->n_lookup_rounds);
     }
 
     for (const auto & impl : spec->impls) {
