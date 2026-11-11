@@ -87,6 +87,8 @@ struct common_speculative_draft_params {
     // context lookup extension: the minimum match (0 = off) and the maximum draft length with the extension
     int32_t lookup_n_min = 0;
     int32_t lookup_n_max = 0;
+    // lookup round: a match of at least this many tokens drafts the round without the drafter (0 = off)
+    int32_t lookup_round = 0;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
