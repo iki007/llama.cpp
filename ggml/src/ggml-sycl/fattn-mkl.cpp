@@ -211,11 +211,16 @@ static void mkl_fa_online_softmax_chunk(
 }
 
 // Write one GQA group's normalized output to its destination head.
+// With attention sinks (one logit per Q head, no value row) the sink joins the softmax denominator as TILE does:
+// max' = max(KQ_max, sink), sum' = KQ_sum * exp(KQ_max - max') + exp(sink - max'), and the accumulator, which is
+// relative to KQ_max, is scaled by exp(KQ_max - max') as well.
 static void mkl_fa_normalize_head(
     dpct::queue_ptr stream,
     float * __restrict dst_batch,
     const float * __restrict VKQ_accum,
     const float * __restrict KQ_sum,
+    const float * __restrict KQ_max,
+    const float * __restrict sinks,
     int iqh, int n_queries, int DV, int n_q_heads,
     int64_t src_offset, int64_t wg_size) {
 
@@ -229,6 +234,13 @@ static void mkl_fa_normalize_head(
 
                 int     ksum_idx = (int)(src_offset / DV) + jc;
                 float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
+                if (sinks) {
+                    const float sink  = sinks[iqh];
+                    const float m_old = KQ_max[ksum_idx];
+                    const float m_new = sycl::fmax(m_old, sink);
+                    const float scale = sycl::native::exp(m_old - m_new);
+                    inv_sum = scale / (KQ_sum[ksum_idx] * scale + sycl::native::exp(sink - m_new));
+                }
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):
@@ -269,7 +281,6 @@ struct mkl_fa_kv_desc {
     int64_t              D    = 0;      // ne[0]
     int64_t              nb1  = 0;      // byte stride, seq dim
     int64_t              nb2  = 0;      // byte stride, head dim
-    int64_t              nb3  = 0;      // byte stride, batch dim
     mkl_fa_kv_desc_mode  mode = MKL_FA_KV_MODE_F16_DENSE;
     int64_t              ts   = 0;      // type size (mode 3 base offset)
     int64_t              s01  = 0;      // nc row stride in blocks (mode 3)
@@ -283,7 +294,6 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
     d.D    = T->ne[0];
     d.nb1  = (int64_t)T->nb[1];
     d.nb2  = (int64_t)T->nb[2];
-    d.nb3  = (int64_t)T->nb[3];
     d.ts   = (int64_t)ggml_type_size(T->type);
 
     if (T->type == GGML_TYPE_F16) {
@@ -295,6 +305,8 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
         d.mode = MKL_FA_KV_MODE_QUANT_CONTIG;
     } else {
         d.mode = MKL_FA_KV_MODE_QUANT_NC;
+        // nb[] are the physical strides for every layout (heads interleaved within rows, or a view into a
+        // larger cache), so they give the block strides directly
         d.s01 = d.nb1 / d.ts;
         d.s02 = d.nb2 / d.ts;
     }
@@ -304,20 +316,19 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
 // Dequant one KV-head chunk into a dense [this_chunk x D] fp16 buffer.
 static void mkl_fa_dequant_chunk(
     dpct::queue_ptr stream, const mkl_fa_kv_desc & d, ggml_tensor * dst_ctx,
-    sycl::half * out, int ikvh, int ib, int chunk_start, int this_chunk) {
+    sycl::half * out, int ikvh, int chunk_start, int this_chunk) {
 
     const int64_t D = d.D;
     switch (d.mode) {
         case MKL_FA_KV_MODE_F16_DENSE: {
-            // ib * nb3 selects this batch's KV (nb[3] != ne[1]*nb[1] for batched KV views)
             const char * base = d.data + (int64_t)ikvh * d.nb2
-                + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
+                + (int64_t)chunk_start * d.nb1;
             stream->memcpy(out, base, (size_t)this_chunk * D * sizeof(sycl::half));
             break;
         }
         case MKL_FA_KV_MODE_F16_INTERLEAVED: {
             const char * base = d.data + (int64_t)ikvh * d.nb2
-                + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
+                + (int64_t)chunk_start * d.nb1;
             const int64_t row_halfs = d.nb1 / (int64_t)sizeof(sycl::half);
             const sycl::half * src = (const sycl::half *)base;
             stream->parallel_for(
@@ -331,7 +342,7 @@ static void mkl_fa_dequant_chunk(
         }
         case MKL_FA_KV_MODE_QUANT_CONTIG: {
             const char * base = d.data + (int64_t)ikvh * d.nb2
-                + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
+                + (int64_t)chunk_start * d.nb1;
             to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(d.type, dst_ctx);
             to_fp16(base, out, (int64_t)this_chunk * D, stream);
             break;
@@ -339,7 +350,7 @@ static void mkl_fa_dequant_chunk(
         default: {  // MKL_FA_KV_MODE_QUANT_NC
             to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(d.type);
             const int64_t base_blocks = (int64_t)ikvh * d.s02
-                + (int64_t)chunk_start * d.s01 + (int64_t)ib * d.nb3 / d.ts;
+                + (int64_t)chunk_start * d.s01;
             const char * base = d.data + base_blocks * d.ts;
             // ne02 = ne03 = 1 → s02/s03 inert; head+chunk offset carried by base.
             to_fp16(base, out, D, this_chunk, 1, 1, d.s01, d.s02, d.s02, stream);
@@ -361,10 +372,13 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+    GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
+    const float * sinks_d = sinks ? (const float *) sinks->data : nullptr;
 
     // --- Op params ---
     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
@@ -530,6 +544,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const float beta  = 0.0f;
 
     for (int ib = 0; ib < n_batch; ib++) {
+        mkl_fa_kv_desc K_batch = K_desc;
+        mkl_fa_kv_desc V_batch = V_desc;
+        K_batch.data += (K->ne[3] == 1 ? 0 : ib) * K->nb[3];
+        V_batch.data += (V->ne[3] == 1 ? 0 : ib) * V->nb[3];
+
         const float * Q_batch = (const float *)Q->data
             + ib * (Q->nb[3] / sizeof(float));
         float * dst_batch = (float *)KQV->data
@@ -564,11 +583,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 // 3a. Dequant this KV chunk to dense fp16 (once per chunk)
                 {
                     MKL_TAKE_TIME(t0);
-                    mkl_fa_dequant_chunk(stream, K_desc, KQV,
-                        K_chunk_f16_ptr, ikvh, ib, chunk_start, this_chunk);
+                    mkl_fa_dequant_chunk(stream, K_batch, KQV,
+                        K_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     if (!V_is_K_view) {
-                        mkl_fa_dequant_chunk(stream, V_desc, KQV,
-                            V_chunk_f16_ptr, ikvh, ib, chunk_start, this_chunk);
+                        mkl_fa_dequant_chunk(stream, V_batch, KQV,
+                            V_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     }
                     MKL_ACCUM(dequant_time_us, t0);
                 }
@@ -646,7 +665,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 int     iqh        = kvh_base_head + iqg;
                 int64_t src_offset = (int64_t)iqg * n_queries * DV;
                 mkl_fa_normalize_head(stream,
-                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr, KQ_max_ptr, sinks_d,
                     iqh, n_queries, DV, n_q_heads,
                     src_offset, wg_size);
             }

@@ -17,6 +17,7 @@
 #include "fattn-common.hpp"
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
+#include "fattn-xmx.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
@@ -98,7 +99,8 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 / q8_0 K/V decode on Xe2 XMX
+    BEST_FATTN_KERNEL_XMX      = 120, // DPAS, short GQA query batches (fattn-xmx.cpp)
+    BEST_FATTN_KERNEL_DPAS     = 130, // q4_0 / q8_0 K/V decode on Xe2 XMX
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
@@ -131,6 +133,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    if (ggml_sycl_flash_attn_ext_xmx_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMX;
+    }
+
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
@@ -157,7 +163,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    // Attention sinks (one F32 logit per Q head) join the softmax denominator in mkl_fa_normalize_head.
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && (!sinks || sinks->type == GGML_TYPE_F32) && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -203,6 +210,16 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         case 256:
         case 512:
             if (V->ne[0] != K->ne[0]) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
+        case 192:
+            if (V->ne[0] != 128 || !gqa_opt_applies || gqa_ratio % 8 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
+        case 320:
+            if (V->ne[0] != 256 || !gqa_opt_applies || gqa_ratio % 32 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -254,8 +271,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes.
     // BF16 is excluded: the VEC kernel has no BF16 template (it needs GGML_SYCL_FA_ALL_QUANTS for non-F16/Q4_0/Q8_0).
     const bool has_bf16 = (K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16);
+    // The VEC kernel has no instance with different K and V head sizes (192/128, 320/256) either.
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0
-        && !has_bf16;
+        && !has_bf16 && K->ne[0] == V->ne[0];
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
@@ -268,6 +286,14 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
+                // The tile kernel groups 4, 8 or 16 query heads per KV head. With other ratios (24 query / 4 KV
+                // heads in Qwen3.8-27B) the vector kernel decodes faster on an Arc Pro B70: 2.40 -> 1.46 ms per
+                // layer at 100k KV for GQA 6, 1.75 -> 1.57 ms for GQA 2; multiples of 4 stay on the tile kernel.
+                // Multiples of 6 are the exception: the 6-column tile (launch_fattn_tile_c6) is
+                // 2.0x faster than the vector kernel at 100k KV, so leave those on the tile kernel.
+                if (gqa_ratio % 4 != 0 && gqa_ratio % 6 != 0 && ggml_sycl_fattn_tile_tuned_bmg_g31(device)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
@@ -283,6 +309,48 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+// Several sequences in one batch arrive as streams along ne[3], each its own attention problem. The XMX kernel
+// takes all streams in one launch for decode rows (fa_xmx_supported); other batches (prefill rows, a q8_0 cache it
+// cannot read in place) fell to the tile kernel (Qwen3.8-27B, 4 sessions x 8 rows at 28k: 1.14 ms per call against
+// 0.15 ms for one stream). Run those once per stream when a stream qualifies.
+static bool ggml_sycl_flash_attn_ext_streams(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t       ns   = Q->ne[3];
+    // the mask is per stream, or one mask shared by all streams
+    if (ns <= 1 || !mask || K->ne[3] != ns || V->ne[3] != ns || (mask->ne[3] != ns && mask->ne[3] != 1) || dst->ne[3] != ns ||
+        ggml_sycl_flash_attn_ext_xmx_supported(ctx.device, dst)) {
+        return false;
+    }
+
+    auto stream = [](const ggml_tensor * t, int64_t s) {
+        ggml_tensor v = *t;
+        v.ne[3] = 1;
+        v.data  = (char *) t->data + s * t->nb[3];
+        return v;
+    };
+    for (int64_t s = 0; s < ns; ++s) {
+        ggml_tensor q = stream(Q, s);
+        ggml_tensor k = stream(K, s);
+        ggml_tensor v = stream(V, s);
+        ggml_tensor m = stream(mask, mask->ne[3] == ns ? s : 0);
+        ggml_tensor d = stream(dst, s);
+        d.src[0] = &q;
+        d.src[1] = &k;
+        d.src[2] = &v;
+        d.src[3] = &m;
+        if (!ggml_sycl_flash_attn_ext_xmx_supported(ctx.device, &d)) {
+            // the first stream decides; a later one cannot differ in shape or type
+            GGML_ASSERT(s == 0);
+            return false;
+        }
+        ggml_sycl_flash_attn_ext_xmx(ctx, &d);
+    }
+    return true;
 }
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -309,6 +377,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         return;
     }
 
+    if (ggml_sycl_flash_attn_ext_streams(ctx, dst)) {
+        return;
+    }
+
     // n_kv watchdog: log when n_kv differs from the last FA call with
     // the same D — helps detect cache-truncation issues.
     static int nkv_debug = ggml_sycl_get_env("GGML_SYCL_MKL_FA_DEBUG", 0);
@@ -325,6 +397,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
         if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
         if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
+        if (k == BEST_FATTN_KERNEL_XMX)  kname = "XMX";
         if (k == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
         int64_t delta = 0;
         if (Dk == 256) {
@@ -357,6 +430,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_sycl_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_XMX:
+            ggml_sycl_flash_attn_ext_xmx(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_DPAS:
             ggml_sycl_flash_attn_ext_dpas(ctx, dst);
@@ -463,8 +539,18 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     const bool V_is_K_view = V->view_src &&
         (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
-    size_t need_K = 0, need_V = 0, need_Q = 0, need_out = 0, need_scale = 0;
-    if (onednn_supported) {
+    size_t need_K = 0, need_V = 0, need_Q = 0, need_out = 0, need_scale = 0, need_mask = 0;
+    if (onednn_supported && dst->src[4]) {
+        // sinks: everything staged with the sink dims and tokens (ggml_sycl_flash_attn_ext_onednn_sinks)
+        const int64_t da = d + ONEDNN_SINK_DIMS;
+        const int64_t sa = K->ne[1] + ONEDNN_SINK_TOKS;
+        need_Q     = (size_t) H * q * da;
+        need_out   = (size_t) H * q * da;
+        need_scale = 1;
+        need_K     = (size_t) K->ne[2] * sa * da;
+        need_V     = (size_t) K->ne[2] * sa * da;
+        need_mask  = (size_t) q * sa;
+    } else if (onednn_supported) {
         need_Q     = (size_t) H * q * d;
         need_out   = (size_t) H * q * d;
         need_scale = 1;
@@ -488,6 +574,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
                        : ggml_sycl_fattn_reserve_halves(extra, need_V);
     extra.scale_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_scale);
     extra.out_buffer_ptr   = ggml_sycl_fattn_reserve_halves(extra, need_out);
+    extra.mask_buffer_ptr  = ggml_sycl_fattn_reserve_halves(extra, need_mask);
 
     return extra;
 }

@@ -32,6 +32,7 @@ struct ggml_sycl_fattn_extra {
     uintptr_t Q_buffer_ptr     = 0;   // dense F16 copy of Q, oneDNN only
     uintptr_t scale_buffer_ptr = 0;   // the softmax scale as an F16 scalar, oneDNN only
     uintptr_t out_buffer_ptr   = 0;   // F16 SDPA output before conversion to F32, oneDNN only
+    uintptr_t mask_buffer_ptr  = 0;   // the mask with the sink tokens' columns, oneDNN with sinks only
     uintptr_t end              = 0;   // one past the last reserved byte; sizes the allocation
 };
 

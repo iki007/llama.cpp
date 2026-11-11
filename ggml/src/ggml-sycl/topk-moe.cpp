@@ -5,7 +5,14 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "binbcast.hpp"
+#include "getrows.hpp"
+#include "qsa-score.hpp"
+#include "set_rows.hpp"
+#include "topk-radix.hpp"
 #include "topk-moe.hpp"
+#include "moe-weighted-reduction.hpp"
+#include "amax-scale.hpp"
 
 // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
 // path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
@@ -86,7 +93,8 @@ static inline void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const
     It is intended as a fusion of the softmax->top-k->get_rows pipeline for MoE models.
     One sub-group handles one row/token, mirroring topk_moe_cuda's one-warp-per-row layout.
 */
-template <int n_experts>
+// out_slots: selected weights kept per thread (1 when n_expert_used <= WARP_SIZE, else one per expert slot)
+template <int n_experts, int out_slots>
 static void topk_moe_kernel(const float * __restrict__ logits,
                             float * __restrict__       weights,
                             int32_t * __restrict__     ids,
@@ -141,25 +149,43 @@ static void topk_moe_kernel(const float * __restrict__ logits,
     // from the next iteration.
 
     float wt_sum = 0.f;
-    float output_weights[experts_per_thread];
+    float output_weights[out_slots];
 #pragma unroll
-    for (int i = 0; i < experts_per_thread; i++) {
+    for (int i = 0; i < out_slots; i++) {
         output_weights[i] = 0.f;
     }
 
     const sycl::sub_group sg = item_ct1.get_sub_group();
 
     for (int k = 0; k < n_expert_used; k++) {
-        float max_val    = wt[0];
-        int   max_expert = lane;
+        // the thread's argmax as a pairwise tree (depth log2 instead of a chain); the left value has the lower
+        // expert, so it wins ties as in a linear scan (slots past n_experts were loaded as -INFINITY)
+        float max_val  = wt[0];
+        int   max_slot = 0;
+        if constexpr (experts_per_thread > 1) {
+            constexpr int half = experts_per_thread / 2;
+            float         tv[half];
+            int           ti[half];
 #pragma unroll
-        for (int i = 1; i < experts_per_thread; i++) {
-            const int expert = lane + i * WARP_SIZE;
-            if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
-                max_val    = wt[i];
-                max_expert = expert;
+            for (int i = 0; i < half; i++) {
+                const bool right = wt[2 * i + 1] > wt[2 * i];
+                tv[i]            = right ? wt[2 * i + 1] : wt[2 * i];
+                ti[i]            = right ? 2 * i + 1 : 2 * i;
             }
+#pragma unroll
+            for (int s = 1; s < half; s *= 2) {
+#pragma unroll
+                for (int i = 0; i + s < half; i += 2 * s) {
+                    if (tv[i + s] > tv[i]) {
+                        tv[i] = tv[i + s];
+                        ti[i] = ti[i + s];
+                    }
+                }
+            }
+            max_val  = tv[0];
+            max_slot = ti[0];
         }
+        int max_expert = lane + max_slot * WARP_SIZE;
 #pragma unroll
         for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
             const float val    = dpct::permute_sub_group_by_xor(sg, max_val, mask);
@@ -170,11 +196,18 @@ static void topk_moe_kernel(const float * __restrict__ logits,
             }
         }
 
-        if ((max_expert & (WARP_SIZE - 1)) == lane) {
-            wt[max_expert / WARP_SIZE] = -INFINITY;
+        // compile-time indices only: a runtime index puts wt / output_weights in scratch memory on Intel GPUs
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            if (max_expert == lane + i * WARP_SIZE) {
+                wt[i] = -INFINITY;
+            }
         }
-        if ((k & (WARP_SIZE - 1)) == lane) {
-            output_weights[k / WARP_SIZE] = max_val;
+#pragma unroll
+        for (int i = 0; i < out_slots; i++) {
+            if (k == lane + i * WARP_SIZE) {
+                output_weights[i] = max_val;
+            }
         }
         if ((max_expert & (WARP_SIZE - 1)) == lane) {
             ids[k] = max_expert;
@@ -189,17 +222,17 @@ static void topk_moe_kernel(const float * __restrict__ logits,
         wt_sum          = sycl::fmax(wt_sum, clamp_val);
         const float inv = 1.0f / wt_sum;
 #pragma unroll
-        for (int i = 0; i < experts_per_thread; i++) {
+        for (int i = 0; i < out_slots; i++) {
             output_weights[i] *= inv;
         }
     }
 
     if (config.delayed_softmax) {
-        softmax_warp_inplace<experts_per_thread, true>(output_weights, n_expert_used, lane);
+        softmax_warp_inplace<out_slots, true>(output_weights, n_expert_used, lane);
     }
 
 #pragma unroll
-    for (int i = 0; i < experts_per_thread; i++) {
+    for (int i = 0; i < out_slots; i++) {
         const int idx = i * WARP_SIZE + lane;
         if (idx < n_expert_used) {
             weights[idx] = output_weights[i] * scale_val;
@@ -210,14 +243,24 @@ static void topk_moe_kernel(const float * __restrict__ logits,
 template <int n_experts>
 static void launch_topk_moe(queue_ptr stream, const float * logits, float * weights, int32_t * ids, int n_rows,
                             int n_expert_used, float clamp_val, float scale_val, const topk_moe_config & config) {
+    constexpr int        experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
     const sycl::range<1> block_dims(WARP_SIZE);
     const sycl::range<1> block_nums(n_rows);
-    stream->parallel_for(sycl::nd_range<1>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             topk_moe_kernel<n_experts>(logits, weights, ids, n_rows, n_expert_used, clamp_val,
-                                                        scale_val, config);
-                             GGML_UNUSED(item_ct1);
-                         });
+    if (n_expert_used <= WARP_SIZE) {
+        stream->parallel_for(sycl::nd_range<1>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 topk_moe_kernel<n_experts, 1>(logits, weights, ids, n_rows, n_expert_used, clamp_val,
+                                                               scale_val, config);
+                                 GGML_UNUSED(item_ct1);
+                             });
+    } else {
+        stream->parallel_for(sycl::nd_range<1>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 topk_moe_kernel<n_experts, experts_per_thread>(
+                                     logits, weights, ids, n_rows, n_expert_used, clamp_val, scale_val, config);
+                                 GGML_UNUSED(item_ct1);
+                             });
+    }
 }
 
 static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
@@ -448,7 +491,7 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, 
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            if (node_idx < n_nodes && nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 node_idx++;
             } else {
                 args.norm = false;
@@ -457,21 +500,22 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, 
         }
 
         // DIV <- CLAMP, RESHAPE
-        if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
             args.norm = false;
             return true;
         }
         node_idx++;
 
-        if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
+            nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             args.norm = false;
             return true;
         }
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -543,77 +587,138 @@ int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i)
         return 0;
     }
 
+    if (const int n = ggml_sycl_fuse_qsa_attn(ctx, cgraph, i)) {
+        return n;
+    }
+    if (const int n = ggml_sycl_fuse_qsa_mask(ctx, cgraph, i)) {
+        return n;
+    }
+
+    if (cgraph->nodes[i]->op == GGML_OP_MUL) {
+        ggml_sycl_moe_weighted_reduction_match match;
+        if (ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_sycl_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                ggml_sycl_op_moe_weighted_reduction(ctx, match);
+                return match.node_count - 1;
+            }
+        }
+    }
+
+    if (const int n = ggml_sycl_fuse_qsa_score(ctx, cgraph, i)) {
+        return n;
+    }
+    if (const int n = ggml_sycl_fuse_qsa_topk(ctx, cgraph, i)) {
+        return n;
+    }
+    if (const int n = ggml_sycl_fuse_qsa_gather(ctx, cgraph, i)) {
+        return n;
+    }
+    if (const int n = ggml_sycl_fuse_cast_add(ctx, cgraph, i)) {
+        return n;
+    }
+    if (cgraph->nodes[i]->op == GGML_OP_UNARY) {
+        ggml_sycl_amax_scale_match match;
+        // its own range rule: the div runs in place (x / e over x) as the allocator usually places it
+        if (ggml_sycl_match_amax_scale(cgraph, i, match) && ggml_sycl_amax_scale_ranges_ok(match)) {
+            ggml_sycl_op_amax_scale(ctx, match);
+            return match.node_count - 1;
+        }
+    }
     return ggml_sycl_fuse_topk_moe(ctx, cgraph, i);
 }
 
-int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
-    ggml_tensor * node = cgraph->nodes[i];
+// The fusable top-k MoE router subgraph starting at a node: its length, its two outputs and the
+// tensors the fused kernel takes. Graph shape and tensor properties only; memory overlap is not checked.
+struct ggml_sycl_topk_moe_match {
+    ggml_sycl_topk_moe_args args;
+    int                     node_count   = 0;
+    int                     out_nodes[2] = {};
+    const ggml_tensor *     logits       = nullptr;
+    ggml_tensor *           weights      = nullptr;
+    ggml_tensor *           ids          = nullptr;
+    const ggml_tensor *     clamp        = nullptr;
+    const ggml_tensor *     scale        = nullptr;
+};
+
+static bool ggml_sycl_match_topk_moe(const ggml_cgraph * cgraph, int i, ggml_sycl_topk_moe_match & m) {
+    const ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op != GGML_OP_UNARY && node->op != GGML_OP_SOFT_MAX && node->op != GGML_OP_ARGSORT) {
-        return 0;
+        return false;
     }
 
-    ggml_sycl_topk_moe_args args;
+    ggml_sycl_topk_moe_args & args = m.args;
     if (!ggml_sycl_topk_moe_fusion(cgraph, i, args)) {
-        return 0;
+        return false;
     }
 
     // this kernel implements the no-bias path only; decline anything with a routing bias
     if (args.prob_bias) {
-        return 0;
+        return false;
     }
 
-    const ggml_tensor * logits  = node->src[0];
-    ggml_tensor *       weights = nullptr;
-    ggml_tensor *       ids     = nullptr;
-    const ggml_tensor * clamp   = nullptr;
-    const ggml_tensor * scale   = nullptr;
+    m.logits = node->src[0];
 
     std::vector<ggml_op> ops;
-    int                  out_nodes[2];
 
     if (!args.delayed_softmax) {
         const ggml_op gating_op = args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX;
         ops.insert(ops.end(), { gating_op, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
-        out_nodes[0] = i + 3;
-        ids          = cgraph->nodes[i + 3];
+        m.out_nodes[0] = i + 3;
+        m.ids          = cgraph->nodes[i + 3];
 
         if (args.norm) {
             ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
-            clamp = cgraph->nodes[i + (int) ops.size() - 3];
+            m.clamp = cgraph->nodes[i + (int) ops.size() - 3];
         }
         if (args.scale) {
             ops.insert(ops.end(), { GGML_OP_SCALE });
-            scale = cgraph->nodes[i + (int) ops.size() - 1];
+            m.scale = cgraph->nodes[i + (int) ops.size() - 1];
         }
 
-        weights      = cgraph->nodes[i + (int) ops.size() - 1];
-        out_nodes[1] = i + (int) ops.size() - 1;
+        m.weights      = cgraph->nodes[i + (int) ops.size() - 1];
+        m.out_nodes[1] = i + (int) ops.size() - 1;
 
-        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-            ggml_sycl_should_use_topk_moe(node, weights, logits, ids) &&
-            ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-            ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, args);
-            return (int) ops.size() - 1;
+        if (!ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), m.out_nodes, 2) ||
+            !ggml_sycl_should_use_topk_moe(node, m.weights, m.logits, m.ids)) {
+            return false;
         }
     } else if (!args.norm && !args.prob_bias) {
         // gpt-oss style: argsort -> view -> get_rows -> reshape -> softmax -> reshape, no norm/bias
         ops.insert(ops.end(),
                    { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SOFT_MAX,
                      GGML_OP_RESHAPE });
-        weights                     = cgraph->nodes[i + 5];
-        ids                         = cgraph->nodes[i + 1];
+        m.weights                   = cgraph->nodes[i + 5];
+        m.ids                       = cgraph->nodes[i + 1];
         const ggml_tensor * softmax = cgraph->nodes[i + 4];
-        out_nodes[0]                = i + 1;
-        out_nodes[1]                = i + 5;
+        m.out_nodes[0]              = i + 1;
+        m.out_nodes[1]              = i + 5;
 
-        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-            ggml_sycl_should_use_topk_moe(softmax, weights, logits, ids) &&
-            ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-            ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, args);
-            return (int) ops.size() - 1;
+        if (!ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), m.out_nodes, 2) ||
+            !ggml_sycl_should_use_topk_moe(softmax, m.weights, m.logits, m.ids)) {
+            return false;
         }
+    } else {
+        return false;
     }
 
-    return 0;
+    m.node_count = (int) ops.size();
+    return true;
+}
+
+int ggml_sycl_topk_moe_node_count(const ggml_cgraph * cgraph, int i) {
+    ggml_sycl_topk_moe_match m;
+    return ggml_sycl_match_topk_moe(cgraph, i, m) ? m.node_count : 0;
+}
+
+int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_sycl_topk_moe_match m;
+    if (!ggml_sycl_match_topk_moe(cgraph, i, m) ||
+        !ggml_sycl_check_fusion_memory_ranges(cgraph, i, m.node_count, m.out_nodes, 2, /*is_topk_moe=*/true)) {
+        return 0;
+    }
+
+    ggml_sycl_op_topk_moe(ctx, m.logits, m.weights, m.ids, m.clamp, m.scale, m.args);
+    return m.node_count - 1;
 }
