@@ -24,7 +24,7 @@ static void k_get_rows(
             /*size_t s0,*/ size_t s1, size_t s2, size_t s3,
             /*size_t nb00,*/ size_t nb01, size_t nb02, size_t nb03,
             size_t s10, size_t s11, size_t s12,
-            const sycl::nd_item<3> &item_ct1/*, size_t s13*/) {
+            const sycl::nd_item<3> &item_ct1, int64_t ne10 = INT64_MAX/*, size_t s13*/) {
 
     const int i00 = (item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                      item_ct1.get_local_id(2)) *
@@ -38,7 +38,7 @@ static void k_get_rows(
                      item_ct1.get_local_id(0)) %
                     ne12;
 
-    if (i00 >= ne00) {
+    if (i00 >= ne00 || i10 >= ne10) {
         return;
     }
 
@@ -202,6 +202,24 @@ static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *sr
     //const size_t s13 = nb13 / ggml_element_size(src1);
 
     GGML_ASSERT(ne00 % 2 == 0);
+
+    // a short row would leave most of a SYCL_GET_ROWS_BLOCK_SIZE work-group idle (a 128-value row: 64 of 256 threads):
+    // give each work-group several rows instead, one work-item per pair of values
+    static const bool multi_row = ggml_sycl_get_env("GGML_SYCL_GET_ROWS_MULTI", 1) != 0;
+    if (multi_row && ne00 < 2*SYCL_GET_ROWS_BLOCK_SIZE) {
+        const int64_t n_pairs = ne00 / 2;
+        const int64_t n_rows  = std::max<int64_t>(1, SYCL_GET_ROWS_BLOCK_SIZE / n_pairs);
+        const sycl::range<3> wg(1, n_rows, n_pairs);
+        const sycl::range<3> grid(ne11 * ne12, (ne10 + n_rows - 1) / n_rows * n_rows, n_pairs);
+        stream->parallel_for(sycl::nd_range<3>(grid, wg),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 k_get_rows<qk, qr, dq>(
+                                     src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                                     s3, nb01, nb02, nb03, s10, s11, s12, item_ct1, ne10);
+                             });
+        GGML_UNUSED(ctx);
+        return;
+    }
 
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) {
@@ -558,8 +576,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 const void * vx = dst->src[0]->data;
                 get_rows_sycl_reorder_iq3(ctx, dst->src[0], dst->src[1], dst, src1_i32, (float *) dst->data,
                     [=](float * y, int64_t iblk, const sycl::nd_item<3> & item_ct1, int64_t nb) {
-                        dequantize_block_iq3_xxs_reorder(vx, y, iblk, item_ct1, nb,
-                                                         iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+                        dequantize_block_iq3_xxs_reorder(vx, y, iblk, item_ct1, nb);
                     });
                 break;
             }
@@ -579,8 +596,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 const void * vx = dst->src[0]->data;
                 get_rows_sycl_reorder_iq3(ctx, dst->src[0], dst->src[1], dst, src1_i32, (float *) dst->data,
                     [=](float * y, int64_t iblk, const sycl::nd_item<3> & item_ct1, int64_t nb) {
-                        dequantize_block_iq3_s_reorder(vx, y, iblk, item_ct1, nb,
-                                                       kmask_iq2xs, iq3s_grid);
+                        dequantize_block_iq3_s_reorder(vx, y, iblk, item_ct1, nb);
                     });
                 break;
             }
@@ -719,4 +735,134 @@ void ggml_sycl_op_get_rows_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0->type));
     }
+}
+bool ggml_sycl_qsa_gather_shape(const ggml_cgraph * cgraph, int i) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * cont_in  = cgraph->nodes[i];
+    ggml_tensor * rows     = cgraph->nodes[i + 1];
+    ggml_tensor * perm_out = cgraph->nodes[i + 2];
+    ggml_tensor * cont_out = cgraph->nodes[i + 3];
+
+    if (cont_in->op != GGML_OP_CONT || rows->op != GGML_OP_GET_ROWS || perm_out->op != GGML_OP_PERMUTE ||
+        cont_out->op != GGML_OP_CONT) {
+        return false;
+    }
+    for (const ggml_tensor * node : { cont_in, rows, perm_out, cont_out }) {
+        if (node->type != GGML_TYPE_F32 || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+    if (ggml_is_empty(cont_in) || ggml_is_empty(rows) || ggml_is_empty(cont_out)) {
+        return false;
+    }
+    if (cont_in->view_src || rows->view_src || cont_out->view_src) {
+        return false;
+    }
+    if ((cont_in->flags | rows->flags | perm_out->flags) & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, i + 2) != 1) {
+        return false;
+    }
+    if (rows->src[0] != cont_in || perm_out->src[0] != rows || perm_out->view_src != rows ||
+        perm_out->view_offs != 0 || cont_out->src[0] != perm_out) {
+        return false;
+    }
+
+    const ggml_tensor * src = cont_in->src[0];
+    const ggml_tensor * idx = rows->src[1];
+    if (!src || !idx || src->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src, cont_in) || src->ne[2] != 1 || src->ne[3] != 1) {
+        return false;
+    }
+    if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1 || idx->nb[0] != ggml_type_size(GGML_TYPE_I32)) {
+        return false;
+    }
+    const size_t type_size = ggml_type_size(GGML_TYPE_F32);
+    if (src->nb[0] % type_size != 0 || src->nb[1] % type_size != 0) {
+        return false;
+    }
+    if (rows->ne[0] != cont_in->ne[0] || rows->ne[1] != idx->ne[0] || rows->ne[2] != 1 || rows->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(cont_in) || !ggml_is_contiguous(rows) || !ggml_is_contiguous(cont_out)) {
+        return false;
+    }
+    if (perm_out->ne[0] != rows->ne[1] || perm_out->ne[1] != rows->ne[0] || perm_out->ne[2] != 1 ||
+        perm_out->ne[3] != 1 || perm_out->nb[0] != rows->nb[1] || perm_out->nb[1] != rows->nb[0]) {
+        return false;
+    }
+    return ggml_are_same_shape(cont_out, perm_out);
+}
+
+bool ggml_sycl_can_fuse_qsa_gather(const ggml_cgraph * cgraph, int i) {
+    return g_ggml_sycl_enable_fusion && ggml_sycl_qsa_gather_shape(cgraph, i);
+}
+
+template <int width>
+static void k_qsa_gather(const char * src, const int32_t * idx, float * dst,
+                         int64_t n_idx, size_t nb0, size_t nb1, const sycl::nd_item<2> & item) {
+    const int64_t t = item.get_global_id(0);
+    const int64_t c = (int64_t) item.get_global_id(1) * width;
+    if (c >= n_idx) {
+        return;
+    }
+
+    const char * row = src + t * nb0;
+    float * out = dst + t * n_idx + c;
+
+    if constexpr (width > 1) {
+        sycl::vec<float, width> values;
+#pragma unroll
+        for (int j = 0; j < width; ++j) {
+            values[j] = *(const float *) (row + (int64_t) idx[c + j] * nb1);
+        }
+        *(sycl::vec<float, width> *) out = values;
+    } else {
+        *out = *(const float *) (row + (int64_t) idx[c] * nb1);
+    }
+}
+
+int ggml_sycl_fuse_qsa_gather(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_sycl_can_fuse_qsa_gather(cgraph, i)) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cgraph->nodes[i]->src[0];
+    const ggml_tensor * idx = cgraph->nodes[i + 1]->src[1];
+    ggml_tensor * cont_out = cgraph->nodes[i + 3];
+
+    const int64_t n_idx = cont_out->ne[0];
+    const int64_t n_cols = cont_out->ne[1];
+    const int width = n_idx % 4 == 0 && (uintptr_t) cont_out->data % 16 == 0 ? 4 : 1;
+
+    constexpr int block = 256;
+    const int64_t items = (n_idx + width - 1) / width;
+    const sycl::range<2> local(1, block);
+    const sycl::range<2> global(n_cols, ((items + block - 1) / block) * block);
+
+    const char * src_data = (const char *) src->data;
+    const int32_t * idx_data = (const int32_t *) idx->data;
+    float * dst_data = (float *) cont_out->data;
+    const size_t nb0 = src->nb[0];
+    const size_t nb1 = src->nb[1];
+    GGML_ASSERT(src_data && idx_data && dst_data);
+
+    auto launch = [&](auto w) {
+        ctx.stream()->parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
+            k_qsa_gather<decltype(w)::value>(src_data, idx_data, dst_data, n_idx, nb0, nb1, item);
+        });
+    };
+    if (width == 4) {
+        launch(std::integral_constant<int, 4>{});
+    } else {
+        launch(std::integral_constant<int, 1>{});
+    }
+    return 3;
 }

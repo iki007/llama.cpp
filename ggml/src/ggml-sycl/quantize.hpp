@@ -39,20 +39,24 @@ __dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
 
 #pragma unroll(ElementsPerWI)
     for (int i = 0; i < ElementsPerWI; i++) {
-        sum += wi_f32_vals[i];
         amax                = sycl::fmax(amax, sycl::fabs(wi_f32_vals[i]));
         quantized_values[i] = 0;
     }
-    sum  = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
     amax = sycl::reduce_over_group(it.get_sub_group(), amax, sycl::maximum<float>());
     d    = amax == 0 ? 1 : amax / 127;
 
+    int isum = 0;
 #pragma unroll(ElementsPerWI)
     for (int i = 0; i < ElementsPerWI; i++) {
         quantized_values[i] = sycl::round(wi_f32_vals[i] / d);
+        isum += quantized_values[i];
     }
 
     d = amax == 0 ? 0 : d;
+    // The block sum as the CPU stores it, d * sum(qs), not the sum of the unquantized values: with it the offset term
+    // of q4_K / q5_K / q4_0 / q4_1 / q5_1 weights sees the same rounded activations as the product term, and the
+    // rounding errors are weighted by the centred weights instead of by their unsigned codes.
+    sum = d * sycl::reduce_over_group(it.get_sub_group(), isum, sycl::plus<int>());
 }
 
 // No op to control codepath in ggml_sycl_op_mul_mat

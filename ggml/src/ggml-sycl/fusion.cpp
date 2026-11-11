@@ -4,7 +4,7 @@
 #include <algorithm>
 
 // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
-// (weight layout, split buffers, DMMV) is checked by ggml_sycl_op_mul_mat_glu_fused().
+// (weight layout, split buffers, DMMV) is checked by ggml_sycl_mul_mat_glu_mmvq_fused().
 static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const ggml_tensor * up,
                                               const ggml_tensor * glu) {
     // the fused epilogue implements these two; the rest fall back to the standalone GLU kernels
@@ -32,29 +32,21 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // fused K-quant GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type
+    // fused GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type
     // q4_K, the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
     const bool reorder_pair = wu->type == GGML_TYPE_Q4_K && wg->type == GGML_TYPE_Q4_K;
     const bool plain_pair   = (wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_IQ4_XS) &&
                             (wg->type == GGML_TYPE_Q5_K || wg->type == GGML_TYPE_IQ4_XS);
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
-    // same-type pairs of the types of the XMX kernels, which also take a few more columns
-    // (the XMX kernels walk whole QK_K super-blocks, so they need rows of a multiple of QK_K)
-    const bool xmx_pair = wu->type == wg->type && ggml_sycl_xmx_supports_type(wu->type) && wu->ne[0] % QK_K == 0;
+    // same-type pairs of the types of upstream's XMX kernels, which also take a few more columns (only with
+    // GGML_SYCL_ENABLE_XMX_ESIMD=1 on this branch; the XMX kernels walk whole QK_K super-blocks, so rows of a multiple of QK_K)
+    const bool xmx_pair = g_ggml_sycl_enable_xmx_esimd && wu->type == wg->type && ggml_sycl_xmx_supports_type(wu->type) &&
+                          wu->ne[0] % QK_K == 0;
 #else
     const bool xmx_pair = false;
 #endif // GGML_SYCL_MMVQ_HAS_XMX
-    // the ESIMD kernel covers same-type q2_K..q6_K and q8_0, single column only (as unfused DMMV)
-#ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    const bool esimd_pair   = g_ggml_sycl_enable_esimd && wu->type == wg->type && act->ne[1] == 1 &&
-                            (wu->type == GGML_TYPE_Q2_K || wu->type == GGML_TYPE_Q3_K || wu->type == GGML_TYPE_Q4_K ||
-                             wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_Q6_K || wu->type == GGML_TYPE_Q8_0);
-#else
-    const bool esimd_pair   = false;
-#endif
-    // q8_0 rows are walked in 32-wide blocks, so they only need to be a multiple of QK8_0
-    const int64_t row_align = esimd_pair && wu->type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
-    if ((!reorder_pair && !plain_pair && !xmx_pair && !esimd_pair) || wu->ne[0] % row_align != 0) {
+    // no ESIMD pair on this branch: the unfused reorder MMVQ kernels beat it
+    if ((!reorder_pair && !plain_pair && !xmx_pair) || wu->ne[0] % QK_K != 0) {
         return false;
     }
 
@@ -82,6 +74,45 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     return true;
 }
 
+// mul_mat_id(gate) + mul_mat_id(up) + GLU: graph shape and tensor properties only. Weight layout and
+// the fused-path dispatch are checked by ggml_sycl_mul_mat_id_glu_mmvq_fused().
+static bool ggml_sycl_should_fuse_mul_mat_id_glu(const ggml_tensor * gate, const ggml_tensor * up,
+                                                 const ggml_tensor * glu) {
+    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(glu, 1) /* swapped */) {
+        return false;
+    }
+
+    const ggml_tensor * wu  = up->src[0];
+    const ggml_tensor * wg  = gate->src[0];
+    const ggml_tensor * act = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+
+    // one set of expert and block offsets and one quantized activation must serve both weights
+    if (wu->type != wg->type || !ggml_are_same_shape(wu, wg) || !ggml_are_same_stride(wu, wg)) {
+        return false;
+    }
+    if (act != gate->src[1] || ids != gate->src[2]) {
+        return false;
+    }
+
+    if (act->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) ||
+        !ggml_is_contiguous(glu) || act->ne[0] % QK8_1 != 0) {
+        return false;
+    }
+    if (act->ne[1] != 1 && act->ne[1] != ids->ne[0]) {
+        return false;
+    }
+    if (ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 // the unary ops the fused unary chains in element_wise.cpp have a functor for
 static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
     return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
@@ -101,8 +132,9 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
     // gate and up are siblings, not a chain, so ggml_can_fuse cannot express this: use the
     // subgraph form with the GLU as the only materialised output.
-    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_MUL_MAT &&
-        ops.begin()[2] == GGML_OP_GLU) {
+    const bool is_mul_mat_id = ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT_ID;
+    if (ops.size() == 3 && ops.begin()[0] == ops.begin()[1] &&
+        (ops.begin()[0] == GGML_OP_MUL_MAT || ops.begin()[0] == GGML_OP_MUL_MAT_ID) && ops.begin()[2] == GGML_OP_GLU) {
         if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
             return false;
         }
@@ -118,7 +150,8 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
             return false;
         }
 
-        return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+        return is_mul_mat_id ? ggml_sycl_should_fuse_mul_mat_id_glu(gate, up, glu) :
+                               ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

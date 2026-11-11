@@ -70,6 +70,7 @@ void ggml_sycl_host_free(void* ptr);
 extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
+extern int g_ggml_sycl_enable_dnn;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmvq_wide;
 extern int g_ggml_sycl_enable_xmx_esimd;
@@ -236,7 +237,7 @@ typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
-#define MMVQ_MAX_BATCH_SIZE  8
+#define MMVQ_MAX_BATCH_SIZE  16
 
 #if defined(GGML_SYCL_SUPPORT_XMX) && defined(__INTEL_LLVM_COMPILER) && __has_include(<sycl/ext/intel/esimd/xmx/dpas.hpp>)
 #    define GGML_SYCL_MMVQ_HAS_XMX
@@ -458,6 +459,50 @@ struct ggml_sycl_grouped_gemm_tile {
     int32_t n1;
 };
 
+// Grow-only pinned host buffer. The driver stages copies between the device and pageable host memory, which costs
+// 0.3-0.9 ms per small copy on an Arc Pro B70; copies to and from pinned memory do not pay that.
+struct ggml_sycl_pinned_buffer {
+    sycl::queue * queue = nullptr;
+    void *        ptr   = nullptr;
+    size_t        size  = 0;
+
+    // the caller must have drained every queued copy that still uses the current allocation
+    void * reserve(sycl::queue & q, size_t n) {
+        if (n > size) {
+            release();
+            ptr = sycl::malloc_host(n, q);
+            GGML_ASSERT(ptr != nullptr);
+            queue = &q;
+            size  = n;
+        }
+        return ptr;
+    }
+
+    void release() {
+        if (ptr != nullptr) {
+            sycl::free(ptr, *queue);
+            ptr  = nullptr;
+            size = 0;
+        }
+    }
+
+    ggml_sycl_pinned_buffer() = default;
+    ggml_sycl_pinned_buffer(const ggml_sycl_pinned_buffer &) = delete;
+    ggml_sycl_pinned_buffer & operator=(const ggml_sycl_pinned_buffer &) = delete;
+    ~ggml_sycl_pinned_buffer() { release(); }
+};
+
+// y = act(x * s0 + b0) * s1 + b1 at the store of a mat-vec output; the default is the identity
+enum ggml_sycl_mmv_act { GGML_SYCL_MMV_ACT_NONE = 0, GGML_SYCL_MMV_ACT_SILU, GGML_SYCL_MMV_ACT_SIGMOID };
+struct ggml_sycl_mmv_epilogue {
+    int   act    = GGML_SYCL_MMV_ACT_NONE;
+    float s0     = 1.0f;
+    float b0     = 0.0f;
+    float s1     = 1.0f;
+    float b1     = 0.0f;
+    bool  active = false;
+};
+
 namespace sycl_ex = sycl::ext::oneapi::experimental;
 
 #ifdef GGML_SYCL_GRAPH
@@ -500,12 +545,93 @@ struct ggml_backend_sycl_context {
     std::string name;
     optimize_feature opt_feature;
 
+    // this backend holds one part of weights split by rows over two devices (set by ggml_backend_sycl_comm_init)
+    bool row_split = false;
+
+    // f32->f16 conversion cache for a matmul's src1. Several projections inside one block
+    // read the SAME activation tensor -- Qwen3Next builds wq/wk/wv from one `cur` and
+    // wqkv/wqkv_gate from one `input` -- but ggml_sycl_op_mul_mat_sycl converts src1 into a
+    // per-call pool allocation, so the identical bytes are converted 2-3 times per block.
+    //
+    // Reuse is valid only while nothing has overwritten the source. That is checked against
+    // the GRAPH rather than the executed node sequence, so the fusion paths that advance `i`
+    // past several nodes are covered without each one having to remember to invalidate.
+    struct src1_f16_cache {
+        const ggml_cgraph * graph  = nullptr;
+        const void *        key    = nullptr;  // src1_ddf_i of the cached slice
+        const void *        stream = nullptr;  // separates the multi-device split path
+        size_t              ne     = 0;        // elements converted
+        int                 node   = -1;       // graph node index it was produced at
+        std::unique_ptr<ggml_sycl_pool_alloc<sycl::half>> buf;
+    } src1_f16;
+
+    // set by the graph walker so the matmul op can locate itself in the graph
+    const ggml_cgraph * cur_graph = nullptr;
+    int                 cur_node  = -1;
+
+    // GET_ROWS / SIGMOID nodes that a later gated_delta_net reads through instead (ggml_sycl_gdn_folds), for the
+    // graph with this uid; recomputed when a graph has no uid
+    struct {
+        uint64_t                          uid     = 0;
+        int                               n_nodes = -1;
+        std::vector<uint8_t>              skip;   // node runs inside a later gated_delta_net
+        std::vector<const ggml_tensor *>  gather; // per gated_delta_net node: the state GET_ROWS it reads through
+        std::vector<uint8_t>              beta;   // per gated_delta_net node: beta's SIGMOID is applied at load
+        std::vector<const ggml_tensor *>  lid_gather; // per lightning_indexer node: the K GET_ROWS it reads through
+    } gdn_folds;
+
+    // elementwise tail of a fused mat-vec (ggml_sycl_fuse_mmv_epilogue), applied by the ESIMD mat-vec at its store;
+    // mmv_epi_done tells whether a kernel took it
+    ggml_sycl_mmv_epilogue mmv_epi;
+    bool                   mmv_epi_done = false;
+
+    // The general device pool is stack-disciplined (it asserts that a free is the top of
+    // the stack), so a buffer held across nodes cannot live there. Give the cache its own
+    // pool -- it is the only allocation in it, so LIFO is trivially satisfied. Mirrors the
+    // existing host_pools / fattn_bufs pattern.
+    std::unique_ptr<ggml_sycl_pool> src1_pools[GGML_SYCL_MAX_DEVICES];
+
+    ggml_sycl_pool & src1_pool(int device) {
+        if (src1_pools[device] == nullptr) {
+            src1_pools[device] = new_pool_for_device(stream(device, 0), device);
+        }
+        return *src1_pools[device];
+    }
+
+    ggml_sycl_pool & src1_pool() { return src1_pool(device); }
+
+    void src1_f16_reset() {
+        src1_f16.buf.reset();
+        src1_f16.graph = nullptr;
+        src1_f16.key   = nullptr;
+        src1_f16.node  = -1;
+    }
+
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     explicit ggml_backend_sycl_context(int device) :
         device(device),
         name(GGML_SYCL_NAME + std::to_string(device)) {
         opt_feature = ggml_sycl_info().devices[device].opt_feature;
+    }
+
+    // src1_f16.buf is owned by src1_pools, and members are destroyed in REVERSE declaration
+    // order -- so the pools die first and ggml_sycl_pool_alloc's destructor then calls free()
+    // on a dead pool. Releasing the cache here works regardless of declaration order, because
+    // a destructor body runs before any member is destroyed.
+    //
+    // This is not theoretical: it segfaulted at exit on every process that ran a prefill, and
+    // on no decode-only one -- decode's ne1 == 1 takes mmvq, never converts src1, and so never
+    // populates the cache. The results had already been printed by then, which is exactly what
+    // makes it easy to miss.
+    ~ggml_backend_sycl_context() {
+        src1_f16_reset();
+        // the staging slots are released after this body: let every queued upload from them finish first
+        for (size_t i = 0; i < upload_submitted.size(); ++i) {
+            if (upload_submitted[i]) {
+                upload_events[i].wait();
+            }
+        }
     }
 
     queue_ptr stream(int device, int stream) {
@@ -574,6 +700,17 @@ struct ggml_backend_sycl_context {
 
     std::vector<mmid_row_mapping> mmid_row_mapping_host;
     std::vector<ggml_sycl_grouped_gemm_tile> mmid_tile_schedule_host;
+    // MUL_MAT_ID loop staging: ids read back, and the row mapping uploaded asynchronously. The mapping buffer is
+    // reused only after the next ids readback has drained the queue.
+    ggml_sycl_pinned_buffer mmid_ids_pinned;
+    ggml_sycl_pinned_buffer mmid_row_mapping_pinned;
+
+    // set_tensor_async from pageable host memory (the mmap()ed experts of CPU layers, uploaded for each prompt
+    // batch): host threads fill pinned slots that the device pulls while the next slot fills
+    ggml_sycl_pinned_buffer  upload_staging;
+    std::vector<sycl::event> upload_events;
+    std::vector<bool>        upload_submitted;
+    int                      upload_next = 0;
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
@@ -925,6 +1062,15 @@ static const sycl::uint3 init_fastdiv_values(uint32_t d) {
 static constexpr int ggml_sycl_get_max_cpy_bytes() {
     return 16;
 }
+
+// If the node after `dst` is a mul_mat that will convert `dst` to f16 as its src1, hand back a
+// buffer for the producing kernel to write that f16 copy into while the value is still in a
+// register, and register it in the src1 conversion cache so the mul_mat finds it. Returns
+// nullptr when the conversion would not happen (mat-vec paths, f16 dst, cache disabled), so a
+// caller can template the extra store away entirely. Defined in ggml-sycl.cpp, where the
+// cache and the mul_mat path predicates live.
+sycl::half * ggml_sycl_f16_mirror_for_next_matmul(ggml_backend_sycl_context & ctx,
+                                                  const ggml_tensor * dst, size_t ne);
 
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes.
 template <int nbytes, int alignment = 0>
