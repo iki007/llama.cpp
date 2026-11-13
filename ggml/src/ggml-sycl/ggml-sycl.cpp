@@ -102,6 +102,7 @@
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
+#include "ggml-sycl/pgemm.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
 
 #define MEM_SIZE_2M	0x00200000
@@ -3430,6 +3431,16 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 }
                 to_fp16_sycl(src1_ddf_i, out, ne, stream);
                 src1_ptr = out;
+            }
+        }
+
+        // Q4_K / Q5_K / IQ4_XS at 64+ tokens: the weights dequantized inside the GEMM (pgemm.cpp) instead of expanded
+        // to f16 for oneMKL; on the converted (cached) src1. Qwen3.8-27B, two B70: pp512 at 16k context 933 -> 1048 t/s
+        if (src1_ncols >= 64 && ggml_sycl_pgemm_supported(ctx.device, src0->type)) {
+            const auto * ex = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+            if (ggml_sycl_pgemm(src0->type, src0_dd_i, ex && ex->optimized_feature.reorder, src1_ptr, dst_dd_i, (int) ne10,
+                                (int) row_diff, (int) src1_ncols, ldc, stream)) {
+                return;
             }
         }
 

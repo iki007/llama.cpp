@@ -11156,6 +11156,13 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // prompt-size MUL_MAT with the weights dequantized in the GEMM (pgemm.cpp): q4_K / q5_K / iq4_xs, 128-row tiles,
+    // 64+ tokens, a token tail (100), plain blocks (reordered ones: MUL_MAT_REORDERED)
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 512, 256, 1024, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 100, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 2048, 512, { 1, 1 }, { 1, 1 }));
+    }
     // head-256 decode / verify rows of the 27B per card (12 query / 2 KV heads): 1..16 rows per stream, 1 / 2 / 4 / 8
     // streams (sessions), a causal mask over each stream's last rows, q8_0 and f16 caches, large logits
     for (int64_t ns : { 1, 2, 4, 8 }) {
