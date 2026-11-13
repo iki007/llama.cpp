@@ -11181,6 +11181,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, 1024, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, 512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
+    // a q8_0 K / q4_0 V cache (V read in place by the XMX decode kernel, converted by the prompt kernel): 1 / 2 / 4 / 8
+    // streams, decode / verify rows and prompt rows, causal masks, keys not a multiple of the 256-key block
+    for (int64_t ns : { 1, 2, 4, 8 }) {
+        for (int64_t nb : { 1, 3, 4, 6, 8, 33, 300 }) {
+            for (int64_t kv : { 512, 1536 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {6, ns}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    }
+    // the KV cache's own layout: the heads of a token interleaved in one row (permute 0 2 1 3: head stride = one block
+    // row), as the server's caches are read in place; q8_0 / q8_0 and q8_0 K / q4_0 V
+    for (ggml_type tv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t ns : { 1, 4 }) {
+            for (int64_t nb : { 1, 6, 8, 33 }) {
+                for (int64_t kv : { 512, 1536 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                           GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
+                }
+            }
+        }
+        // a decode and a prompt batch past 65535 keys (a 98304-cell slot at 64k)
+        for (int64_t nb : { 1, 33 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, 1}, 65792, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                   GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
+        }
+    }
     // head-256 decode / verify rows of the 27B per card (12 query / 2 KV heads): 1..16 rows per stream, 1 / 2 / 4 / 8
     // streams (sessions), a causal mask over each stream's last rows, q8_0 and f16 caches, large logits
     for (int64_t ns : { 1, 2, 4, 8 }) {
@@ -14467,6 +14494,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // decode attention of 4 sessions of the 27B per card at depth: q8_0 / q8_0 against q8_0 K / q4_0 V
+    for (ggml_type tv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t kv : { 32768, 65536, 131072 }) {
+            for (int64_t nb : { 1, 6 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, 4}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, tv));
+            }
+        }
+    }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
