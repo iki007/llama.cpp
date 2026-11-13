@@ -14365,6 +14365,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_epilogue(t, 320, n, 1024, false, 2, true));
         }
     }
+    // 2 to 32 rows on a weight a one-row MUL_MAT has reordered: the 1-8 and 9-64 column XMX mat-vec kernels (with and
+    // without 2D activation loads), row tails, the 27B's FFN width
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+        for (int64_t n : { 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 31, 32 }) {
+            test_cases.emplace_back(new test_mul_mat_reordered(t, 4096, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_reordered(t, 2056, n, 5120));
+        }
+    }
     // batches past 32 rows on a weight a one-row MUL_MAT has reordered: up to 160 rows in chunks of 32 where a type
     // has a mat-vec kernel that wide, else the dequantizing XMX GEMM (33 to 64 rows) or dequantize + library GEMM
     for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
