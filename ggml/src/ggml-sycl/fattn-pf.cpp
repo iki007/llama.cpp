@@ -317,7 +317,7 @@ bool ggml_sycl_fa_prompt(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         n_kv < PF_BC || H % n_kvh != 0 || K->ne[3] != ns || V->ne[3] != ns || V->ne[1] != n_kv || V->ne[2] != n_kvh ||
         dst->ne[0] != D || dst->ne[1] != H || dst->ne[2] != nr || dst->ne[3] != ns ||
         !((K->type == V->type && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0)) ||
-          (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0)) || (uintptr_t) mask->data % 64 != 0 || mask->nb[1] % 16 != 0 ||
+          (K->type == GGML_TYPE_Q8_0 && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q5_0))) || (uintptr_t) mask->data % 64 != 0 || mask->nb[1] % 16 != 0 ||
         mask->nb[1] < 64 || (ns > 1 && mask->ne[3] == ns && mask->nb[3] % 64 != 0) || Q->nb[0] != sizeof(float)) {
         return false;
     }
@@ -355,7 +355,7 @@ bool ggml_sycl_fa_prompt(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_pool_alloc<uint32_t> vp(ctx.pool(), (size_t) ns * n_kvh * n_kv * D / 2);
     for (int w = 0; w < 2; ++w) {
         const ggml_tensor * T = w ? V : K;
-        if (T->type != GGML_TYPE_F16) {  // q8_0, or a q4_0 V
+        if (T->type != GGML_TYPE_F16) {  // q8_0, or a q4_0 / q5_0 V
             const size_t ts = ggml_type_size(T->type);
             ggml_get_to_fp16_nc_sycl(T->type)(T->data, (sycl::half *) (w ? vp.get() : kt.get()), T->ne[0], T->ne[1], T->ne[2],
                                               T->ne[3], (int64_t) (T->nb[1] / ts), (int64_t) (T->nb[2] / ts),
