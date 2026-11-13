@@ -9506,6 +9506,32 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// a causal mask over the last nb cells (row j of a stream sees keys 0 .. kv - nb + j), as decode / verify rows and a
+// prompt chunk at depth get
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",causal=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> f(ggml_nelements(m));
+        const int64_t n_kv = m->ne[0], rows = m->ne[1];
+        for (int64_t s = 0; s < m->ne[3]; ++s) {
+            for (int64_t j = 0; j < rows; ++j) {
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    const bool vis = j < nb && i <= kv - nb + j;
+                    f[(s * rows + j) * n_kv + i] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
+                }
+            }
+        }
+        ggml_backend_tensor_set(m, f.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11130,6 +11156,17 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // head-256 decode / verify rows of the 27B per card (12 query / 2 KV heads): 1..16 rows per stream, 1 / 2 / 4 / 8
+    // streams (sessions), a causal mask over each stream's last rows, q8_0 and f16 caches, large logits
+    for (int64_t ns : { 1, 2, 4, 8 }) {
+        for (int64_t nb : { 1, 3, 4, 8, 16 }) {
+            for (int64_t kv : { 512, 1536 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, 768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {6, ns}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
 
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         for (int64_t nt : { 1, 2, 7, 32 }) {
