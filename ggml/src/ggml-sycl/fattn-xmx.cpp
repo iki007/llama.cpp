@@ -123,7 +123,9 @@ static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, R> fa_xmx_row_sum(
 // Q8: K and V are a q8_0 cache read in place (see the loads below); otherwise f16
 // D: the head size (256 or 128). T = D / 16 threads, each owning 16 dims of O and scoring 16 tokens of a block of
 // BK = 16 T tokens; KS = D / 16 k-steps of 16 dims per score.
-template <int D, int RG, bool SKIP, bool Q8>
+// MG > 0: g == MG query heads per KV head known at compile time, so the block's mask rows (one per query row, shared by
+// its MG heads) are loaded before the scores and added with no runtime index
+template <int D, int RG, bool SKIP, bool Q8, int MG = 0>
 static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx     = sycl::ext::intel::esimd::xmx;
@@ -220,6 +222,19 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
             }
         }
 
+        // the mask rows of this block's query rows, issued before the score loads (MG > 0)
+        constexpr int MQ = MG > 0 ? (R8 + MG - 1) / MG : 1;
+        simd<float, MQ * 16> mkr;
+        if constexpr (MG > 0) {
+#pragma unroll
+            for (int j = 0; j < MQ; ++j) {
+                const int          jj = j < a.nq ? j : a.nq - 1;
+                const sycl::half * mp = (const sycl::half *) (Ms + jj * a.m_nb1) + my_tok;
+                mkr.template select<16, 1>(16 * j) = convert<float>(block_load<sycl::half, 16>(mp, a16));
+            }
+            mkr *= 1.44269504088896341f;
+        }
+
         // 2. S[r][n] = Q[r] . K[my_tok + n] for this thread's 16 tokens
         simd<float, R8 * 16> s = 0.0f;
         auto score_ks = [&](int ks, const simd<sycl::half, 256> & b) {
@@ -281,13 +296,27 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
             score();
         }
 
-        // 3. mask (log2 domain), per query row j
+        // 3. mask (log2 domain): one load per query row j for its g heads r = j g + c (one per row and head was ~22%
+        // of the kernel at 8 rows: 48 small loads per thread and block)
+        if constexpr (MG > 0) {
 #pragma unroll
-        for (int r = 0; r < R8; ++r) {
-            if (r < M) {
-                const sycl::half * mp = (const sycl::half *) (Ms + (r / a.g) * a.m_nb1) + my_tok;
-                simd<float, 16>    mk = convert<float>(block_load<sycl::half, 16>(mp, a16));
-                s.template select<16, 1>(16 * r) += mk * 1.44269504088896341f;
+            for (int r = 0; r < R8; ++r) {
+                s.template select<16, 1>(16 * r) += mkr.template select<16, 1>(16 * (r / MG));
+            }
+        } else {
+            simd<float, 16> mk = 0.0f;
+            int             jl = -1;
+#pragma unroll
+            for (int r = 0; r < R8; ++r) {
+                if (r < M) {
+                    const int j = r / a.g;
+                    if (j != jl) {
+                        const sycl::half * mp = (const sycl::half *) (Ms + j * a.m_nb1) + my_tok;
+                        mk = convert<float>(block_load<sycl::half, 16>(mp, a16)) * 1.44269504088896341f;
+                        jl = j;
+                    }
+                    s.template select<16, 1>(16 * r) += mk;
+                }
             }
         }
 
@@ -617,14 +646,24 @@ template <int D, int RG, bool SKIP, bool Q8>
 static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
     constexpr int           T = D / 16;
     const sycl::nd_range<1> range(sycl::range<1>((size_t) a.n_str * n_kvh * a.nsplit * T), sycl::range<1>(T));
-    auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8>(a, it); };
-    if constexpr (RG <= 3) {
-        if (grf128) {
-            stream->parallel_for(range, fa_xmx_grf128<decltype(kern)>{ kern });
+    auto go = [&](auto kern) {
+        if constexpr (RG <= 3) {
+            if (grf128) {
+                stream->parallel_for(range, fa_xmx_grf128<decltype(kern)>{ kern });
+                return;
+            }
+        }
+        stream->parallel_for(range, fa_xmx_grf256<decltype(kern)>{ kern });
+    };
+    // Qwen3.8-27B (6 query heads per KV head), one card, 4 / 8 rows per stream over a q8_0 cache: +10..17% / +28..35%
+    // against one mask load per row and head; 8 streams at 27.6k in the model 26.6 -> 21.7 ms of decode attention a round
+    if constexpr (D == 256) {
+        if (a.g == 6) {
+            go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 6>(a, it); });
             return;
         }
     }
-    stream->parallel_for(range, fa_xmx_grf256<decltype(kern)>{ kern });
+    go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8>(a, it); });
 }
 
 template <int D, bool SKIP, bool Q8>
