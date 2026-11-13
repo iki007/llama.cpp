@@ -2146,7 +2146,8 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
 
 // More than 8 columns: DPAS repeats over at most 8 A rows, so one dequantized B operand feeds NG dpas<8, 8> calls,
 // one per group of 8 columns. A column past ncols_y repeats the last one; its sums are not written.
-template <ggml_type T, int NG, int TPW, bool A2D = false>
+// H: the tile decoded in f16 arithmetic (traits::block_h)
+template <ggml_type T, int NG, int TPW, bool A2D = false, bool H = false>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
                                                    const int64_t dst_stride, const bool a2d, const int ntile,
@@ -2191,7 +2192,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
                                                                       (unsigned) y_stride * 2 - 1, 0, 0);
     for (int ib = tid; ib < nb_row; ib += TPW) {
         const sycl::half * yb = y + (size_t) ib * QK_K;
-        traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
+        auto step = [&](int koff, simd<sycl::half, 256> & b) {
             if (A2D || a2d) {
                 a4_desc.set_x(ib * QK_K + koff);
                 a_desc.set_x(ib * QK_K + koff);
@@ -2231,7 +2232,12 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
                     acc[g] = xmx::dpas<8, NC, float, float>(acc[g], b, a);
                 }
             }
-        });
+        };
+        if constexpr (H) {
+            traits::block_h(vx, nb, row_blk + (uint32_t) ib, step);
+        } else {
+            traits::block(vx, nb, row_blk + (uint32_t) ib, step);
+        }
     }
 
     // the threads' partial sums meet in local memory, a column of 16 rows per message
@@ -2309,6 +2315,18 @@ static void dequantize_mul_mat_vec_dpas_wide_sycl(const void * vx, const sycl::h
         };
         // with 2D activation loads the per-column fallback is compiled out (its 32 column addresses were computed for
         // every block: ~19% of the vector instructions of a q4_K 32-column tile)
+        // q4_K / q5_K / iq4_xs decode the tile in f16 arithmetic (dpas_trait_h): 27B, two cards, 24 / 32-row batches,
+        // wide kernels together with the fallback removal -8.9 / -9.0% (GGML_SYCL_DPAS_WIDE_F16=0: f32 decode)
+        static const bool wide_f16 = ggml_sycl_get_env("GGML_SYCL_DPAS_WIDE_F16", 1) != 0;
+        if constexpr (dpas_trait_h<dpas_tile_traits<T>>::value) {
+            if (a2d && wide_f16) {
+                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
+                    dequantize_mul_mat_vec_dpas_wide<T, NG, TPW, true, true>(vx, y, dst, ncols, nrows, ncols_y, y_stride,
+                                                                             dst_stride, a2d, ntile, lmem, it);
+                });
+                return;
+            }
+        }
         if (a2d) {
             go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
                 dequantize_mul_mat_vec_dpas_wide<T, NG, TPW, true>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride,
