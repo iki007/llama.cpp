@@ -11204,6 +11204,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // 17..31 rows of one sequence (a short tool result or prompt tail): row chunks of the decode kernel, not the
+        // tile kernel over an f16 copy of the cache
+        for (int64_t ns : { 1, 4 }) {
+            for (int64_t nb : { 17, 24, 31 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, 1536, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                       GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
+            }
+        }
         // a decode and a prompt batch past 65535 keys (a 98304-cell slot at 64k)
         for (int64_t nb : { 1, 33 }) {
             test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, 1}, 65792, nb, true, false, 0, 0, GGML_PREC_F32,

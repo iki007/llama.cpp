@@ -940,9 +940,13 @@ static bool fa_xmx_supported(int device, const ggml_tensor * dst, bool check_dat
     }
     const int64_t g  = Q->ne[2] / K->ne[2];
     const int64_t nq = Q->ne[1];
-    // rows beyond 64 / g run as further row chunks, each reading the cache once more
+    // rows beyond 64 / g run as further row chunks, each reading the cache once more. A quantized cache read in place
+    // takes up to 31 rows (the prompt kernel starts at 32): past max_q the tile kernel would convert the whole cache to
+    // f16 first (Qwen3.8-27B, q8_0 K / q5_0 V, 24 rows of one sequence at 98k: 8.4 ms per layer and card in the tile
+    // kernel plus 2.2 ms of conversion, against 3 chunks of 8 rows here)
     // a block is D tokens (D / 16 threads x 16 tokens)
-    if ((nq > max_q && !fa_xmx_use_list(dst, max_q)) || g > 64 || K->ne[1] % D != 0 || mask->ne[0] < K->ne[1] ||
+    const bool in_place = q8_kv && nq < 32;
+    if ((nq > max_q && !in_place && !fa_xmx_use_list(dst, max_q)) || g > 64 || K->ne[1] % D != 0 || mask->ne[0] < K->ne[1] ||
         mask->ne[1] < nq) {
         return false;
     }
