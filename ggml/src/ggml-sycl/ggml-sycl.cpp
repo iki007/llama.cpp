@@ -14,6 +14,7 @@
 #include <array>
 #include <assert.h>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cinttypes>
 #include <cstddef>
@@ -891,6 +892,50 @@ static bool ggml_sycl_buffer_init_staging(ggml_backend_sycl_buffer_context * ctx
     return ctx->staging.data != nullptr;
 }
 
+// what the host thread last entered or left, on which device and when (steady clock, us): the exchange guard reports it
+// when a flag is late, to tell a host stall from a device one
+enum ggml_sycl_host_mark_what {
+    GGML_SYCL_MARK_NONE = 0,
+    GGML_SYCL_MARK_SET_TENSOR, GGML_SYCL_MARK_SET_TENSOR_END,
+    GGML_SYCL_MARK_GET_TENSOR, GGML_SYCL_MARK_GET_TENSOR_END,
+    GGML_SYCL_MARK_SYNC,       GGML_SYCL_MARK_SYNC_END,
+    GGML_SYCL_MARK_GRAPH,      GGML_SYCL_MARK_GRAPH_END,
+};
+static std::atomic<int64_t> g_sycl_mark_us{0};
+static std::atomic<int64_t> g_sycl_mark_bytes{0};
+static std::atomic<int>     g_sycl_mark_what{GGML_SYCL_MARK_NONE};
+static std::atomic<int>     g_sycl_mark_dev{-1};
+
+static int64_t ggml_sycl_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct ggml_sycl_host_mark {
+    const int what, dev;
+    ggml_sycl_host_mark(int what, int dev, int64_t bytes = 0) : what(what), dev(dev) { set(what, dev, bytes); }
+    ~ggml_sycl_host_mark() { set(what + 1, dev, 0); }
+    static void set(int w, int d, int64_t b) {
+        g_sycl_mark_what.store(w, std::memory_order_relaxed);
+        g_sycl_mark_dev.store(d, std::memory_order_relaxed);
+        g_sycl_mark_bytes.store(b, std::memory_order_relaxed);
+        g_sycl_mark_us.store(ggml_sycl_now_us(), std::memory_order_release);
+    }
+};
+
+static const char * ggml_sycl_host_mark_name(int w) {
+    switch (w) {
+        case GGML_SYCL_MARK_SET_TENSOR:     return "in set_tensor";
+        case GGML_SYCL_MARK_SET_TENSOR_END: return "left set_tensor";
+        case GGML_SYCL_MARK_GET_TENSOR:     return "in get_tensor";
+        case GGML_SYCL_MARK_GET_TENSOR_END: return "left get_tensor";
+        case GGML_SYCL_MARK_SYNC:           return "in synchronize";
+        case GGML_SYCL_MARK_SYNC_END:       return "left synchronize";
+        case GGML_SYCL_MARK_GRAPH:          return "in graph_compute";
+        case GGML_SYCL_MARK_GRAPH_END:      return "left graph_compute";
+        default:                            return "none";
+    }
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -899,6 +944,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+    const ggml_sycl_host_mark mark(GGML_SYCL_MARK_SET_TENSOR, ctx->device, (int64_t) size);
     ggml_sycl_set_device(ctx->device);
 
     // copy through pinned memory so the device never reads mmap()ed pages directly
@@ -959,6 +1005,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+    const ggml_sycl_host_mark mark(GGML_SYCL_MARK_GET_TENSOR, ctx->device, (int64_t) size);
 
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
@@ -7900,6 +7947,7 @@ catch (sycl::exception const &exc) {
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    const ggml_sycl_host_mark mark(GGML_SYCL_MARK_SYNC, sycl_ctx->device);
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
 
@@ -8727,6 +8775,7 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    const ggml_sycl_host_mark mark(GGML_SYCL_MARK_GRAPH, sycl_ctx->device);
 
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()
@@ -9702,6 +9751,7 @@ struct ggml_backend_sycl_comm_context {
     int        hslot         = 0;
     uint32_t * hflag         = nullptr;
     uint32_t   hseq          = 0;
+    std::atomic<int64_t> hseq_us{0};  // when the host started the last exchange (steady clock, us)
 
     // per device a second in-order queue whose copies run on the copy engine next to the main queue's kernels;
     // per device stage the last copy out of it
@@ -10182,6 +10232,15 @@ static bool ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     if (phase == GGML_SYCL_COMM_START && !(x.duplex || x.block || x.ce)) {
         return false;
     }
+    // a copy-engine exchange still in flight raises its flag from the copy engine after its upload; a block or duplex
+    // exchange started behind it raises the same flag word from another queue and can land first (card 1's x4 upload of
+    // a 2048-row partial outlasts a 4-row ubatch's sub-graph, the pair at the end of a prompt), so the older value
+    // overwrote the newer one and the peer waited for a flag that had gone back (the guard's flags k + 1 / k, card 1
+    // one behind). Such an exchange runs whole instead, which finishes the copy-engine one first
+    if (phase == GGML_SYCL_COMM_START && !x.ce &&
+        std::any_of(comm_ctx->pending.begin(), comm_ctx->pending.end(), [](const auto & p) { return p.ce; })) {
+        return false;
+    }
     if (comm_ctx->hbox_bytes < x.xbytes) {
         if (!comm_ctx->pending.empty()) {
             return false;
@@ -10216,6 +10275,7 @@ static bool ggml_sycl_comm_allreduce_host(ggml_backend_sycl_comm_context * comm_
     x.out[1]   = tensors[1]->data;
     x.slot     = comm_ctx->hslot;
     x.seq      = ++comm_ctx->hseq;
+    comm_ctx->hseq_us.store(ggml_sycl_now_us(), std::memory_order_relaxed);
     comm_ctx->hslot = (comm_ctx->hslot + 1) % ggml_backend_sycl_comm_context::n_slots;
 
     // leaving the second queue: the main queue waits for the copy engine's last payload and flag, or its flag below
@@ -10329,32 +10389,57 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
             GGML_LOG_INFO("%s: exchanges of graph pairs on the copy engines: %s\n", __func__, ctx->ce ? "yes" : "no (Level Zero setup failed)");
             if (ctx->ce) {
                 ctx->ce_dog = std::thread([ctx]() {
-                    auto stuck_since = std::chrono::steady_clock::now();
-                    bool stuck       = false;
+                    // the driver resets an engine after a job runs 5 s (xe job_timeout_ms): a flag that has not moved for
+                    // 2 s is reported with what the host was doing, and released at 3.5 s; one that moves in between was
+                    // late (a long batch on one card), not lost, and the exchange goes on
+                    static const int warn_ms    = ggml_sycl_get_env("GGML_SYCL_COMM_GUARD_WARN_MS", 2000);
+                    static const int release_ms = ggml_sycl_get_env("GGML_SYCL_COMM_GUARD_MS", 3500);
+                    int64_t  stuck_since = 0;
+                    bool     stuck = false, warned = false;
                     uint32_t last0 = 0, last1 = 0;
                     while (!ctx->ce_dog_stop) {
                         const uint32_t seq = __atomic_load_n(&ctx->hseq, __ATOMIC_RELAXED);
                         const uint32_t f0  = __atomic_load_n(&ctx->hflag[0], __ATOMIC_RELAXED);
                         const uint32_t f1  = __atomic_load_n(&ctx->hflag[16], __ATOMIC_RELAXED);
-                        // a long graph keeps the flags behind the host while they still advance: only a flag that
-                        // stops moving for 2 s is lost (a 2-session 52k prefill batch ran > 2 s behind and was released)
+                        const int64_t  now = ggml_sycl_now_us();
+                        // a long graph keeps the flags behind the host while they still advance: only a flag that stops
+                        // moving counts (a 2-session 52k prefill batch ran > 2 s behind)
                         const bool moved = f0 != last0 || f1 != last1;
                         last0 = f0;
                         last1 = f1;
                         if ((f0 >= seq && f1 >= seq) || moved) {
-                            stuck = false;
+                            if (warned) {
+                                GGML_LOG_WARN("ggml_sycl_comm: exchange flags moved again after %.2f s (%u / %u, sequence %u): late, not lost\n",
+                                              (now - stuck_since) / 1e6, f0, f1, seq);
+                            }
+                            stuck  = false;
+                            warned = false;
                         } else if (!stuck) {
                             stuck       = true;
-                            stuck_since = std::chrono::steady_clock::now();
-                        } else if (std::chrono::steady_clock::now() - stuck_since > std::chrono::seconds(2)) {
-                            GGML_LOG_ERROR("ggml_sycl_comm: exchange flags %u / %u behind sequence %u, unchanged for 2 s: released\n",
-                                           f0, f1, seq);
-                            __atomic_store_n(&ctx->hflag[0],  0xfffffff0u, __ATOMIC_SEQ_CST);
-                            __atomic_store_n(&ctx->hflag[16], 0xfffffff0u, __ATOMIC_SEQ_CST);
-                            ctx->ce_broken = true;
-                            stuck          = false;
+                            stuck_since = now;
+                        } else {
+                            const int64_t ms = (now - stuck_since) / 1000;
+                            if (!warned && ms >= warn_ms) {
+                                warned = true;
+                                const int what = g_sycl_mark_what.load(std::memory_order_acquire);
+                                GGML_LOG_WARN("ggml_sycl_comm: exchange flags %u / %u behind sequence %u, unchanged for %.2f s; "
+                                              "host started that exchange %.2f s ago, last %s (device %d, %lld bytes) %.2f s ago\n",
+                                              f0, f1, seq, ms / 1e3, (now - ctx->hseq_us.load(std::memory_order_relaxed)) / 1e6,
+                                              ggml_sycl_host_mark_name(what), g_sycl_mark_dev.load(std::memory_order_relaxed),
+                                              (long long) g_sycl_mark_bytes.load(std::memory_order_relaxed),
+                                              (now - g_sycl_mark_us.load(std::memory_order_relaxed)) / 1e6);
+                            }
+                            if (ms >= release_ms) {
+                                GGML_LOG_ERROR("ggml_sycl_comm: exchange flags %u / %u behind sequence %u, unchanged for %.2f s: released\n",
+                                               f0, f1, seq, ms / 1e3);
+                                __atomic_store_n(&ctx->hflag[0],  0xfffffff0u, __ATOMIC_SEQ_CST);
+                                __atomic_store_n(&ctx->hflag[16], 0xfffffff0u, __ATOMIC_SEQ_CST);
+                                ctx->ce_broken = true;
+                                stuck          = false;
+                                warned         = false;
+                            }
                         }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
                     }
                 });
             }
