@@ -419,12 +419,19 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
                     qh_lo = vw.template select<16, 1, 1, 1>(r0, 2);
                     qh_hi = vw.template select<16, 1, 1, 1>(r0, 3);
                 }
-                const simd<uint16_t, 16>  qh  = (t & 1) ? qh_hi : qh_lo;
-                const simd<uint16_t, 16>  dim(0, 1);
-                const simd<uint16_t, 256> hb  = (qh.template replicate_vs_w_hs<16, 1, 16, 0>(0) >> dim.template replicate<16>()) & 1;
-                const simd<uint8_t, 256>  nib = (t & 1) ? simd<uint8_t, 256>(qb >> 4) : simd<uint8_t, 256>(qb & 0x0F);
-                const simd<uint8_t, 256>  q   = nib | simd<uint8_t, 256>(hb << 4);
-                simd<sycl::half, 256> hv = (convert<sycl::half>(q) - sycl::half(16.0f)) * dh.template replicate_vs_w_hs<16, 1, 16, 0>(0);
+                const simd<uint16_t, 16> qh  = (t & 1) ? qh_hi : qh_lo;
+                const simd<uint8_t, 256> nib = (t & 1) ? simd<uint8_t, 256>(qb >> 4) : simd<uint8_t, 256>(qb & 0x0F);
+                // 16 b without integer shifts per value: qh & 1 << i is 2^i or 0, exact in f16, and times 2^(4 - i) it is
+                // 16 or 0 (2^-11 is a normal f16); the two 16-wide constants repeat across the token rows
+                const simd<uint16_t, 16> dim(0, 1);
+                const simd<uint16_t, 16> bit = simd<uint16_t, 16>(1) << dim;
+                simd<uint16_t, 16>       scb = (simd<uint16_t, 16>(19) - dim) << 10;  // the bits of the f16 2^(4 - i)
+                const simd<sycl::half, 16> sc  = scb.template bit_cast_view<sycl::half>();
+                const simd<uint16_t, 256> hbm = qh.template replicate_vs_w_hs<16, 1, 16, 0>(0) & bit.template replicate<16>();
+                // q = nibble + 16 b in [0, 31] is exact, then q d - 16 d in one multiply-add (16 d is exact)
+                simd<sycl::half, 256> hv = convert<sycl::half>(hbm) * sc.template replicate<16>() + convert<sycl::half>(nib);
+                const simd<sycl::half, 16> nd = dh * sycl::half(-16.0f);
+                hv = hv * dh.template replicate_vs_w_hs<16, 1, 16, 0>(0) + nd.template replicate_vs_w_hs<16, 1, 16, 0>(0);
                 auto vb2 = vb.template bit_cast_view<sycl::half, 8, 32>();
                 auto hv2 = hv.template bit_cast_view<sycl::half, 16, 16>();
                 vb2.template select<8, 1, 16, 2>(0, 0) = hv2.template select<8, 2, 16, 1>(0, 0);
