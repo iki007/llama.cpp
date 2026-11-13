@@ -487,6 +487,107 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// seqs first decoded out of order (1, 0, 2) used to sit in out-of-order cells. Seq 0 then verifies a few tokens in its own
+// ubatch, and the next ubatch of the same batch (seqs 1 and 2) re-orders the cells and moves seq 0 aside, away from its
+// rollback snapshots. Rolling seq 0 back must then still work and give the logits of a context that never went past the
+// kept token.
+struct case_rollback_after_reorder : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "reorder"; }
+
+    const char * description() const override {
+        return "roll back a seq right after a batch whose later ubatch re-ordered the recurrent cells";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t  n_seqs     = 4; // seqs 0..2 are used, 4 keeps the reserve shapes even
+        constexpr llama_pos n_prompt   = 12;
+        constexpr uint32_t  n_verify   = 4; // seq 0 decodes this many tokens, then keeps only the first
+
+        for (const int unified : { 0, 1 }) {
+            const auto make_ctx = [&]() {
+                ctx_opts opts;
+                opts.n_ctx      = 256;
+                opts.n_batch    = 64;
+                opts.n_ubatch   = 32;
+                opts.n_seq_max  = n_seqs;
+                opts.n_rs_seq   = 8;
+                opts.kv_unified = unified;
+                return mr.ctx(opts);
+            };
+
+            llama_context_ptr ctx_roll = make_ctx();
+            llama_context_ptr ctx_ref  = make_ctx();
+            if (!ctx_roll || !ctx_ref) {
+                return case_result::fail();
+            }
+
+            if (llama_n_rs_seq(ctx_roll.get()) < n_verify - 1) {
+                return case_result::skip("n_rs_seq is too small");
+            }
+
+            const auto tok = [&](llama_seq_id seq, llama_pos pos) {
+                return gen_token(n_vocab, seq, pos);
+            };
+
+            bool ok = true;
+
+            // the first decode of each seq picks its cell
+            for (const llama_seq_id s : { 1, 0, 2 }) {
+                ok = ok && decode_gen(ctx_roll.get(), n_vocab, s, 0, n_prompt);
+                ok = ok && decode_gen(ctx_ref.get(),  n_vocab, s, 0, n_prompt);
+            }
+            CTX_REQUIRE(ok, "the prompt decode failed");
+
+            // one batch: seq 0 first (n_verify tokens in roll, 1 in ref), then 1 token each for seqs 1 and 2
+            const auto decode_mixed = [&](llama_context * ctx, uint32_t n0) {
+                common_batch batch(ctx);
+                for (uint32_t i = 0; i < n0; ++i) {
+                    batch.add(tok(0, n_prompt + (llama_pos) i), n_prompt + (llama_pos) i, 0, true);
+                }
+                for (const llama_seq_id s : { 1, 2 }) {
+                    batch.add(tok(s, n_prompt), n_prompt, s, true);
+                }
+                return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            };
+
+            ok = decode_mixed(ctx_roll.get(), n_verify) && decode_mixed(ctx_ref.get(), 1);
+            CTX_REQUIRE(ok, "the mixed decode failed");
+
+            // keep only the first verified token of seq 0
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), 0, n_prompt + 1, -1),
+                    "the rollback of seq 0 was refused (kv_unified " + std::to_string(unified) + ")");
+
+            ok = decode_one(ctx_roll.get(), tok(0, n_prompt + 9), n_prompt + 1, 0) &&
+                 decode_one(ctx_ref.get(),  tok(0, n_prompt + 9), n_prompt + 1, 0);
+            CTX_REQUIRE(ok, "the decode after the rollback failed");
+
+            const float * l_roll = llama_get_logits_ith(ctx_roll.get(), 0);
+            const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
+            if (l_roll == nullptr || l_ref == nullptr) {
+                TLOG_ERR("%s: missing logits after the rollback\n", __func__);
+                return case_result::fail();
+            }
+
+            logits_diff diff;
+            diff.add(l_roll, l_ref, n_vocab);
+
+            // as in the replay case: random dummy models drift up to ~1.7e-5
+            CTX_REQUIRE(diff.nmse() <= 1e-4f,
+                    "logits after the rollback differ (kv_unified " + std::to_string(unified) + ", max diff " +
+                    std::to_string(diff.diff_max) + ", nmse " + std::to_string(diff.nmse()) + ")");
+
+            TLOG_INF("%s: kv_unified %d: rollback after re-order matched (max diff %g, nmse %g)\n",
+                    __func__, unified, (double) diff.diff_max, diff.nmse());
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -494,6 +595,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_rollback_after_reorder>());
 
     return cases;
 }

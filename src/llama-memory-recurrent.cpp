@@ -608,7 +608,13 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cell.seq_id.size() == 1) { has_cell = true; }
         }
         if (!has_cell) {
-            auto & empty_cell = cells[next_empty_cell];
+            // keep seq i in cell i while that cell is free: the ubatches of a non-unified cache hold consecutive seqs, so
+            // they then never need the re-ordering below, which moves a seq's state but not its rollback snapshots
+            uint32_t cell_id = next_empty_cell;
+            if ((uint32_t) seq_id < size && cells[seq_id].is_empty()) {
+                cell_id = seq_id;
+            }
+            auto & empty_cell = cells[cell_id];
             GGML_ASSERT(empty_cell.is_empty());
             // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
@@ -619,9 +625,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
             }
-            seq_meta.tail = next_empty_cell;
+            seq_meta.tail = cell_id;
             // find next empty cell
-            if (s + 1 < n_seqs) {
+            if (cell_id == next_empty_cell && s + 1 < n_seqs) {
                 for (uint32_t j = 0; j < size; ++j) {
                     next_empty_cell += 1;
                     if (next_empty_cell >= size) { next_empty_cell -= size; }
@@ -646,6 +652,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+
+            // the seq moved out of the way keeps its state (via src) but its rollback snapshots stay behind
+            src_cell.rs_max = 0;
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
