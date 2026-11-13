@@ -2003,7 +2003,7 @@ static bool ggml_sycl_dpas_a2d(const sycl::half * y, int64_t y_stride) {
 
 // The activations of a k step are one 2D block load when y allows it (a2d: 64-byte aligned base, pitch a multiple of
 // 16 bytes): one message for NC columns x 16 halves, already in DPAS A order, instead of one load per column.
-template <ggml_type T, int NC, int TPW>
+template <ggml_type T, int NC, int TPW, bool A2D = false>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                               const int nrows, const int64_t y_stride, const int64_t dst_stride,
                                               const bool a2d, sycl::local_accessor<float, 1> lmem,
@@ -2046,10 +2046,10 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
             traits::block_coded(vx, nb, row_blk + (uint32_t) ib,
                 [&](int slot, int koff, simd<sycl::half, 256> & b) {
                     simd<sycl::half, NP * 16> a = sycl::half(0.0f);
-                    if (a2d) {
+                    if (A2D || a2d) {
                         a_desc.set_x(ib * QK_K + koff);
                         a.template select<NC * 16, 1>(0) = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
-                    } else {
+                    } else if constexpr (!A2D) {
 #pragma unroll
                         for (int c = 0; c < NC; ++c) {
                             a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + c * y_stride + koff);
@@ -2074,10 +2074,10 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas(const void * vx, const sycl::half 
         const sycl::half * yb = y + (size_t) ib * QK_K;
         traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
             simd<sycl::half, NC * 16> a;
-            if (a2d) {
+            if (A2D || a2d) {
                 a_desc.set_x(ib * QK_K + koff);
                 a = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
-            } else {
+            } else if constexpr (!A2D) {
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
                     a.template select<16, 1>(c * 16) = block_load<sycl::half, 16>(yb + c * y_stride + koff);
@@ -2129,17 +2129,24 @@ static void dequantize_mul_mat_vec_dpas_sycl(const void * vx, const sycl::half *
     const bool    a2d        = ggml_sycl_dpas_a2d(y, y_stride);
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(TPW * NC * ROWS), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW)),
-                       [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                           dequantize_mul_mat_vec_dpas<T, NC, TPW>(vx, y, dst, ncols, nrows, y_stride, dst_stride, a2d, lmem,
-                                                                   it);
-                       });
+        // with 2D activation loads the per-column fallback is compiled out: the compiler hoisted its column addresses
+        // out of the branch into every block (27B, two cards, 8-row batch: 8-column kernels 33.96 -> 32.62 ms)
+        const sycl::nd_range<1> range(sycl::range<1>((size_t) workgroups * TPW), sycl::range<1>(TPW));
+        if (a2d) {
+            h.parallel_for(range, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                dequantize_mul_mat_vec_dpas<T, NC, TPW, true>(vx, y, dst, ncols, nrows, y_stride, dst_stride, a2d, lmem, it);
+            });
+        } else {
+            h.parallel_for(range, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                dequantize_mul_mat_vec_dpas<T, NC, TPW>(vx, y, dst, ncols, nrows, y_stride, dst_stride, a2d, lmem, it);
+            });
+        }
     });
 }
 
 // More than 8 columns: DPAS repeats over at most 8 A rows, so one dequantized B operand feeds NG dpas<8, 8> calls,
 // one per group of 8 columns. A column past ncols_y repeats the last one; its sums are not written.
-template <ggml_type T, int NG, int TPW>
+template <ggml_type T, int NG, int TPW, bool A2D = false>
 ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::half * y, float * dst, const int ncols,
                                                    const int nrows, const int ncols_y, const int64_t y_stride,
                                                    const int64_t dst_stride, const bool a2d, const int ntile,
@@ -2185,7 +2192,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
     for (int ib = tid; ib < nb_row; ib += TPW) {
         const sycl::half * yb = y + (size_t) ib * QK_K;
         traits::block(vx, nb, row_blk + (uint32_t) ib, [&](int koff, simd<sycl::half, 256> & b) {
-            if (a2d) {
+            if (A2D || a2d) {
                 a4_desc.set_x(ib * QK_K + koff);
                 a_desc.set_x(ib * QK_K + koff);
 #pragma unroll
@@ -2212,7 +2219,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_dpas_wide(const void * vx, const sycl::
                     simd<sycl::half, NC * 16> a = esimd_x::lsc_load_2d<sycl::half, 16, NC, 1, false, false>(a_desc);
                     acc[NG - 1] = xmx::dpas<8, NC, float, float>(acc[NG - 1], b, a);
                 }
-            } else {
+            } else if constexpr (!A2D) {
 #pragma unroll
                 for (int g = 0; g < NG; ++g) {
                     simd<sycl::half, NC * 16> a;
@@ -2293,14 +2300,25 @@ static void dequantize_mul_mat_vec_dpas_wide_sycl(const void * vx, const sycl::h
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(ntile * TPW * NG * 8 * ROWS), h);
         const sycl::nd_range<1> range(sycl::range<1>((size_t) workgroups * ntile * TPW), sycl::range<1>(ntile * TPW));
-        auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
-            dequantize_mul_mat_vec_dpas_wide<T, NG, TPW>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, a2d,
-                                                         ntile, lmem, it);
+        auto go = [&](auto kern) {
+            if constexpr (NG > 4) {
+                h.parallel_for(range, dmmv_dpas_grf256<decltype(kern)>{ kern });
+            } else {
+                h.parallel_for(range, [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL { kern(it); });
+            }
         };
-        if constexpr (NG > 4) {
-            h.parallel_for(range, dmmv_dpas_grf256<decltype(kern)>{ kern });
+        // with 2D activation loads the per-column fallback is compiled out (its 32 column addresses were computed for
+        // every block: ~19% of the vector instructions of a q4_K 32-column tile)
+        if (a2d) {
+            go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
+                dequantize_mul_mat_vec_dpas_wide<T, NG, TPW, true>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride,
+                                                                   a2d, ntile, lmem, it);
+            });
         } else {
-            h.parallel_for(range, [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL { kern(it); });
+            go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION {
+                dequantize_mul_mat_vec_dpas_wide<T, NG, TPW>(vx, y, dst, ncols, nrows, ncols_y, y_stride, dst_stride, a2d,
+                                                             ntile, lmem, it);
+            });
         }
     });
 }
