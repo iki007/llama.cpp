@@ -86,8 +86,8 @@ struct fa_xmx_args {
     // between streams (m_nb3 = 0: one mask for all) and span flags between streams
     int              n_str;
     size_t           q_nb3, k_nb3, v_nb3, m_nb3, live_nb3;
-    // a q4_0 V cache read in place next to a q8_0 K cache (decode rows, head 256)
-    bool             vq4;
+    // 4 / 5: a q4_0 / q5_0 V cache read in place next to a q8_0 K cache (head 256), else 0
+    int              vq;
 };
 
 // row maxima of an [R][16] block
@@ -127,9 +127,10 @@ static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, R> fa_xmx_row_sum(
 // BK = 16 T tokens; KS = D / 16 k-steps of 16 dims per score.
 // MG > 0: g == MG query heads per KV head known at compile time, so the block's mask rows (one per query row, shared by
 // its MG heads) are loaded before the scores and added with no runtime index
-// VQ4: the V cache is q4_0 (read in place like q8_0: blocks of 18 bytes, a 2-byte f16 scale and 16 bytes holding values
-// i and i + 16 in their low and high nibbles), the K cache q8_0
-template <int D, int RG, bool SKIP, bool Q8, int MG = 0, bool VQ4 = false>
+// VQ: 4 / 5 for a q4_0 / q5_0 V cache read in place like q8_0, the K cache q8_0. q4_0: blocks of 18 bytes, a 2-byte f16
+// scale and 16 bytes holding values i and i + 16 in their low and high nibbles. q5_0: blocks of 22 bytes, the scale, 4
+// bytes of fifth bits (bit i for value i), then the same 16 bytes of nibbles
+template <int D, int RG, bool SKIP, bool Q8, int MG = 0, int VQ = 0>
 static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx     = sycl::ext::intel::esimd::xmx;
@@ -208,11 +209,12 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
     esimd_x::config_2d_mem_access<uint32_t, 1, 16, 1>  k1_desc(Kh, (unsigned) a.k_nb1 - 1, surf_h, (unsigned) a.k_nb1 - 1, 0, 0);
     esimd_x::config_2d_mem_access<uint32_t, 16, 32, 1> vq_desc((const uint32_t *) Vh, (unsigned) a.v_nb1 - 1, surf_h,
                                                                (unsigned) a.v_nb1 - 1, kvh * a.v_hx + 34 * (t >> 1) / 4, 0);
-    // q4_0 V: block j = t / 2 starts 18 j bytes into the head row, at byte 0 (even j) or 2 (odd j) of a dword; one
-    // [32 tokens][8 dwords] load per two token steps covers its scale and 16 bytes; half t & 1 takes the low or high
-    // nibbles (values 16 (t & 1)..)
-    esimd_x::config_2d_mem_access<uint32_t, 8, 32, 1> vq4_desc((const uint32_t *) Vh, (unsigned) a.v_nb1 - 1, surf_h,
-                                                               (unsigned) a.v_nb1 - 1, kvh * a.v_hx + 18 * (t >> 1) / 4, 0);
+    // q4_0 / q5_0 V: block j = t / 2 starts 18 j / 22 j bytes into the head row, at byte 0 (even j) or 2 (odd j) of a
+    // dword; one [32 tokens][8 dwords] load per two token steps covers the whole block (20 / 24 bytes from the dword);
+    // half t & 1 takes the low or high nibbles (values 16 (t & 1)..)
+    constexpr int VB = VQ == 5 ? 22 : 18;
+    esimd_x::config_2d_mem_access<uint32_t, 8, 32, 1> vqn_desc((const uint32_t *) Vh, (unsigned) a.v_nb1 - 1, surf_h,
+                                                               (unsigned) a.v_nb1 - 1, kvh * a.v_hx + VB * (t >> 1) / 4, 0);
 
     const int blk0 = split * a.bps;
     const int nblk = a.n_kv / BK;
@@ -363,11 +365,11 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
         for (int r = 0; r < R8; ++r) {
             o.template select<16, 1>(16 * r) *= alpha[r];
         }
-        simd<uint32_t, 32 * (VQ4 ? 8 : 16)> vwin;  // q8_0 / q4_0: the V window of token steps ts & ~1
+        simd<uint32_t, 32 * (VQ ? 8 : 16)> vwin;  // q8_0 / q4_0 / q5_0: the V window of token steps ts & ~1
         auto vload = [&](int ts) {
-            if constexpr (VQ4) {
-                vq4_desc.set_y(tok0 + ts * 16);
-                vwin = esimd_x::lsc_load_2d<uint32_t, 8, 32, 1, false, false>(vq4_desc);
+            if constexpr (VQ) {
+                vqn_desc.set_y(tok0 + ts * 16);
+                vwin = esimd_x::lsc_load_2d<uint32_t, 8, 32, 1, false, false>(vqn_desc);
             } else if constexpr (Q8) {
                 vq_desc.set_y(tok0 + ts * 16);
                 vwin = esimd_x::lsc_load_2d<uint32_t, 16, 32, 1, false, false>(vq_desc);
@@ -375,7 +377,7 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
         };
         auto pv = [&](int ts) {
             simd<sycl::half, 256> vb;
-            if constexpr (VQ4) {
+            if constexpr (VQ == 4) {
                 // (q - 8) * d: the integer is exact in f16 and the product is rounded once, the values of the f16 copy
                 auto                 vb8 = vwin.template bit_cast_view<uint8_t, 32, 32>();
                 auto                 vh  = vwin.template bit_cast_view<sycl::half, 32, 16>();
@@ -391,6 +393,38 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
                 }
                 const simd<uint8_t, 256> nib = (t & 1) ? simd<uint8_t, 256>(qb >> 4) : simd<uint8_t, 256>(qb & 0x0F);
                 simd<sycl::half, 256> hv = (convert<sycl::half>(nib) - sycl::half(8.0f)) * dh.template replicate_vs_w_hs<16, 1, 16, 0>(0);
+                auto vb2 = vb.template bit_cast_view<sycl::half, 8, 32>();
+                auto hv2 = hv.template bit_cast_view<sycl::half, 16, 16>();
+                vb2.template select<8, 1, 16, 2>(0, 0) = hv2.template select<8, 2, 16, 1>(0, 0);
+                vb2.template select<8, 1, 16, 2>(0, 1) = hv2.template select<8, 2, 16, 1>(1, 0);
+            } else if constexpr (VQ == 5) {
+                // (q - 16) * d with q = nibble | fifth bit << 4: exact in f16, the product rounded once, as the f16 copy.
+                // Even j: scale at byte 0, fifth bits at 2..5, nibbles at 6..21; odd j: 2, 4..7, 8..23. The 16 fifth
+                // bits of this half are one u16 per token: bit i belongs to dim i
+                auto                 vb8 = vwin.template bit_cast_view<uint8_t, 32, 32>();
+                auto                 vh  = vwin.template bit_cast_view<sycl::half, 32, 16>();
+                auto                 vw  = vwin.template bit_cast_view<uint16_t, 32, 16>();
+                const int            r0  = (ts & 1) * 16;
+                simd<uint8_t, 256>   qb;
+                simd<sycl::half, 16> dh;
+                simd<uint16_t, 16>   qh_lo, qh_hi;
+                if ((t & 2) == 0) {
+                    qb    = vb8.template select<16, 1, 16, 1>(r0, 6);
+                    dh    = vh.template select<16, 1, 1, 1>(r0, 0);
+                    qh_lo = vw.template select<16, 1, 1, 1>(r0, 1);
+                    qh_hi = vw.template select<16, 1, 1, 1>(r0, 2);
+                } else {
+                    qb    = vb8.template select<16, 1, 16, 1>(r0, 8);
+                    dh    = vh.template select<16, 1, 1, 1>(r0, 1);
+                    qh_lo = vw.template select<16, 1, 1, 1>(r0, 2);
+                    qh_hi = vw.template select<16, 1, 1, 1>(r0, 3);
+                }
+                const simd<uint16_t, 16>  qh  = (t & 1) ? qh_hi : qh_lo;
+                const simd<uint16_t, 16>  dim(0, 1);
+                const simd<uint16_t, 256> hb  = (qh.template replicate_vs_w_hs<16, 1, 16, 0>(0) >> dim.template replicate<16>()) & 1;
+                const simd<uint8_t, 256>  nib = (t & 1) ? simd<uint8_t, 256>(qb >> 4) : simd<uint8_t, 256>(qb & 0x0F);
+                const simd<uint8_t, 256>  q   = nib | simd<uint8_t, 256>(hb << 4);
+                simd<sycl::half, 256> hv = (convert<sycl::half>(q) - sycl::half(16.0f)) * dh.template replicate_vs_w_hs<16, 1, 16, 0>(0);
                 auto vb2 = vb.template bit_cast_view<sycl::half, 8, 32>();
                 auto hv2 = hv.template bit_cast_view<sycl::half, 16, 16>();
                 vb2.template select<8, 1, 16, 2>(0, 0) = hv2.template select<8, 2, 16, 1>(0, 0);
@@ -690,11 +724,19 @@ static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, bool grf128, dpct::q
     // Qwen3.8-27B (6 query heads per KV head), one card, 4 / 8 rows per stream over a q8_0 cache: +10..17% / +28..35%
     // against one mask load per row and head; 8 streams at 27.6k in the model 26.6 -> 21.7 ms of decode attention a round
     if constexpr (D == 256 && Q8) {
-        if (a.vq4) {
+        if (a.vq == 4) {
             if (a.g == 6) {
-                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 6, true>(a, it); });
+                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 6, 4>(a, it); });
             } else {
-                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 0, true>(a, it); });
+                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 0, 4>(a, it); });
+            }
+            return;
+        }
+        if (a.vq == 5) {
+            if (a.g == 6) {
+                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 6, 5>(a, it); });
+            } else {
+                go([=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8, 0, 5>(a, it); });
             }
             return;
         }
@@ -803,7 +845,7 @@ static bool fa_xmx_use_list(const ggml_tensor * dst, int max_q) {
 // and each head either at a 64-byte aligned offset (hb) or inside the token row (hx, the KV cache's heads interleaved
 // per token)
 static bool fa_xmx_q8_layout(const ggml_tensor * t, size_t & hb, int & hx) {
-    // a head row of q8_0 (34-byte blocks) or q4_0 (18-byte blocks)
+    // a head row of q8_0 (34-byte blocks), q4_0 (18) or q5_0 (22)
     const size_t row = ggml_row_size(t->type, t->ne[0]);
     if ((uintptr_t) t->data % 64 != 0 || t->nb[1] % 16 != 0 || t->nb[1] < 64 || t->nb[1] >= (1u << 24)) {
         return false;
@@ -846,9 +888,9 @@ static bool fa_xmx_supported(int device, const ggml_tensor * dst, bool check_dat
 
     // a q8_0 cache is read in place or converted to f16 once per call (see ggml_sycl_flash_attn_ext_xmx)
     const bool f16_kv = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
-    // a q8_0 K with a q4_0 V cache: read in place, head 256, decode rows only (fa_xmx_impl, VQ4)
-    const bool vq4    = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && K->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) &&
-                     V->nb[0] == ggml_type_size(GGML_TYPE_Q4_0);
+    // a q8_0 K with a q4_0 / q5_0 V cache: read in place, head 256 (fa_xmx_impl, VQ)
+    const bool vq4    = K->type == GGML_TYPE_Q8_0 && (V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q5_0) &&
+                     K->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && V->nb[0] == ggml_type_size(V->type);
     const bool q8_kv  = (vq4 || (V->type == GGML_TYPE_Q8_0 && V->nb[0] == ggml_type_size(GGML_TYPE_Q8_0))) &&
                        K->type == GGML_TYPE_Q8_0 && (!check_data || K->data != V->data) && K->nb[0] == ggml_type_size(GGML_TYPE_Q8_0);
     if (Q->type != GGML_TYPE_F32 || !(f16_kv || q8_kv) || dst->type != GGML_TYPE_F32 ||
@@ -1215,7 +1257,7 @@ static void fa_xmx_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, cons
     ggml_sycl_pool_alloc<float> part_ml(ctx.pool(), (size_t) n_hs * nsplit * R8_max * 2);
 
     fa_xmx_args a = {};
-    a.vq4       = V->type == GGML_TYPE_Q4_0;
+    a.vq        = V->type == GGML_TYPE_Q4_0 ? 4 : V->type == GGML_TYPE_Q5_0 ? 5 : 0;
     a.n_kvh     = n_kvh;
     a.n_str     = n_str;
     a.q_nb3     = n_str > 1 ? Q->nb[3] : 0;
