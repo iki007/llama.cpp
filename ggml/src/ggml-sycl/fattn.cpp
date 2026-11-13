@@ -18,6 +18,7 @@
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
 #include "fattn-xmx.hpp"
+#include "fattn-pf.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
@@ -374,6 +375,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
     // sparse nodes are gathered down to n_kv_max rows and re-dispatched here
     if (ggml_sycl_flash_attn_ext_sparse(ctx, dst)) {
+        return;
+    }
+
+    // prompt rows (32+ per stream) at head 256 on XMX, every stream in one launch: Qwen3.8-27B, two cards, causal 32k
+    // keys, 1 x 512 / 2 x 1024 / 4 x 512 / 8 x 256 rows 1.43x / 2.50x / 2.61x / 2.49x the old path
+    if (ggml_sycl_fa_prompt(ctx, dst)) {
         return;
     }
 

@@ -11163,6 +11163,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 100, 2048, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 2048, 512, { 1, 1 }, { 1, 1 }));
     }
+    // prompt-size flash attention (fattn-pf.cpp): head 256, GQA 6, q8_0 / f16, a row tail, two streams
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 512, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1024, 100, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // and the 27B per card (12 query / 2 KV heads) for 1 / 2 / 4 / 8 sessions (streams): row tails, short and longer
+    // keys, q8_0 and f16, large logits, causal masks over the last rows
+    for (int64_t ns : { 1, 2, 4, 8 }) {
+        for (int64_t nb : { 33, 128, 300 }) {
+            for (int64_t kv : { 256, 1024 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, ns}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, ns}, 512, 200, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {6, ns}, 512, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, 1024, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, ns}, 512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
     // head-256 decode / verify rows of the 27B per card (12 query / 2 KV heads): 1..16 rows per stream, 1 / 2 / 4 / 8
     // streams (sessions), a causal mask over each stream's last rows, q8_0 and f16 caches, large logits
     for (int64_t ns : { 1, 2, 4, 8 }) {
