@@ -11212,8 +11212,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                                        GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
             }
         }
-        // a decode and a prompt batch past 65535 keys (a 98304-cell slot at 64k)
-        for (int64_t nb : { 1, 33 }) {
+        // decode / verify rows and a prompt batch past 65535 keys (a 98304-cell slot at 64k)
+        for (int64_t nb : { 1, 4, 6, 33 }) {
             test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {6, 1}, 65792, nb, true, false, 0, 0, GGML_PREC_F32,
                                                                    GGML_TYPE_Q8_0, tv, {0, 2, 1, 3}));
         }
