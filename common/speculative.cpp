@@ -2034,8 +2034,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
         verify_row0.assign(n_seq, -1);
 
-        // shared memory and chained heads keep the host rows
-        if (!is_mem_shared && !chain_heads) {
+        // shared memory and chained heads keep the host rows; host rows are also the default here (env LLAMA_MTP_DEV=1
+        // turns the device rows on): with the output layer on card 1 and the draft on card 0, a Flash-Next draft round
+        // took 109 ms with them against 72 ms with host rows
+        const char * env_dev = getenv("LLAMA_MTP_DEV");
+        if (!is_mem_shared && !chain_heads && env_dev != nullptr && atoi(env_dev) != 0) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_ctx_state_src(ctx_dft, nullptr);
