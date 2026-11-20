@@ -165,6 +165,15 @@ int main()
         root ::= "a"{5000,6000}
     )""");
 
+    // maximum below the minimum (Issue #32550)
+    verify_failure(R"""(
+        root ::= "a"{3,2}
+    )""");
+
+    verify_failure(R"""(
+        vK1::=4444444444444{445,00000444}tno2minLe4{445,4244442}nonicpmolu
+    )""");
+
     // Recursion depth limit exceeded (Issue #29495)
     {
         std::string deep_grammar = "root ::= ";
