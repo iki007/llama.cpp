@@ -718,6 +718,10 @@ const char * llama_grammar_parser::parse_sequence(
             } else {
                 throw std::runtime_error(std::string("expecting ',' at ") + pos);
             }
+            // {m,n} with n < m would wrap n - m around in handle_repetitions (hang and OOM, #32550)
+            if (max_times != UINT64_MAX && max_times < min_times) {
+                throw std::runtime_error(std::string("repetition maximum is smaller than its minimum before ") + pos);
+            }
             if (min_times > MAX_REPETITION_THRESHOLD) {
                 throw std::runtime_error(std::string("number of repetitions exceeds sane defaults, please reduce the number of repetitions"));
             }
