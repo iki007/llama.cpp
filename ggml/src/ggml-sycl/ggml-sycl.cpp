@@ -7336,6 +7336,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += 2;
             continue;
         }
+        if (node->op == GGML_OP_CONT && ggml_sycl_try_skip_bias_table_cont(cgraph, i)) {
+            continue;
+        }
         if (node->op == GGML_OP_RMS_NORM) {
             const int mix_nodes_to_skip = ggml_sycl_try_depth_mix_fusion(*sycl_ctx, cgraph, i);
             if (mix_nodes_to_skip > 0) {
@@ -8380,8 +8383,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            // K/V row lists and indexed bias are not supported
-            return op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) && ggml_sycl_flash_attn_ext_supported(device, op);
+            // K/V row lists are not supported; an indexed bias only where the tile kernel takes it (fattn.cpp)
+            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

@@ -132,7 +132,8 @@ static void mkl_fa_online_softmax_chunk(
     const sycl::half * mask_data, int64_t mask_head_stride,
     int64_t mask_row_stride, int mask_n_heads,
     float logit_softcap, int64_t wg_size,
-    const sycl::event & dep_event) {
+    const sycl::event & dep_event,
+    const fattn_indexed_bias bias, int query0) {
 
     // One work-group per query row: exactly q_rows groups of wg_size
     // items. q_rows * wg_size is already a multiple of wg_size, so unlike
@@ -171,8 +172,19 @@ static void mkl_fa_online_softmax_chunk(
                         s = logit_softcap * sycl::tanh(s);
                     }
                     if (mask_h) {
-                        s += (float)mask_h[q_row * m_stride
+                        float m = (float)mask_h[q_row * m_stride
                             + (chunk_start + i)];
+                        // an indexed bias: the head's value of this key's bin, rounded with the mask to F16
+                        // (the tile kernel's and the dense mask's rounding); query0 = the stream's first query
+                        if (bias.table) {
+                            const int64_t query = query0 + q_row;
+                            const int bin = bias.indices[query * bias.stride + chunk_start + i];
+                            if ((uint32_t) bin < (uint32_t) bias.n_bins) {
+                                m = (float) (sycl::half) (m + bias.table[
+                                    (query * bias.n_head + kvh_head + gqa_group) * bias.n_bins + bin]);
+                            }
+                        }
+                        s += m;
                     }
                     return s;
                 };
@@ -210,36 +222,42 @@ static void mkl_fa_online_softmax_chunk(
     });
 }
 
-// Write one GQA group's normalized output to its destination head.
-static void mkl_fa_normalize_head(
+// Write the normalized outputs of the gqa_ratio heads of one KV head (heads kvh_base_head + iqg) to their destination,
+// one work-item per output value: reads and writes run along DV, one launch for the group. The softmax state
+// (VKQ_accum / KQ_sum / KQ_max) is [iqg][query] rows of the group, as the GEMMs left it.
+static void mkl_fa_normalize_heads(
     dpct::queue_ptr stream,
     float * __restrict dst_batch,
     const float * __restrict VKQ_accum,
     const float * __restrict KQ_sum,
-    int iqh, int n_queries, int DV, int n_q_heads,
-    int64_t src_offset, int64_t wg_size) {
+    int kvh_base_head, int gqa_ratio, int n_queries, int DV, int n_q_heads,
+    int64_t wg_size,
+    const float * __restrict KQ_max, const float * sinks) {
 
-    const int64_t wg = ((n_queries + wg_size - 1) / wg_size) * wg_size;
+    const int64_t n_total = (int64_t) gqa_ratio * n_queries * DV;
+    const int64_t wg      = ((n_total + wg_size - 1) / wg_size) * wg_size;
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<1>(wg, wg_size),
             [=](sycl::nd_item<1> item) {
-                int jc = item.get_global_id(0);
-                if (jc >= n_queries) return;
+                const int64_t i = item.get_global_id(0);
+                if (i >= n_total) return;
+                const int     v   = (int) (i % DV);
+                const int64_t row = i / DV;               // iqg * n_queries + query
+                const int     jc  = (int) (row % n_queries);
+                const int     iqh = kvh_base_head + (int) (row / n_queries);
 
-                int     ksum_idx = (int)(src_offset / DV) + jc;
-                float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
-                const float * __restrict src = VKQ_accum
-                    + src_offset + jc * (int64_t)DV;
-                // Interleaved dst layout (matching TILE):
-                // rows alternate between heads, then increment query.
-                // offset = (query * n_q_heads + head) * DV
-                float * __restrict dst_row = dst_batch
-                    + ((int64_t)jc * n_q_heads + iqh) * (int64_t)DV;
-
-                for (int v = 0; v < DV; v++) {
-                    dst_row[v] = src[v] * inv_sum;
+                float inv_sum = 1.0f / KQ_sum[row];
+                if (sinks) {
+                    // the head's sink logit joins the softmax denominator, against max(row max, sink)
+                    const float m  = KQ_max[row];
+                    const float sk = sinks[iqh];
+                    const float mm = m > sk ? m : sk;
+                    const float a  = (m < -1e29f) ? 0.0f : sycl::native::exp(m - mm);
+                    inv_sum = a / (KQ_sum[row] * a + sycl::native::exp(sk - mm));
                 }
+                // interleaved dst layout (matching TILE): rows alternate between heads, then increment query
+                dst_batch[((int64_t) jc * n_q_heads + iqh) * DV + v] = VKQ_accum[row * DV + v] * inv_sum;
             });
     });
 }
@@ -490,6 +508,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     // --- Allocate intermediates from pool ---
     ggml_sycl_pool & pool = ctx.pool();
 
+    // the pool is a stack: the transposed bias table, allocated first, is declared first so that it is freed last
+    ggml_sycl_pool_alloc<float>      bias_table_t(pool); // [n_bins x n_head x n_queries], an indexed bias only
+    const fattn_indexed_bias bias = dst->src[6] ? ggml_sycl_fattn_indexed_bias(stream, dst, bias_table_t) : fattn_indexed_bias{};
+    const float * sinks_data = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
     ggml_sycl_pool_alloc<float>      KQ_f32(pool);      // [q_tile_rows x chunk]
     ggml_sycl_pool_alloc<sycl::half> S_f16(pool);       // [q_tile_rows x chunk]
     ggml_sycl_pool_alloc<float>      VKQ_chunk(pool);   // [q_tile_rows x DV]
@@ -603,7 +625,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             kvh_base_head,
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
-                            logit_softcap, wg_size, kq_done);
+                            logit_softcap, wg_size, kq_done,
+                            bias, ib * n_queries);
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
@@ -641,15 +664,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 }
             }
 
-            // 4. Normalize and scatter each GQA head to dst
-            for (int iqg = 0; iqg < gqa_ratio; iqg++) {
-                int     iqh        = kvh_base_head + iqg;
-                int64_t src_offset = (int64_t)iqg * n_queries * DV;
-                mkl_fa_normalize_head(stream,
-                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
-                    iqh, n_queries, DV, n_q_heads,
-                    src_offset, wg_size);
-            }
+            // 4. Normalize and scatter the group's GQA heads to dst (one launch)
+            mkl_fa_normalize_heads(stream,
+                dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                kvh_base_head, gqa_ratio, n_queries, DV, n_q_heads,
+                wg_size, KQ_max_ptr, sinks_data);
         }
     }
 
