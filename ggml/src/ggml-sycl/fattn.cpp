@@ -21,6 +21,7 @@
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
+#include "convert.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -135,10 +136,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (per_head_mask && Q->ne[2] % mask->ne[2] != 0) {
         return BEST_FATTN_KERNEL_NONE;
     }
-    // an indexed bias (ggml_flash_attn_ext_add_indexed_bias) is applied by the tile kernel only, one head a group; for
-    // a few query rows the graph's dense per-head mask (supports_op false) is cheap and keeps the vector kernel
+    // an indexed bias (ggml_flash_attn_ext_add_indexed_bias) is applied by the tile kernel (one head a group), the MKL
+    // path and the vector kernel (one token)
     const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
-    if (indexed_bias && (Q->ne[1] < 8 || !mask || max_bias != 0.0f || logit_softcap != 0.0f ||
+    if (indexed_bias && (!mask || max_bias != 0.0f || logit_softcap != 0.0f ||
                          (K->ne[0] != 64 && K->ne[0] != 128) || V->ne[0] != K->ne[0])) {
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -174,7 +175,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     static const int mkl_fa_min_kv = ggml_sycl_get_env("GGML_SYCL_MKL_FA_MIN_KV", 1024);
     // an indexed bias and its sinks are applied by the MKL softmax / normalization (fattn-mkl.cpp); sinks without an
     // indexed bias stay on the kernels below as before
+    // the MKL path converts a non-F16 cache with ggml_get_to_fp16(_nc)_sycl (fattn-mkl.cpp, mkl_fa_dequant_chunk): a type
+    // without that conversion (e.g. iq4_nl) would call a null function, so it stays on the kernels below
+    const auto mkl_kv_ok = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F16 || ggml_get_to_fp16_nc_sycl(t->type) != nullptr;
+    };
     if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !per_head_mask && (!sinks || indexed_bias) && gqa_ratio >= 2 &&
+        mkl_kv_ok(K) && mkl_kv_ok(V) &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= mkl_fa_min_kv &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -278,10 +285,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
-    if (can_use_vector_kernel && !indexed_bias) {
+    if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
+                // with an indexed bias the mask is shared, which would allow the GQA tile; the vector kernel takes it
+                if (!gqa_opt_applies || indexed_bias) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
