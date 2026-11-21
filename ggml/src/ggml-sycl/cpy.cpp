@@ -321,6 +321,42 @@ static bool ggml_cpy_try_transpose_sycl(const char * cx, char * cdst, const int6
     return true;
 }
 
+// Same-type contiguous copy as a kernel. A queue memcpy costs ~3 us per call on the B70 against ~1.3 us
+// for a kernel, which matters for the many small conts of a decode graph; large copies keep the memcpy.
+static constexpr size_t GGML_SYCL_CPY_KERNEL_MAX_BYTES = 4u << 20;
+
+static bool ggml_cpy_contig_same_sycl(const char * cx, char * cdst, const size_t nbytes, queue_ptr stream) {
+    constexpr int BS = SYCL_CPY_BLOCK_SIZE;
+    if (nbytes == 0 || nbytes > GGML_SYCL_CPY_KERNEL_MAX_BYTES || nbytes % 4 != 0 ||
+        ((uintptr_t) cx & 3) != 0 || ((uintptr_t) cdst & 3) != 0) {
+        return false;
+    }
+    if (nbytes % 16 == 0 && ((uintptr_t) cx & 15) == 0 && ((uintptr_t) cdst & 15) == 0) {
+        const int64_t       n          = (int64_t) (nbytes / 16);
+        const int           num_blocks = (int) std::min<int64_t>((n + BS - 1) / BS, 65536);
+        const sycl::uint4 * src        = (const sycl::uint4 *) cx;
+        sycl::uint4 *       dst        = (sycl::uint4 *) cdst;
+        stream->parallel_for(sycl::nd_range<1>((size_t) num_blocks * BS, BS), [=](sycl::nd_item<1> item) {
+            const int64_t stride = (int64_t) item.get_global_range(0);
+            for (int64_t i = (int64_t) item.get_global_linear_id(); i < n; i += stride) {
+                dst[i] = src[i];
+            }
+        });
+    } else {
+        const int64_t    n          = (int64_t) (nbytes / 4);
+        const int        num_blocks = (int) std::min<int64_t>((n + BS - 1) / BS, 65536);
+        const uint32_t * src        = (const uint32_t *) cx;
+        uint32_t *       dst        = (uint32_t *) cdst;
+        stream->parallel_for(sycl::nd_range<1>((size_t) num_blocks * BS, BS), [=](sycl::nd_item<1> item) {
+            const int64_t stride = (int64_t) item.get_global_range(0);
+            for (int64_t i = (int64_t) item.get_global_linear_id(); i < n; i += stride) {
+                dst[i] = src[i];
+            }
+        });
+    }
+    return true;
+}
+
 static void ggml_cpy_contig_f32_f16_sycl(const char * cx, char * cdst, const int64_t ne, queue_ptr stream) {
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
     constexpr int BS = SYCL_CPY_BLOCK_SIZE;
@@ -1529,7 +1565,9 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     const bool both_contig = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
     if ((src0->type == src1->type) && both_contig) {
         GGML_SYCL_DEBUG("%s: memcpy path\n", __func__);
-        main_stream->memcpy(src1_ddc, src0_ddc, ggml_nbytes(src0));
+        if (!ggml_cpy_contig_same_sycl(src0_ddc, src1_ddc, ggml_nbytes(src0), main_stream)) {
+            main_stream->memcpy(src1_ddc, src0_ddc, ggml_nbytes(src0));
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && both_contig && src0_ddc != src1_ddc) {
         ggml_cpy_contig_f32_f16_sycl(src0_ddc, src1_ddc, ne, main_stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && both_contig && src0_ddc != src1_ddc) {

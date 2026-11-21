@@ -62,6 +62,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-sycl/add-id.hpp"
+#include "ggml-sycl/depth_mix.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
@@ -4117,6 +4118,32 @@ static void ggml_sycl_op_tri(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 }
 
 
+// ADD (same shapes, contiguous) + SCALE in one pass: dst = scale * (a + b) + bias, the two kernels' expressions in
+// their order. Each element is read and written by one work-item, so dst may alias a or b (in-place ADD/SCALE).
+static void ggml_sycl_op_add_scale_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const float * a = static_cast<const float *>(add->src[0]->data);
+    const float * b = static_cast<const float *>(add->src[1]->data);
+    float *       d = static_cast<float *>(dst->data);
+    float scale;
+    float bias;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
+    const int k = (int) ggml_nelements(dst);
+    const int num_blocks = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) num_blocks * SYCL_SCALE_BLOCK_SIZE), sycl::range<1>(SYCL_SCALE_BLOCK_SIZE)),
+        [=](sycl::nd_item<1> it) {
+            const int i = (int) it.get_global_id(0);
+            if (i < k) {
+                const float x = a[i] + b[i];
+                d[i] = scale * x + bias;
+            }
+        });
+}
+
 inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
@@ -7309,6 +7336,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += 2;
             continue;
         }
+        if (node->op == GGML_OP_RMS_NORM) {
+            const int mix_nodes_to_skip = ggml_sycl_try_depth_mix_fusion(*sycl_ctx, cgraph, i);
+            if (mix_nodes_to_skip > 0) {
+                i += mix_nodes_to_skip;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
             ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
@@ -7387,6 +7421,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += l2_batch_skip;
                 continue;
             }
+        }
+
+        if (node->op == GGML_OP_ADD && ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_SCALE }, {})) {
+            ggml_sycl_op_add_scale_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            i += 1;
+            continue;
         }
 
         if (node->op == GGML_OP_SSM_CONV &&
