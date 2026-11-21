@@ -259,6 +259,7 @@ public:
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, const slot_info & sinfo, uint32_t kpool, uint32_t n_kv) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -466,6 +467,7 @@ public:
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, uint32_t kpool) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
