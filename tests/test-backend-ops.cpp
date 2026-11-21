@@ -11748,6 +11748,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // strided view src
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {1152, 8, 2, 1}, 0.25f, 0.0f, false, 1)); // gate half of a fused gate_up
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {100, 10, 10, 10}, 0.5f, 0.0f));
@@ -12181,6 +12183,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8400000, 32, {1, 1}, {2, 1}));
 #endif
 
+    // Small F32 projections (single- and multi-column) and fallback controls.
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{2304, 2}, {1025, 16}, {2304, 64}, {64, 4608}, {128, 2304}, {3, 2304}, {63, 4607}, {2305, 65}}) {
+        for (int n : {1, 2, 3, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, 16, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, 15, {1, 1}, {1, 1}));
+    // Small BF16 single-column projections (e.g. attention sink & dynamic conv tap projections).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 24, 1, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 32, 1, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 1, 2304, {1, 1}, {1, 1}));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
@@ -12236,6 +12251,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // permuted and broadcast src0/src1 for the 2 byte aligned types
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 64, 13, 2304, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+    // attention without flash attention: K (f16 cache view) x Q, permuted, 8 K/V heads broadcast to 24 Q heads (Inkling 2)
+    for (int64_t n : { 1, 12 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 128, {8, 1}, {3, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 128, {8, 1}, {4, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 128, {8, 1}, {2, 1}, {0, 2, 1, 3}));
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 63,  5, 2304, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K,  GGML_TYPE_F32, 64, 13, 4608, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 63,  5, 4608, {3, 2}, {2, 2}));
@@ -12538,6 +12559,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    // NVFP4 expert decode shapes.
+    for (int k : {1152, 2304}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, 1, k));
+    }
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
     // and 1024 at the LLAMA_MAX_EXPERTS limit
     for (int n : {1, 5, 64, 300}) {
@@ -13445,6 +13471,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
             test_cases.emplace_back(new test_flash_attn_ext_mask_bcast(128, 128, 4, {8, 4}, 1024, 32, true, sinks, 0, 0, GGML_PREC_F32, type, type));
         }
+    }
+    // Inkling 2: its own mask slice for each of 24 Q heads (relative-position bias), sinks, 8 K/V heads
+    for (int64_t nb : { 1, 64 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, nb, true, true, 0, 0, GGML_PREC_F32,
+                                                        GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 24));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

@@ -129,12 +129,26 @@ void ggml_sycl_trunc(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_arange(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
-// fused UNARY(silu|sigmoid|softplus) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
+// fused UNARY(silu|sigmoid|softplus|tanh) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
-// fused f32 ADD + UNARY(silu|sigmoid|softplus) + MUL with the bias and the scale broadcast
+// fused f32 ADD + UNARY(silu|sigmoid|softplus|tanh) + MUL with the bias and the scale broadcast
 // over dim 0; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,
                                       ggml_tensor * unary_node, ggml_tensor * mul_node);
+
+// fused f32 UNARY + SCALE + MUL: dst = (s * op(x) + b) * other
+void ggml_sycl_op_unary_scale_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node,
+                                        ggml_tensor * scale_node, ggml_tensor * mul_node);
+
+// fused f32 UNARY + MUL + ADD: dst = acc + op(x) * other
+void ggml_sycl_op_unary_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node,
+                                      ggml_tensor * mul_node, ggml_tensor * add_node);
+
+// fused f32 row-wise L2-norm clip: [optional cur *= scale], then cur *= clamp(thresh / (s*||cur||_2 + b), cmin, cmax)
+void ggml_sycl_op_l2_clip_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * cur_in,
+                                const ggml_tensor * scale_in, const ggml_tensor * scale_node,
+                                const ggml_tensor * fill_node, const ggml_tensor * clamp_node,
+                                ggml_tensor * out_node);
 
 #endif // GGML_SYCL_ELEMENTWISE_HPP

@@ -14,4 +14,6 @@
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops);
 
+bool ggml_sycl_can_fuse_l2_clip(const ggml_cgraph * cgraph, int node_idx, bool has_scale);
+
 #endif  // GGML_SYCL_FUSION_HPP
