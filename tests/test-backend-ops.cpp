@@ -13990,9 +13990,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
-    // NVFP4 expert decode shapes.
+    // NVFP4 expert decode and prompt shapes.
     for (int k : {1152, 2304}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, 1, k));
+        for (int n : {1, 17, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, k));
+        }
     }
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
     // and 1024 at the LLAMA_MAX_EXPERTS limit

@@ -355,6 +355,23 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return true;
     }
 
+    // ADD + SCALE without broadcast: one element-wise pass (ggml_sycl_op_add_scale_fused)
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * a     = add->src[0];
+        const ggml_tensor * b     = add->src[1];
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_is_contiguous(a) ||
+            !ggml_is_contiguous(b) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+        return ggml_nelements(scale) <= INT32_MAX;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * scale    = cgraph->nodes[node_idx + 1];

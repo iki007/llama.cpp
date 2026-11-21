@@ -187,6 +187,29 @@ ggml_tensor * llama_model_inkling2::graph::mix_stack(const std::vector<ggml_tens
     return mix_stacks[list] = res;
 }
 
+// a view that is already contiguous (one token) is used as it is instead of being copied
+static ggml_tensor * cont_view(ggml_context * ctx, ggml_tensor * view) {
+    return ggml_is_contiguous(view) ? view : ggml_cont(ctx, view);
+}
+
+// rows [blocks[n-1], ..., blocks[0]] of the depth states, normalized. The block list changes only when a block
+// is added, while mix() runs several times per layer: the stack is built once per list, each new block adding
+// one row to the previous list's stack.
+ggml_tensor * llama_model_inkling2::graph::mix_stack(const std::vector<ggml_tensor *> & blocks, size_t n) {
+    if (n == 0) {
+        return nullptr;
+    }
+    std::vector<ggml_tensor *> key(blocks.begin(), blocks.begin() + n);
+    if (auto it = mix_stacks.find(key); it != mix_stacks.end()) {
+        return it->second;
+    }
+    ggml_tensor * prev  = mix_stack(blocks, n - 1);
+    ggml_tensor * row   = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks[n - 1], n_embd, 1, n_tokens), 1e-6f);
+    ggml_tensor * stack = prev ? ggml_concat(ctx0, row, prev, 1) : row;
+    mix_stacks.emplace(std::move(key), stack);
+    return stack;
+}
+
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     // [norm(b_n-1), ..., norm(b_0), norm(cur)]
