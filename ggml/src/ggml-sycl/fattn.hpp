@@ -42,4 +42,15 @@ size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+// An indexed-bias table that reaches FLASH_ATTN_EXT as CONT(PERMUTE(x)) with x its bins-innermost layout, the one the
+// kernels read: the graph loop then skips the CONT and hands x to that flash attention through this slot
+// (ggml_sycl_fattn_indexed_bias takes it in place of transposing the table back). GGML_SYCL_FA_BIAS_DIRECT=0 disables.
+struct ggml_sycl_fattn_bias_direct {
+    const ggml_tensor * fa      = nullptr;
+    const float *       table_t = nullptr;
+};
+extern thread_local ggml_sycl_fattn_bias_direct g_ggml_sycl_fattn_bias_direct;
+// true when node i is such a CONT, skipped (not computed), its x handed on
+bool ggml_sycl_try_skip_bias_table_cont(const ggml_cgraph * cgraph, int i);
+
 #endif // GGML_SYCL_FATTN_HPP
