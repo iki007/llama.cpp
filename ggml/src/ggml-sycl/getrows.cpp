@@ -392,8 +392,6 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     const int block_num_x = (ne00 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
     const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
 
-    // strides in elements
-    //const size_t s0 = nb0 / ggml_element_size(dst);
     const size_t s1 = nb1 / ggml_element_size(dst);
     const size_t s2 = nb2 / ggml_element_size(dst);
     const size_t s3 = nb3 / ggml_element_size(dst);
@@ -403,7 +401,61 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     const size_t s12 = nb12 / ggml_element_size(src1);
     //const size_t s13 = nb13 / ggml_element_size(src1);
 
-    {
+    const int64_t total_rows = ne10 * ne11 * ne12;
+    const int64_t total_work = total_rows * (int64_t) block_num_x * SYCL_GET_ROWS_BLOCK_SIZE;
+
+    // Pack small rows (e.g. Inkling2 relative-bias gather with ne00 == n_head == 24) one subgroup
+    // per row with a capped grid-stride loop, avoiding both 90%+ wasted lanes and -fsycl-id-queries-range=int overflow.
+    if (ne00 <= 32 && total_rows > 0) {
+        constexpr int ROWS_PER_WG = 8;
+        constexpr int WG          = ROWS_PER_WG * 32;
+        const int64_t total_wgs   = (total_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
+        const size_t  n_wgs       = (size_t) std::min<int64_t>(total_wgs, 65536);
+        const int64_t row_stride  = (int64_t) n_wgs * ROWS_PER_WG;
+
+        stream->parallel_for(
+            sycl::nd_range<1>(n_wgs * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int lane  = it.get_sub_group().get_local_linear_id();
+                const int sg_id = it.get_sub_group().get_group_linear_id();
+                if (lane >= ne00) {
+                    return;
+                }
+                for (int64_t r = (int64_t) it.get_group_linear_id() * ROWS_PER_WG + sg_id;
+                     r < total_rows; r += row_stride) {
+                    const int64_t i10 = r % ne10;
+                    const int64_t tmp = r / ne10;
+                    const int64_t i12 = tmp % ne12;
+                    const int64_t i11 = tmp / ne12;
+                    const int64_t i01 = src1_dd[(size_t) i10 * s10 + (size_t) i11 * s11 + (size_t) i12 * s12];
+                    dst_t * dst_row = dst_dd + (size_t) i10 * s1 + (size_t) i11 * s2 + (size_t) i12 * s3;
+                    const src0_t * src0_row = (const src0_t *) ((const char *) src0_dd +
+                                                                (size_t) i01 * nb01 + (size_t) i11 * nb02 + (size_t) i12 * nb03);
+                    dst_row[lane] = src0_row[lane];
+                }
+            });
+    } else if (total_work > (1LL << 30) && total_rows > 0) {
+        constexpr int WG = SYCL_GET_ROWS_BLOCK_SIZE;
+        const size_t n_wgs = (size_t) std::min<int64_t>(total_rows, 65536);
+        stream->parallel_for(
+            sycl::nd_range<1>(n_wgs * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const int tid = it.get_local_linear_id();
+                for (int64_t r = it.get_group_linear_id(); r < total_rows; r += (int64_t) n_wgs) {
+                    const int64_t i10 = r % ne10;
+                    const int64_t tmp = r / ne10;
+                    const int64_t i12 = tmp % ne12;
+                    const int64_t i11 = tmp / ne12;
+                    const int64_t i01 = src1_dd[(size_t) i10 * s10 + (size_t) i11 * s11 + (size_t) i12 * s12];
+                    dst_t * dst_row = dst_dd + (size_t) i10 * s1 + (size_t) i11 * s2 + (size_t) i12 * s3;
+                    const src0_t * src0_row = (const src0_t *) ((const char *) src0_dd +
+                                                                (size_t) i01 * nb01 + (size_t) i11 * nb02 + (size_t) i12 * nb03);
+                    for (int64_t col = tid; col < ne00; col += WG) {
+                        dst_row[col] = src0_row[col];
+                    }
+                }
+            });
+    } else {
         dpct::has_capability_or_fail(stream->get_device(),
                                      {sycl::aspect::fp16});
 

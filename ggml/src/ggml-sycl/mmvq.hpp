@@ -36,15 +36,19 @@ bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,             // start of stacked expert weights
     const void *       vy,                  // pre-quantized src1 (Q8_1)
-    const int32_t *    ids_dev,             // device-side int32, length n_experts_used
+    const int32_t *    ids_dev,             // device-side int32, shape [n_experts_used, n_tokens]
     float *            dst_base,
     int                ncols,
     int                nrows,
     int                n_experts_used,
     size_t             expert_weight_stride, // bytes between experts in vx_base
-    size_t             dst_row_stride,       // bytes between dst rows
+    size_t             dst_row_stride,       // bytes between dst rows (experts)
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
-    dpct::queue_ptr    stream);
+    dpct::queue_ptr    stream,
+    int                n_tokens = 1,
+    size_t             ids_row_stride = 0,   // int32 elements between token rows in ids_dev
+    size_t             dst_tok_stride = 0,   // bytes between tokens in dst_base
+    size_t             src1_tok_stride = 0); // bytes between tokens in vy
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.

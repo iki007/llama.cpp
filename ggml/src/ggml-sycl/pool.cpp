@@ -170,6 +170,46 @@ void ggml_sycl_op_pool1d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t OW = dst->ne[0];
     const int64_t NC = dst->ne[3] * dst->ne[2] * dst->ne[1];
 
+    // Global 1D pool (e.g. DSpark vocab-wide max over 200k elements): avoid running a single thread
+    // serially over IW elements by reducing each row across a 256-thread work-group.
+    if (OW == 1 && k0 == IW && p0 == 0 && IW >= 256 && (op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG)) {
+        constexpr int WG = 256;
+        if (op == GGML_OP_POOL_MAX) {
+            main_stream->parallel_for(
+                sycl::nd_range<1>((size_t) NC * WG, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int64_t nc  = it.get_group_linear_id();
+                    const int     tid = it.get_local_linear_id();
+                    const float * row = src0_dd + (size_t) nc * (size_t) IW;
+                    float acc = -FLT_MAX;
+                    for (int64_t j = tid; j < IW; j += WG) {
+                        acc = sycl::max(acc, row[j]);
+                    }
+                    acc = sycl::reduce_over_group(it.get_group(), acc, sycl::maximum<float>());
+                    if (tid == 0) {
+                        dst_dd[nc] = acc;
+                    }
+                });
+        } else {
+            main_stream->parallel_for(
+                sycl::nd_range<1>((size_t) NC * WG, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int64_t nc  = it.get_group_linear_id();
+                    const int     tid = it.get_local_linear_id();
+                    const float * row = src0_dd + (size_t) nc * (size_t) IW;
+                    float acc = 0.0f;
+                    for (int64_t j = tid; j < IW; j += WG) {
+                        acc += row[j];
+                    }
+                    acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+                    if (tid == 0) {
+                        dst_dd[nc] = acc / (float) IW;
+                    }
+                });
+        }
+        return;
+    }
+
     const int parallel_elements = NC * OW;
     const int num_blocks = (parallel_elements + SYCL_POOL1D_BLOCK_SIZE - 1) / SYCL_POOL1D_BLOCK_SIZE;
     sycl::range<3> block_nums(1, 1, num_blocks);
