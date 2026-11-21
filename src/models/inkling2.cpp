@@ -175,15 +175,40 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
 }
 
+// a view that is already contiguous (one token) is used as it is instead of being copied
+static ggml_tensor * cont_view(ggml_context * ctx, ggml_tensor * view) {
+    return ggml_is_contiguous(view) ? view : ggml_cont(ctx, view);
+}
+
+// rows [blocks[n-1], ..., blocks[0]] of the depth states, normalized. The block list changes only when a block
+// is added, while mix() runs several times per layer: the stack is built once per list, each new block adding
+// one row to the previous list's stack.
+ggml_tensor * llama_model_inkling2::graph::mix_stack(const std::vector<ggml_tensor *> & blocks, size_t n) {
+    if (n == 0) {
+        return nullptr;
+    }
+    std::vector<ggml_tensor *> key(blocks.begin(), blocks.begin() + n);
+    if (auto it = mix_stacks.find(key); it != mix_stacks.end()) {
+        return it->second;
+    }
+    ggml_tensor * prev  = mix_stack(blocks, n - 1);
+    ggml_tensor * row   = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks[n - 1], n_embd, 1, n_tokens), 1e-6f);
+    ggml_tensor * stack = prev ? ggml_concat(ctx0, row, prev, 1) : row;
+    mix_stacks.emplace(std::move(key), stack);
+    return stack;
+}
+
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
-    }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
+    // the states are [blocks[n-1], ..., blocks[0], cur], each row normalized on its own
+    ggml_tensor * stack  = mix_stack(blocks, blocks.size());
+    ggml_tensor * row    = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
+    ggml_tensor * states = stack ? ggml_concat(ctx0, stack, row, 1) : row;
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    // one token needs no repeat: the queries are the weight itself
+    ggml_tensor * queries = n_tokens == 1 && ggml_is_contiguous(query)
+        ? ggml_reshape_3d(ctx0, query, n_embd, query->ne[1], 1)
+        : ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
@@ -285,7 +310,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return cont_view(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -299,7 +324,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = cont_view(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
         }
     }
 
