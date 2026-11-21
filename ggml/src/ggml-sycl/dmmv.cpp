@@ -20,16 +20,6 @@ static void convert_f16(const void * vx, const int64_t ib, const int iqs, dfloat
     v.y() = x[ib + iqs + 1];
 }
 
-#ifdef GGML_SYCL_DMMV_HAS_BF16
-static void convert_bf16(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
-    const sycl::ext::oneapi::bfloat16 *x = (const sycl::ext::oneapi::bfloat16 *)vx;
-
-    // automatic bfloat16 -> float type cast if dfloat == float
-    v.x() = x[ib + iqs + 0];
-    v.y() = x[ib + iqs + 1];
-}
-#endif
-
 static void convert_f32(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
     const float * x = (const float *) vx;
 
@@ -241,23 +231,112 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
 }
 
 #ifdef GGML_SYCL_DMMV_HAS_BF16
-static void convert_mul_mat_vec_bf16_sycl(const void *vx, const dfloat *y,
-                                          float *dst, const int ncols,
+static inline float bf16_bits_to_f32(uint16_t bits) {
+    return sycl::bit_cast<float>(static_cast<uint32_t>(bits) << 16);
+}
+
+static void convert_mul_mat_vec_bf16_sycl(const void * vx, const float * y,
+                                          float * dst, const int ncols,
                                           const int nrows,
                                           dpct::queue_ptr stream) {
-    // The qk=1 kernel iterates with stride 2*GGML_SYCL_DMMV_X, so ncols must be a
-    // multiple of that — not just GGML_SYCL_DMMV_X — to avoid out-of-bounds reads.
-    GGML_ASSERT(ncols % (2*GGML_SYCL_DMMV_X) == 0);
-    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
-    const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-    {
-        stream->parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                dequantize_mul_mat_vec<1, 1, convert_bf16>(vx, y, dst, ncols,
-                                                           nrows, item_ct1);
-            });
+    GGML_ASSERT(ncols % (2 * GGML_SYCL_DMMV_X) == 0);
+    const bool vec4_ok = (ncols % 4 == 0) &&
+                         ((((uintptr_t) vx) & 7u) == 0) &&
+                         ((((uintptr_t) y) & 15u) == 0);
+    if (nrows <= 128 && ncols >= 256) {
+        constexpr int WG = 256;
+        if (vec4_ok) {
+            const int ncols4 = ncols / 4;
+            const sycl::ushort4 * x4 = static_cast<const sycl::ushort4 *>(vx);
+            const sycl::float4  * y4 = reinterpret_cast<const sycl::float4 *>(y);
+            stream->parallel_for(
+                sycl::nd_range<1>((size_t) nrows * WG, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int row = it.get_group_linear_id();
+                    const sycl::ushort4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+                    float sum = 0.0f;
+                    for (int col = it.get_local_linear_id(); col < ncols4; col += WG) {
+                        const sycl::ushort4 xv = x_row[col];
+                        const sycl::float4  yv = y4[col];
+                        sum = sycl::fma(bf16_bits_to_f32(xv.x()), yv.x(), sum);
+                        sum = sycl::fma(bf16_bits_to_f32(xv.y()), yv.y(), sum);
+                        sum = sycl::fma(bf16_bits_to_f32(xv.z()), yv.z(), sum);
+                        sum = sycl::fma(bf16_bits_to_f32(xv.w()), yv.w(), sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+                    if (it.get_local_linear_id() == 0) {
+                        dst[row] = sum;
+                    }
+                });
+        } else {
+            const uint16_t * x16 = static_cast<const uint16_t *>(vx);
+            stream->parallel_for(
+                sycl::nd_range<1>((size_t) nrows * WG, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int row = it.get_group_linear_id();
+                    const uint16_t * x_row = x16 + (size_t) row * (size_t) ncols;
+                    float sum = 0.0f;
+                    for (int col = it.get_local_linear_id(); col < ncols; col += WG) {
+                        sum = sycl::fma(bf16_bits_to_f32(x_row[col]), y[col], sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+                    if (it.get_local_linear_id() == 0) {
+                        dst[row] = sum;
+                    }
+                });
+        }
+    } else {
+        constexpr int ROWS_PER_WG = 4;
+        constexpr int WG = ROWS_PER_WG * 32;
+        const size_t global = ((size_t) (nrows + ROWS_PER_WG - 1) / ROWS_PER_WG) * WG;
+        if (vec4_ok) {
+            const int ncols4 = ncols / 4;
+            const sycl::ushort4 * x4 = static_cast<const sycl::ushort4 *>(vx);
+            const sycl::float4  * y4 = reinterpret_cast<const sycl::float4 *>(y);
+            stream->parallel_for(
+                sycl::nd_range<1>(global, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int row  = it.get_group_linear_id() * ROWS_PER_WG + it.get_sub_group().get_group_linear_id();
+                    const int lane = it.get_sub_group().get_local_linear_id();
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const sycl::ushort4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+                    float sum = 0.0f;
+                    for (int col = lane; col < ncols4; col += 32) {
+                        const sycl::ushort4 xv = x_row[col];
+                        const sycl::float4  yv = y4[col];
+                        sum = sycl::fma(bf16_bits_to_f32(xv.x()), yv.x(), sum);
+                        sum = sycl::fma(bf16_bits_to_f32(xv.y()), yv.y(), sum);
+                        sum = sycl::fma(bf16_bits_to_f32(xv.z()), yv.z(), sum);
+                        sum = sycl::fma(bf16_bits_to_f32(xv.w()), yv.w(), sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
+                    if (lane == 0) {
+                        dst[row] = sum;
+                    }
+                });
+        } else {
+            const uint16_t * x16 = static_cast<const uint16_t *>(vx);
+            stream->parallel_for(
+                sycl::nd_range<1>(global, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int row  = it.get_group_linear_id() * ROWS_PER_WG + it.get_sub_group().get_group_linear_id();
+                    const int lane = it.get_sub_group().get_local_linear_id();
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const uint16_t * x_row = x16 + (size_t) row * (size_t) ncols;
+                    float sum = 0.0f;
+                    for (int col = lane; col < ncols; col += 32) {
+                        sum = sycl::fma(bf16_bits_to_f32(x_row[col]), y[col], sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
+                    if (lane == 0) {
+                        dst[row] = sum;
+                    }
+                });
+        }
     }
 }
 #endif
@@ -1955,8 +2034,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
         src0->type == GGML_TYPE_Q1_0 ||
         src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
         src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 ||
-        (src0->type == GGML_TYPE_Q8_0 && !q8_0_esimd) || src0->type == GGML_TYPE_F16 ||
-        src0->type == GGML_TYPE_BF16;
+        (src0->type == GGML_TYPE_Q8_0 && !q8_0_esimd) || src0->type == GGML_TYPE_F16;
 
     if (src1_convert_f16) {
         scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
@@ -2096,7 +2174,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             break;
 #ifdef GGML_SYCL_DMMV_HAS_BF16
         case GGML_TYPE_BF16:
-            convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+            convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
 #endif
         default:

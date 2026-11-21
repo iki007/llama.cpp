@@ -125,7 +125,8 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const sycl::half * maskh = (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * ic0);
+    const sycl::half * maskh = (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * ic0 +
+                                                     (ne32 > 1 ? (int64_t) nb32 * (head % ne32) : 0)); // per-head mask
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 

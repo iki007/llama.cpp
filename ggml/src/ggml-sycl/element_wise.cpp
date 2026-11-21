@@ -1019,6 +1019,7 @@ static void dispatch_fused_unary_op(ggml_unary_op uop, F && launch) {
         case GGML_UNARY_OP_SILU:     launch([](float v) { return op_silu(v); });     break;
         case GGML_UNARY_OP_SIGMOID:  launch([](float v) { return op_sigmoid(v); });  break;
         case GGML_UNARY_OP_SOFTPLUS: launch([](float v) { return op_softplus(v); }); break;
+        case GGML_UNARY_OP_TANH:     launch([](float v) { return sycl::tanh(v); });  break;
         default:
             GGML_ABORT("fused unary chain: unsupported unary op %s", ggml_unary_op_name(uop));
     }
@@ -1096,6 +1097,148 @@ void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tens
     };
 
     dispatch_fused_unary_op(ggml_get_unary_op(unary_node), dispatch_op);
+}
+
+// dst[i] = (s * op(x[i]) + b) * other[i]
+void ggml_sycl_op_unary_scale_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node,
+                                        ggml_tensor * scale_node, ggml_tensor * mul_node) {
+    scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
+
+    const ggml_tensor * x     = unary_node->src[0];
+    const ggml_tensor * other = (mul_node->src[0] == scale_node) ? mul_node->src[1] : mul_node->src[0];
+    GGML_ASSERT(other != scale_node);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(other) && ggml_is_contiguous(mul_node));
+    GGML_ASSERT(ggml_are_same_shape(x, other) && ggml_are_same_shape(x, mul_node));
+
+    const float s = ggml_get_op_params_f32(scale_node, 0);
+    const float b = ggml_get_op_params_f32(scale_node, 1);
+
+    const float * x_d     = (const float *) x->data;
+    const float * other_d = (const float *) other->data;
+    float *       dst_d   = (float *) mul_node->data;
+    const int64_t k       = ggml_nelements(mul_node);
+
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const size_t num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
+    const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+
+    dispatch_fused_unary_op(ggml_get_unary_op(unary_node), [&](auto op) {
+        main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
+                dst_d[i] = sycl::fma(s, op(x_d[i]), b) * other_d[i];
+            }
+        });
+    });
+}
+
+// dst[i] = acc[i] + op(x[i]) * other[i]
+void ggml_sycl_op_unary_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node,
+                                      ggml_tensor * mul_node, ggml_tensor * add_node) {
+    scope_op_debug_print scope_dbg_print(__func__, add_node, /*num_src=*/2);
+
+    const ggml_tensor * x     = unary_node->src[0];
+    const ggml_tensor * other = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+    const ggml_tensor * acc   = (add_node->src[0] == mul_node) ? add_node->src[1] : add_node->src[0];
+    GGML_ASSERT(other != unary_node && acc != mul_node);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 && acc->type == GGML_TYPE_F32 && add_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(other) && ggml_is_contiguous(acc) && ggml_is_contiguous(add_node));
+    GGML_ASSERT(ggml_are_same_shape(x, other) && ggml_are_same_shape(x, acc) && ggml_are_same_shape(x, add_node));
+
+    const float * x_d     = (const float *) x->data;
+    const float * other_d = (const float *) other->data;
+    const float * acc_d   = (const float *) acc->data;
+    float *       dst_d   = (float *) add_node->data;
+    const int64_t k       = ggml_nelements(add_node);
+
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const size_t num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
+    const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+
+    dispatch_fused_unary_op(ggml_get_unary_op(unary_node), [&](auto op) {
+        main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
+                dst_d[i] = sycl::fma(op(x_d[i]), other_d[i], acc_d[i]);
+            }
+        });
+    });
+}
+
+// Single-pass subgroup-per-row L2-norm clip for contiguous F32 rows with ne0 <= 256:
+//   v = cur * [optional scale]
+//   norm = s * sqrt(sum_c v^2) + b
+//   out = v * clamp(threshold / norm, cmin, cmax)
+void ggml_sycl_op_l2_clip_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * cur_in,
+                                const ggml_tensor * scale_in, const ggml_tensor * scale_node,
+                                const ggml_tensor * fill_node, const ggml_tensor * clamp_node,
+                                ggml_tensor * out_node) {
+    scope_op_debug_print scope_dbg_print(__func__, out_node, /*num_src=*/2);
+
+    GGML_ASSERT(cur_in->type == GGML_TYPE_F32 && out_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(!scale_in || scale_in->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(cur_in) && ggml_is_contiguous(out_node));
+    GGML_ASSERT(!scale_in || ggml_is_contiguous(scale_in));
+    GGML_ASSERT(cur_in->ne[0] > 0 && cur_in->ne[0] <= 256);
+
+    const int     ne0        = (int) cur_in->ne[0];
+    const int64_t ne1        = cur_in->ne[1];
+    const int64_t nrows      = ggml_nrows(cur_in);
+    const bool    has_scale  = scale_in != nullptr;
+    const bool    scale_b1   = has_scale && scale_in->ne[1] == 1;
+
+    const float scale_s   = ggml_get_op_params_f32(scale_node, 0);
+    const float scale_b   = ggml_get_op_params_f32(scale_node, 1);
+    const float threshold = ggml_get_op_params_f32(fill_node,  0);
+    const float cmin      = ggml_get_op_params_f32(clamp_node, 0);
+    const float cmax      = ggml_get_op_params_f32(clamp_node, 1);
+
+    const float * cur_d   = (const float *) cur_in->data;
+    const float * scale_d = has_scale ? (const float *) scale_in->data : nullptr;
+    float *       out_d   = (float *) out_node->data;
+
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    constexpr int ROWS_PER_WG = 4;
+    constexpr int WG          = ROWS_PER_WG * WARP_SIZE;
+    const size_t  global      = ((size_t) (nrows + ROWS_PER_WG - 1) / ROWS_PER_WG) * WG;
+
+    main_stream->parallel_for(
+        sycl::nd_range<1>(global, WG),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int64_t row  = (int64_t) it.get_group_linear_id() * ROWS_PER_WG + it.get_sub_group().get_group_linear_id();
+            const int     lane = it.get_sub_group().get_local_linear_id();
+            if (row >= nrows) {
+                return;
+            }
+            const float * x_row = cur_d + (size_t) row * (size_t) ne0;
+            const float * s_row = has_scale ? (scale_d + (size_t) (scale_b1 ? 0 : (row % ne1)) * (size_t) ne0) : nullptr;
+            float *       o_row = out_d + (size_t) row * (size_t) ne0;
+
+            float vals[8];
+            float sum_sq = 0.0f;
+            int   cnt    = 0;
+            for (int col = lane; col < ne0; col += WARP_SIZE) {
+                float v = x_row[col];
+                if (has_scale) {
+                    v *= s_row[col];
+                }
+                vals[cnt++] = v;
+                sum_sq = sycl::fma(v, v, sum_sq);
+            }
+            sum_sq = sycl::reduce_over_group(it.get_sub_group(), sum_sq, sycl::plus<float>());
+            const float norm   = sycl::fma(scale_s, sycl::sqrt(sum_sq), scale_b);
+            const float factor = sycl::clamp(threshold / norm, cmin, cmax);
+
+            cnt = 0;
+            for (int col = lane; col < ne0; col += WARP_SIZE) {
+                o_row[col] = vals[cnt++] * factor;
+            }
+        });
 }
 
 __dpct_inline__ float ggml_sycl_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {

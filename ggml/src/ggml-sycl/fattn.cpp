@@ -132,11 +132,18 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // The GQA-optimized TILE variant handles a trailing partial chunk (out-of-bounds
     // checked iteration), so n_kv no longer needs to be a multiple of FATTN_KQ_STRIDE.
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f;
+    // a mask with its own slice for each head (ne[2] > 1, head h reads slice h % ne[2]; e.g. Inkling 2's relative-position
+    // table): only the VEC and TILE kernels index it per head, TILE one head a group
+    const bool per_head_mask = mask && mask->ne[2] != 1;
+    if (per_head_mask && Q->ne[2] % mask->ne[2] != 0) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
-    if (Q->ne[1] >= 32 && !ggml_sycl_flash_attn_ext_onednn_failed(device)
+    if (Q->ne[1] >= 32 && !per_head_mask && !ggml_sycl_flash_attn_ext_onednn_failed(device)
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -159,7 +166,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !per_head_mask && !sinks && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -244,12 +251,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
-    }
 
     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
-    if (ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
+    if (!per_head_mask && ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
         return BEST_FATTN_KERNEL_DPAS;
     }
 
@@ -261,7 +265,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (!ggml_sycl_flash_attn_ext_onednn_failed(device) && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (!per_head_mask && !ggml_sycl_flash_attn_ext_onednn_failed(device) && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 

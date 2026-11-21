@@ -620,6 +620,8 @@ static void flash_attn_mask_to_KV_max(const sycl::half2 * __restrict__ mask,
                                       int * __restrict__ KV_max,
                                       const int ne30,
                                       const int s31,
+                                      const int s32,
+                                      const int ne32,
                                       const int s33,
                                       int *     buf_iw) {
     auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -639,11 +641,14 @@ static void flash_attn_mask_to_KV_max(const sycl::half2 * __restrict__ mask,
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
         int all_inf = 1;
 
+        // a per-head mask (ne32 > 1): a block is skipped only when it is masked for every head
+        for (int h = 0; h < ne32; ++h) {
 #pragma unroll
-        for (int j = 0; j < ncols1; ++j) {
-            const sycl::float2 tmp =
-                mask[j * s31 + KV_max_sj / 2 + tid].template convert<float, sycl::rounding_mode::automatic>();
-            all_inf = all_inf && int(sycl::isinf((float) (tmp.x()))) && int(sycl::isinf((float) (tmp.y())));
+            for (int j = 0; j < ncols1; ++j) {
+                const sycl::float2 tmp =
+                    mask[h * s32 + j * s31 + KV_max_sj / 2 + tid].template convert<float, sycl::rounding_mode::automatic>();
+                all_inf = all_inf && int(sycl::isinf((float) (tmp.x()))) && int(sycl::isinf((float) (tmp.y())));
+            }
         }
 
         all_inf = warp_reduce_all<warp_size>(all_inf);
@@ -1040,8 +1045,10 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
-        const int s31 = mask->nb[1] / sizeof(sycl::half2);
-        const int s33 = mask->nb[3] / sizeof(sycl::half2);
+        const int s31  = mask->nb[1] / sizeof(sycl::half2);
+        const int s32  = mask->nb[2] / sizeof(sycl::half2);
+        const int ne32 = mask->ne[2];
+        const int s33  = mask->nb[3] / sizeof(sycl::half2);
 
         const dpct::dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
         const dpct::dim3 block_dim_KV_max(FATTN_KQ_STRIDE / 2, 1, 1);
@@ -1063,7 +1070,7 @@ void launch_fattn(
                                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(warp_size)]] {
                                      GGML_UNUSED(item_ct1);
                                      flash_attn_mask_to_KV_max<ncols1, warp_size>(
-                                         mask_data_ct0, KV_max_ptr_ct1, iter_k, s31, s33,
+                                         mask_data_ct0, KV_max_ptr_ct1, iter_k, s31, s32, ne32, s33,
                                          buf_iw_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                                  });
             });

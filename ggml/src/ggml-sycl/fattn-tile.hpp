@@ -731,7 +731,9 @@ static void flash_attn_tile(const char *  Q,
     const sycl::half2 * V_h2 =
         (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
 
-    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
+    // a per-head mask (ne32 > 1) comes with one head a group (ncols2 == 1, launch_fattn_tile_switch_ncols2)
+    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) +
+                                                         (ncols2 == 1 && ne32 > 1 ? (int64_t) nb32 * (head0 % ne32) : 0)) : nullptr;
 
     const int stride_K2   = nb11 / sizeof(sycl::half2);
     const int stride_V2   = nb21 / sizeof(sycl::half2);

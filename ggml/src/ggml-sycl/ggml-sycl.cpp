@@ -2586,6 +2586,31 @@ static void ggml_mul_mat_vec_nc_f16_f32_sycl(
 
 
 
+// SCALE of a strided src0 (e.g. the gate or up half of a fused gate_up result) into a contiguous dst
+static void scale_f32_strided_sycl(const char * x, float * dst, const float scale, const float bias,
+                                   const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+                                   const size_t nb0, const size_t nb1, const size_t nb2, const size_t nb3,
+                                   queue_ptr stream) {
+    const int64_t k = ne0 * ne1 * ne2 * ne3;
+    const int64_t num_blocks = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(num_blocks * SYCL_SCALE_BLOCK_SIZE), sycl::range<1>(SYCL_SCALE_BLOCK_SIZE)),
+        [=](sycl::nd_item<1> it) {
+            const int64_t i = it.get_global_id(0);
+            if (i >= k) {
+                return;
+            }
+            const int64_t i0 = i % ne0;
+            int64_t       r  = i / ne0;
+            const int64_t i1 = r % ne1;
+            r /= ne1;
+            const int64_t i2 = r % ne2;
+            const int64_t i3 = r / ne2;
+            const float   v  = *(const float *) (x + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+            dst[i] = scale * v + bias;
+        });
+}
+
 static void scale_f32_sycl(const float *x, float *dst, const float scale, const float bias,
                            const int k, queue_ptr stream) {
     const int num_blocks = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
@@ -3219,6 +3244,520 @@ catch (sycl::exception const &exc) {
 static constexpr int64_t SYCL_F32_DNNL_MIN_GEMM_FLOPS = 256 * 256 * 256;
 #endif
 
+template <int WG>
+static void launch_mul_mat_vec_f32_vec4_sycl(const float * x, const float * y, float * dst,
+                                             int ncols4, int nrows, queue_ptr stream) {
+    const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+    const sycl::float4 * y4 = reinterpret_cast<const sycl::float4 *>(y);
+    stream->parallel_for(sycl::nd_range<1>((size_t) nrows * WG, WG),
+                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int row = it.get_group_linear_id();
+        const sycl::float4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+        float sum = 0.0f;
+        for (int col = it.get_local_linear_id(); col < ncols4; col += WG) {
+            const sycl::float4 xv = x_row[col];
+            const sycl::float4 yv = y4[col];
+            sum = sycl::fma(xv.x(), yv.x(), sum);
+            sum = sycl::fma(xv.y(), yv.y(), sum);
+            sum = sycl::fma(xv.z(), yv.z(), sum);
+            sum = sycl::fma(xv.w(), yv.w(), sum);
+        }
+        sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+        if (it.get_local_linear_id() == 0) {
+            dst[row] = sum;
+        }
+    });
+}
+
+// Direct F32 GEMV / small-N GEMM for small projections on BMG G31, avoiding oneMKL SGEMM
+// dispatch overhead while preserving full F32 accumulation precision.
+static void mul_mat_vec_f32_small_sycl(const float * x, const float * y, float * dst,
+                                        int ncols, int nrows, int n_out, int ldc,
+                                        queue_ptr stream) {
+    const bool vec4_ok = (ncols % 4 == 0) &&
+                         ((((uintptr_t) x) & 15u) == 0) &&
+                         ((((uintptr_t) y) & 15u) == 0);
+
+    if (n_out == 1) {
+        if (ncols <= 32) {
+            const size_t global = ((size_t) (nrows + 127) / 128) * 128;
+            stream->parallel_for(sycl::nd_range<1>(global, 128), [=](sycl::nd_item<1> it) {
+                const int row = it.get_global_linear_id();
+                if (row >= nrows) {
+                    return;
+                }
+                const float * x_row = x + (size_t) row * (size_t) ncols;
+                float sum = 0.0f;
+                for (int col = 0; col < ncols; ++col) {
+                    sum = sycl::fma(x_row[col], y[col], sum);
+                }
+                dst[row] = sum;
+            });
+        } else if (ncols <= 256) {
+            if (vec4_ok) {
+                const int ncols4 = ncols / 4;
+                const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+                const sycl::float4 * y4 = reinterpret_cast<const sycl::float4 *>(y);
+                const size_t global = ((size_t) (nrows + 7) / 8) * 128;
+                stream->parallel_for(sycl::nd_range<1>(global, 128),
+                                     [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                    const int row  = it.get_group_linear_id() * 8 + it.get_sub_group().get_group_linear_id();
+                    const int lane = it.get_sub_group().get_local_linear_id();
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const sycl::float4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+                    float sum = 0.0f;
+                    for (int col = lane; col < ncols4; col += 16) {
+                        const sycl::float4 xv = x_row[col];
+                        const sycl::float4 yv = y4[col];
+                        sum = sycl::fma(xv.x(), yv.x(), sum);
+                        sum = sycl::fma(xv.y(), yv.y(), sum);
+                        sum = sycl::fma(xv.z(), yv.z(), sum);
+                        sum = sycl::fma(xv.w(), yv.w(), sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
+                    if (lane == 0) {
+                        dst[row] = sum;
+                    }
+                });
+            } else {
+                const size_t global = ((size_t) (nrows + 3) / 4) * 128;
+                stream->parallel_for(sycl::nd_range<1>(global, 128),
+                                     [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int row  = it.get_group_linear_id() * 4 + it.get_sub_group().get_group_linear_id();
+                    const int lane = it.get_sub_group().get_local_linear_id();
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const float * x_row = x + (size_t) row * (size_t) ncols;
+                    float sum = 0.0f;
+                    for (int col = lane; col < ncols; col += 32) {
+                        sum = sycl::fma(x_row[col], y[col], sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
+                    if (lane == 0) {
+                        dst[row] = sum;
+                    }
+                });
+            }
+        } else if (vec4_ok) {
+            const int ncols4 = ncols / 4;
+            if (nrows <= 64 && ncols4 > 640) {
+                launch_mul_mat_vec_f32_vec4_sycl<512>(x, y, dst, ncols4, nrows, stream);
+            } else if (nrows <= 64) {
+                launch_mul_mat_vec_f32_vec4_sycl<256>(x, y, dst, ncols4, nrows, stream);
+            } else {
+                launch_mul_mat_vec_f32_vec4_sycl<128>(x, y, dst, ncols4, nrows, stream);
+            }
+        } else {
+            stream->parallel_for(sycl::nd_range<1>((size_t) nrows * 128, 128),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int row = it.get_group_linear_id();
+                const float * x_row = x + (size_t) row * (size_t) ncols;
+                float sum = 0.0f;
+                for (int col = it.get_local_linear_id(); col < ncols; col += 128) {
+                    sum = sycl::fma(x_row[col], y[col], sum);
+                }
+                sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+                if (it.get_local_linear_id() == 0) {
+                    dst[row] = sum;
+                }
+            });
+        }
+        return;
+    }
+
+    // Multi-column small F32 projections
+    if (ncols <= 32) {
+        if (n_out <= 8) {
+            const size_t global = ((size_t) (nrows + 127) / 128) * 128;
+            stream->parallel_for(sycl::nd_range<1>(global, 128), [=](sycl::nd_item<1> it) {
+                const int row = it.get_global_linear_id();
+                if (row >= nrows) {
+                    return;
+                }
+                const float * x_row = x + (size_t) row * (size_t) ncols;
+                float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                for (int col = 0; col < ncols; ++col) {
+                    const float xv = x_row[col];
+                    for (int c = 0; c < n_out; ++c) {
+                        s[c] = sycl::fma(xv, y[(size_t) c * (size_t) ncols + col], s[c]);
+                    }
+                }
+                for (int c = 0; c < n_out; ++c) {
+                    dst[(size_t) c * (size_t) ldc + row] = s[c];
+                }
+            });
+        } else {
+            const size_t rows_pad = ((size_t) (nrows + 127) / 128) * 128;
+            if (vec4_ok) {
+                const int ncols4 = ncols / 4;
+                const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+                const sycl::float4 * y4 = reinterpret_cast<const sycl::float4 *>(y);
+                stream->parallel_for(sycl::nd_range<2>({ (size_t) n_out, rows_pad }, { 1, 128 }),
+                                     [=](sycl::nd_item<2> it) {
+                    const int c   = it.get_global_id(0);
+                    const int row = it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const sycl::float4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+                    const sycl::float4 * y_col = y4 + (size_t) c   * (size_t) ncols4;
+                    float sum = 0.0f;
+                    for (int col = 0; col < ncols4; ++col) {
+                        const sycl::float4 xv = x_row[col];
+                        const sycl::float4 yv = y_col[col];
+                        sum = sycl::fma(xv.x(), yv.x(), sum);
+                        sum = sycl::fma(xv.y(), yv.y(), sum);
+                        sum = sycl::fma(xv.z(), yv.z(), sum);
+                        sum = sycl::fma(xv.w(), yv.w(), sum);
+                    }
+                    dst[(size_t) c * (size_t) ldc + row] = sum;
+                });
+            } else {
+                stream->parallel_for(sycl::nd_range<2>({ (size_t) n_out, rows_pad }, { 1, 128 }),
+                                     [=](sycl::nd_item<2> it) {
+                    const int c   = it.get_global_id(0);
+                    const int row = it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const float * x_row = x + (size_t) row * (size_t) ncols;
+                    const float * y_col = y + (size_t) c   * (size_t) ncols;
+                    float sum = 0.0f;
+                    for (int col = 0; col < ncols; ++col) {
+                        sum = sycl::fma(x_row[col], y_col[col], sum);
+                    }
+                    dst[(size_t) c * (size_t) ldc + row] = sum;
+                });
+            }
+        }
+        return;
+    }
+
+    // n_out in 2..8, ncols > 32
+    if (ncols <= 256) {
+        if (vec4_ok) {
+            const int ncols4 = ncols / 4;
+            const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+            const sycl::float4 * y4 = reinterpret_cast<const sycl::float4 *>(y);
+            const size_t global = ((size_t) (nrows + 7) / 8) * 128;
+            stream->parallel_for(sycl::nd_range<1>(global, 128),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const int row  = it.get_group_linear_id() * 8 + it.get_sub_group().get_group_linear_id();
+                const int lane = it.get_sub_group().get_local_linear_id();
+                if (row >= nrows) {
+                    return;
+                }
+                const sycl::float4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+                float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                for (int col = lane; col < ncols4; col += 16) {
+                    const sycl::float4 xv = x_row[col];
+                    for (int c = 0; c < n_out; ++c) {
+                        const sycl::float4 yv = y4[(size_t) c * (size_t) ncols4 + col];
+                        s[c] = sycl::fma(xv.x(), yv.x(), s[c]);
+                        s[c] = sycl::fma(xv.y(), yv.y(), s[c]);
+                        s[c] = sycl::fma(xv.z(), yv.z(), s[c]);
+                        s[c] = sycl::fma(xv.w(), yv.w(), s[c]);
+                    }
+                }
+                for (int c = 0; c < n_out; ++c) {
+                    const float sum = sycl::reduce_over_group(it.get_sub_group(), s[c], sycl::plus<float>());
+                    if (lane == 0) {
+                        dst[(size_t) c * (size_t) ldc + row] = sum;
+                    }
+                }
+            });
+        } else {
+            const size_t global = ((size_t) (nrows + 3) / 4) * 128;
+            stream->parallel_for(sycl::nd_range<1>(global, 128),
+                                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int row  = it.get_group_linear_id() * 4 + it.get_sub_group().get_group_linear_id();
+                const int lane = it.get_sub_group().get_local_linear_id();
+                if (row >= nrows) {
+                    return;
+                }
+                const float * x_row = x + (size_t) row * (size_t) ncols;
+                float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                for (int col = lane; col < ncols; col += 32) {
+                    const float xv = x_row[col];
+                    for (int c = 0; c < n_out; ++c) {
+                        s[c] = sycl::fma(xv, y[(size_t) c * (size_t) ncols + col], s[c]);
+                    }
+                }
+                for (int c = 0; c < n_out; ++c) {
+                    const float sum = sycl::reduce_over_group(it.get_sub_group(), s[c], sycl::plus<float>());
+                    if (lane == 0) {
+                        dst[(size_t) c * (size_t) ldc + row] = sum;
+                    }
+                }
+            });
+        }
+    } else if (vec4_ok) {
+        constexpr int WG = 256;
+        const int ncols4 = ncols / 4;
+        const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+        const sycl::float4 * y4 = reinterpret_cast<const sycl::float4 *>(y);
+        stream->parallel_for(sycl::nd_range<1>((size_t) nrows * WG, WG),
+                             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int row = it.get_group_linear_id();
+            const sycl::float4 * x_row = x4 + (size_t) row * (size_t) ncols4;
+            float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+            for (int col = it.get_local_linear_id(); col < ncols4; col += WG) {
+                const sycl::float4 xv = x_row[col];
+                for (int c = 0; c < n_out; ++c) {
+                    const sycl::float4 yv = y4[(size_t) c * (size_t) ncols4 + col];
+                    s[c] = sycl::fma(xv.x(), yv.x(), s[c]);
+                    s[c] = sycl::fma(xv.y(), yv.y(), s[c]);
+                    s[c] = sycl::fma(xv.z(), yv.z(), s[c]);
+                    s[c] = sycl::fma(xv.w(), yv.w(), s[c]);
+                }
+            }
+            for (int c = 0; c < n_out; ++c) {
+                const float sum = sycl::reduce_over_group(it.get_group(), s[c], sycl::plus<float>());
+                if (it.get_local_linear_id() == 0) {
+                    dst[(size_t) c * (size_t) ldc + row] = sum;
+                }
+            }
+        });
+    } else {
+        constexpr int WG = 128;
+        stream->parallel_for(sycl::nd_range<1>((size_t) nrows * WG, WG),
+                             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const int row = it.get_group_linear_id();
+            const float * x_row = x + (size_t) row * (size_t) ncols;
+            float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+            for (int col = it.get_local_linear_id(); col < ncols; col += WG) {
+                const float xv = x_row[col];
+                for (int c = 0; c < n_out; ++c) {
+                    s[c] = sycl::fma(xv, y[(size_t) c * (size_t) ncols + col], s[c]);
+                }
+            }
+            for (int c = 0; c < n_out; ++c) {
+                const float sum = sycl::reduce_over_group(it.get_group(), s[c], sycl::plus<float>());
+                if (it.get_local_linear_id() == 0) {
+                    dst[(size_t) c * (size_t) ldc + row] = sum;
+                }
+            }
+        });
+    }
+}
+
+static bool can_use_mul_mat_vec_f32_small_batched(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (src0->ne[0] != src1->ne[0] || src0->ne[3] != src1->ne[3] ||
+        src1->ne[2] < src0->ne[2] || (src1->ne[2] % src0->ne[2]) != 0) {
+        return false;
+    }
+    const int64_t ncols   = src0->ne[0];
+    const int64_t nrows   = src0->ne[1];
+    const int64_t n_out   = src1->ne[1];
+    const int64_t n_batch = src1->ne[2] * src1->ne[3];
+    if (n_batch <= 1 || n_batch > 65536 || ncols <= 0 || ncols > 8192 || nrows <= 0 || n_out <= 0) {
+        return false;
+    }
+    const bool shape_ok = (n_out <= 8 && nrows <= (2 * 1024 * 1024) / ncols) ||
+                          (ncols <= 32 && n_out <= 32 && nrows <= (2 * 1024 * 1024) / (ncols * n_out));
+    if (!shape_ok) {
+        return false;
+    }
+    if (ncols <= 32) {
+        const int64_t row_wgs = (nrows + 127) / 128;
+        return n_batch * row_wgs <= 8 * 1024 * 1024;
+    }
+    return n_batch * nrows <= 8 * 1024 * 1024;
+}
+
+static void mul_mat_vec_f32_small_batched_sycl(ggml_backend_sycl_context & ctx,
+                                               const ggml_tensor * src0,
+                                               const ggml_tensor * src1,
+                                               ggml_tensor * dst) {
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    queue_ptr stream = ctx.stream();
+
+    const float * x = (const float *) src0->data;
+    const float * y = (const float *) src1->data;
+    float *       d = (float *) dst->data;
+
+    const int     ncols       = (int) src0->ne[0];
+    const int     nrows       = (int) src0->ne[1];
+    const int     n_out       = (int) src1->ne[1];
+    const int     n_batch     = (int) (src1->ne[2] * src1->ne[3]);
+    const int     i02_divisor = (int) (src1->ne[2] / src0->ne[2]);
+    const size_t  x_b_stride  = (size_t) nrows * (size_t) ncols;
+    const size_t  y_b_stride  = (size_t) n_out * (size_t) ncols;
+    const size_t  d_b_stride  = (size_t) n_out * (size_t) nrows;
+
+    const bool vec4_ok = (ncols % 4 == 0) &&
+                         ((((uintptr_t) x) & 15u) == 0) &&
+                         ((((uintptr_t) y) & 15u) == 0);
+
+    if (ncols <= 32) {
+        const size_t global_rows = (size_t) ((nrows + 127) / 128) * 128;
+        if (n_out == 1) {
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, global_rows), sycl::range<2>(1, 128)),
+                [=](sycl::nd_item<2> it) {
+                    const int b   = (int) it.get_group(0);
+                    const int row = (int) it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const float * x_row = x + (size_t) (b / i02_divisor) * x_b_stride + (size_t) row * (size_t) ncols;
+                    const float * y_b   = y + (size_t) b * y_b_stride;
+                    float *       d_b   = d + (size_t) b * d_b_stride;
+                    float sum = 0.0f;
+                    for (int col = 0; col < ncols; ++col) {
+                        sum = sycl::fma(x_row[col], y_b[col], sum);
+                    }
+                    d_b[row] = sum;
+                });
+        } else if (n_out <= 8) {
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, global_rows), sycl::range<2>(1, 128)),
+                [=](sycl::nd_item<2> it) {
+                    const int b   = (int) it.get_group(0);
+                    const int row = (int) it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const float * x_row = x + (size_t) (b / i02_divisor) * x_b_stride + (size_t) row * (size_t) ncols;
+                    const float * y_b   = y + (size_t) b * y_b_stride;
+                    float *       d_b   = d + (size_t) b * d_b_stride;
+                    float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                    for (int col = 0; col < ncols; ++col) {
+                        const float xv = x_row[col];
+                        for (int c = 0; c < n_out; ++c) {
+                            s[c] = sycl::fma(xv, y_b[(size_t) c * (size_t) ncols + col], s[c]);
+                        }
+                    }
+                    for (int c = 0; c < n_out; ++c) {
+                        d_b[(size_t) c * (size_t) nrows + row] = s[c];
+                    }
+                });
+        } else {
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, global_rows), sycl::range<2>(1, 128)),
+                [=](sycl::nd_item<2> it) {
+                    const int b   = (int) it.get_group(0);
+                    const int row = (int) it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const float * x_row = x + (size_t) (b / i02_divisor) * x_b_stride + (size_t) row * (size_t) ncols;
+                    const float * y_b   = y + (size_t) b * y_b_stride;
+                    float *       d_b   = d + (size_t) b * d_b_stride;
+                    float xv[32];
+                    for (int col = 0; col < ncols; ++col) {
+                        xv[col] = x_row[col];
+                    }
+                    for (int c = 0; c < n_out; ++c) {
+                        const float * yc = y_b + (size_t) c * (size_t) ncols;
+                        float sum = 0.0f;
+                        for (int col = 0; col < ncols; ++col) {
+                            sum = sycl::fma(xv[col], yc[col], sum);
+                        }
+                        d_b[(size_t) c * (size_t) nrows + row] = sum;
+                    }
+                });
+        }
+        return;
+    }
+
+    // ncols > 32, n_out <= 8: 128 threads per (batch, row)
+    constexpr int WG = 128;
+    if (vec4_ok) {
+        const int ncols4 = ncols / 4;
+        const size_t x_b_stride4 = x_b_stride / 4;
+        const size_t y_b_stride4 = y_b_stride / 4;
+        const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+        const sycl::float4 * y4 = reinterpret_cast<const sycl::float4 *>(y);
+        if (n_out == 1) {
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, (size_t) nrows * WG), sycl::range<2>(1, WG)),
+                [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int b   = (int) it.get_group(0);
+                    const int row = (int) it.get_group(1);
+                    const int lid = (int) it.get_local_id(1);
+                    const sycl::float4 * x_row = x4 + (size_t) (b / i02_divisor) * x_b_stride4 + (size_t) row * (size_t) ncols4;
+                    const sycl::float4 * y_b   = y4 + (size_t) b * y_b_stride4;
+                    float *              d_b   = d + (size_t) b * d_b_stride;
+                    float sum = 0.0f;
+                    for (int col = lid; col < ncols4; col += WG) {
+                        const sycl::float4 xv = x_row[col];
+                        const sycl::float4 yv = y_b[col];
+                        sum = sycl::fma(xv.x(), yv.x(), sum);
+                        sum = sycl::fma(xv.y(), yv.y(), sum);
+                        sum = sycl::fma(xv.z(), yv.z(), sum);
+                        sum = sycl::fma(xv.w(), yv.w(), sum);
+                    }
+                    sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+                    if (lid == 0) {
+                        d_b[row] = sum;
+                    }
+                });
+        } else {
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, (size_t) nrows * WG), sycl::range<2>(1, WG)),
+                [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                    const int b   = (int) it.get_group(0);
+                    const int row = (int) it.get_group(1);
+                    const int lid = (int) it.get_local_id(1);
+                    const sycl::float4 * x_row = x4 + (size_t) (b / i02_divisor) * x_b_stride4 + (size_t) row * (size_t) ncols4;
+                    const sycl::float4 * y_b   = y4 + (size_t) b * y_b_stride4;
+                    float *              d_b   = d + (size_t) b * d_b_stride;
+                    float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                    for (int col = lid; col < ncols4; col += WG) {
+                        const sycl::float4 xv = x_row[col];
+                        for (int c = 0; c < n_out; ++c) {
+                            const sycl::float4 yv = y_b[(size_t) c * (size_t) ncols4 + col];
+                            s[c] = sycl::fma(xv.x(), yv.x(), s[c]);
+                            s[c] = sycl::fma(xv.y(), yv.y(), s[c]);
+                            s[c] = sycl::fma(xv.z(), yv.z(), s[c]);
+                            s[c] = sycl::fma(xv.w(), yv.w(), s[c]);
+                        }
+                    }
+                    for (int c = 0; c < n_out; ++c) {
+                        const float sum = sycl::reduce_over_group(it.get_group(), s[c], sycl::plus<float>());
+                        if (lid == 0) {
+                            d_b[(size_t) c * (size_t) nrows + row] = sum;
+                        }
+                    }
+                });
+        }
+    } else {
+        stream->parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, (size_t) nrows * WG), sycl::range<2>(1, WG)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int b   = (int) it.get_group(0);
+                const int row = (int) it.get_group(1);
+                const int lid = (int) it.get_local_id(1);
+                const float * x_row = x + (size_t) (b / i02_divisor) * x_b_stride + (size_t) row * (size_t) ncols;
+                const float * y_b   = y + (size_t) b * y_b_stride;
+                float *       d_b   = d + (size_t) b * d_b_stride;
+                float s[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+                for (int col = lid; col < ncols; col += WG) {
+                    const float xv = x_row[col];
+                    for (int c = 0; c < n_out; ++c) {
+                        s[c] = sycl::fma(xv, y_b[(size_t) c * (size_t) ncols + col], s[c]);
+                    }
+                }
+                for (int c = 0; c < n_out; ++c) {
+                    const float sum = sycl::reduce_over_group(it.get_group(), s[c], sycl::plus<float>());
+                    if (lid == 0) {
+                        d_b[(size_t) c * (size_t) nrows + row] = sum;
+                    }
+                }
+            });
+    }
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3245,6 +3784,15 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // the main device has a larger memory buffer to hold the results from all GPUs
     // ldc == nrows of the matrix that cuBLAS writes into
     int ldc = id == ctx.device ? ne0 : row_diff; // used by MKL only
+
+    if (is_bmg_g31_arch(id) && src0->type == GGML_TYPE_F32 &&
+        src1->type == GGML_TYPE_F32 && ne00 > 0 && ne00 <= 8192 &&
+        row_diff > 0 && src1_ncols > 0 &&
+        ((src1_ncols <= 8 && row_diff <= (2 * 1024 * 1024) / ne00) ||
+         (ne00 <= 32 && src1_ncols <= 32 && row_diff <= (2 * 1024 * 1024) / (ne00 * src1_ncols)))) {
+        mul_mat_vec_f32_small_sycl((const float *) src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc, stream);
+        return;
+    }
 
 #ifdef GGML_SYCL_F16
     bool use_fp16 = true;  // TODO(Yu) SYCL capability check
@@ -3591,7 +4139,13 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     // the kernel indexes in 32-bit
     GGML_ASSERT(ggml_nelements(dst->src[0]) <= INT32_MAX);
 
-    scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(dst->src[0]), main_stream);
+    const ggml_tensor * src0 = dst->src[0];
+    if (ggml_is_contiguous(src0)) {
+        scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0), main_stream);
+    } else { // dst is contiguous (supports_op)
+        scale_f32_strided_sycl((const char *) src0->data, dst_dd, scale, bias, src0->ne[0], src0->ne[1], src0->ne[2],
+                               src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], main_stream);
+    }
     /*
     DPCT1010:87: SYCL uses exceptions to report errors and does not use the
     error codes. The call was replaced with 0. You need to rewrite this code.
@@ -4129,38 +4683,43 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
                                                 " : converting src1 to fp16");
 
 #if GGML_SYCL_DNNL
-        // iterate tensor dims and find the slowest moving dim and stride
-        int last_dim=0;
-        int last_str=0;
-        size_t largest_str=0;
-        for(int i = 0; i< 4; i++){
-            // last stride is always the largest
-            if(src1->nb[i] == largest_str){
-                if(src1->ne[last_dim] == 1){
+        // the layout-preserving conversion only suits the oneDNN branch below, which reads src1 with its own
+        // strides; with oneDNN disabled at runtime the oneMKL branch needs the dense copy
+        if (g_ggml_sycl_enable_dnn) {
+            // iterate tensor dims and find the slowest moving dim and stride
+            int last_dim=0;
+            int last_str=0;
+            size_t largest_str=0;
+            for(int i = 0; i< 4; i++){
+                // last stride is always the largest
+                if(src1->nb[i] == largest_str){
+                    if(src1->ne[last_dim] == 1){
+                        last_str = i;
+                        last_dim = i;
+                    }
+                }
+                if(src1->nb[i] > largest_str){
+                    largest_str = src1->nb[i];
                     last_str = i;
                     last_dim = i;
                 }
-            }
-            if(src1->nb[i] > largest_str){
-                largest_str = src1->nb[i];
-                last_str = i;
-                last_dim = i;
-            }
 
-        }
-        // oneDNN handles strided data and does not need overhead of ggml_get_to_fp16_nc_sycl
-        const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
-        src1_f16_alloc.alloc(ne_src1);
-        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
-        GGML_ASSERT(to_fp16_sycl != nullptr);
-        to_fp16_sycl(src1_f16, src1_f16_alloc.get(), ne_src1, queue);
-# else
-        const int64_t ne_src1 = ggml_nelements(src1);
-        src1_f16_alloc.alloc(ne_src1);
-        const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
-        GGML_ASSERT(to_fp16_nc_sycl != nullptr);
-        to_fp16_nc_sycl(src1_f16, src1_f16_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+            }
+            // oneDNN handles strided data and does not need overhead of ggml_get_to_fp16_nc_sycl
+            const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
+            src1_f16_alloc.alloc(ne_src1);
+            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
+            GGML_ASSERT(to_fp16_sycl != nullptr);
+            to_fp16_sycl(src1_f16, src1_f16_alloc.get(), ne_src1, queue);
+        } else
 #endif
+        {
+            const int64_t ne_src1 = ggml_nelements(src1);
+            src1_f16_alloc.alloc(ne_src1);
+            const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
+            GGML_ASSERT(to_fp16_nc_sycl != nullptr);
+            to_fp16_nc_sycl(src1_f16, src1_f16_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+        }
 
         src1_f16 = src1_f16_alloc.get();
         s11      = ne10;
@@ -5252,6 +5811,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+    } else if (!split && !ggml_backend_buffer_is_sycl_split(src1->buffer) && !ggml_backend_buffer_is_sycl_split(dst->buffer) &&
+               is_bmg_g31_arch(ctx.device) && can_use_mul_mat_vec_f32_small_batched(src0, src1, dst)) {
+        mul_mat_vec_f32_small_batched_sycl(ctx, src0, src1, dst);
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
@@ -5620,14 +6182,18 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    if (ne12 != 1) return false;
+    const bool multi_tok_nvfp4 = (src0->type == GGML_TYPE_NVFP4 && ne12 > 1 && ne12 <= 16 &&
+                                  ids->ne[1] == ne12 && dst->ne[2] == ne12 &&
+                                  src1->ne[3] == 1 && dst->ne[3] == 1 &&
+                                  ids->ne[2] == 1 && ids->ne[3] == 1 &&
+                                  ids->nb[1] % sizeof(int32_t) == 0);
+    if (!multi_tok_nvfp4 && (ne12 != 1 || ids->ne[1] != 1)) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
     if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) return false;
-    if (ids->ne[1] != 1) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
 
     return true;
@@ -5640,7 +6206,7 @@ static bool ggml_sycl_mul_mat_id_should_use_mmvq(const ggml_tensor * dst) {
            ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
 }
 
-// Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
+// Fused MoE TG / small-batch verify fast path. Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
@@ -5649,11 +6215,14 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
     const int64_t n_ids_per_group = ids->ne[0];
     const queue_ptr stream           = ctx.stream();
     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
     const int       n_experts_used   = (int) n_ids_per_group;
     const int       nrows            = (int) src0->ne[1];
+    const int       n_tokens         = (int) ne12;
+    const int64_t   n_src1_rows      = ne11 * ne12;
 
     // Lazily reorder supported expert weights into a per-expert SoA layout, then run the reorder
     // GEMV. Placed after the bail checks so a non-dispatchable op does not pay the reorder cost.
@@ -5661,22 +6230,27 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const ggml_tensor_extra_gpu * src0_extra =
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
+    if (use_reorder && n_tokens > 1) {
+        return false;
+    }
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) n_src1_rows * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) n_src1_rows,
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) n_src1_rows,
             src1_padded_cols, stream);
     }
 
-    const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t bytes_per_qrow  = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_tok_stride = (size_t) ne11 * bytes_per_qrow;
+    const size_t ids_row_stride  = ids->nb[1] / sizeof(int32_t);
 
     if (use_reorder) {
         return ggml_sycl_mul_mat_vec_q_id_reorder(
@@ -5691,7 +6265,8 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         (float *) dst->data, (int) ne10, nrows, n_experts_used,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+        src1_row_stride, stream,
+        n_tokens, ids_row_stride, dst->nb[2], src1_tok_stride);
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -5774,10 +6349,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-            return;
-        }
+    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+        return;
     }
     GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
 
@@ -6787,6 +7360,32 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i++;
             continue;
         }
+        if (node->op == GGML_OP_MUL && ggml_sycl_can_fuse_l2_clip(cgraph, i, /*has_scale=*/true)) {
+            ggml_sycl_op_l2_clip_fused(*sycl_ctx, node->src[0], node->src[1],
+                                       cgraph->nodes[i + 4], cgraph->nodes[i + 5], cgraph->nodes[i + 7],
+                                       cgraph->nodes[i + 8]);
+            i += 8;
+            continue;
+        }
+        if (node->op == GGML_OP_SQR && ggml_sycl_can_fuse_l2_clip(cgraph, i, /*has_scale=*/false)) {
+            ggml_sycl_op_l2_clip_fused(*sycl_ctx, node->src[0], nullptr,
+                                       cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 6],
+                                       cgraph->nodes[i + 7]);
+            i += 7;
+            continue;
+        }
+        if (node->op == GGML_OP_UNARY &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
+            ggml_sycl_op_unary_scale_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            i += 2;
+            continue;
+        }
+        if (node->op == GGML_OP_UNARY &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { ggml_get_unary_op(node) })) {
+            ggml_sycl_op_unary_mul_add_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            i += 2;
+            continue;
+        }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
@@ -7676,8 +8275,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SCALE:
-            // the scale kernel is f32 only, and reads src0 flat
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+            // the scale kernels are f32 only; src0 flat or strided, dst contiguous
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_CONT:
             return true;
         case GGML_OP_TRI:

@@ -85,7 +85,7 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
 // the unary ops the fused unary chains in element_wise.cpp have a functor for
 static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
     return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
-           unary_op == GGML_UNARY_OP_SOFTPLUS;
+           unary_op == GGML_UNARY_OP_SOFTPLUS || unary_op == GGML_UNARY_OP_TANH;
 }
 
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
@@ -369,5 +369,175 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
         return true;
     }
+
+    auto elementwise_alias_safe = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
+        if (!src || !dst || !src->data || !dst->data) {
+            return false;
+        }
+        if (dst->data == src->data) {
+            return true; // exact element-for-element in-place
+        }
+        const uintptr_t ds = (uintptr_t) dst->data;
+        const uintptr_t de = ds + ggml_nbytes(dst);
+        const uintptr_t ss = (uintptr_t) src->data;
+        const uintptr_t se = ss + ggml_nbytes(src);
+        return de <= ss || se <= ds;
+    };
+
+    // UNARY + SCALE + MUL: dst = (s * op(x) + b) * other
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_SCALE &&
+        ops.begin()[2] == GGML_OP_MUL && unary_ops.size() == 1) {
+        const ggml_tensor * unary = cgraph->nodes[node_idx];
+        const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+        const ggml_unary_op unary_op = ggml_get_unary_op(unary);
+        if (unary_op != unary_ops.begin()[0] || !ggml_sycl_fused_unary_has_kernel(unary_op)) {
+            return false;
+        }
+        if (scale->src[0] != unary) {
+            return false;
+        }
+        const ggml_tensor * x     = unary->src[0];
+        const ggml_tensor * other = (mul->src[0] == scale) ? mul->src[1] : mul->src[0];
+        if (!x || !other || other == scale) {
+            return false;
+        }
+        if (x->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(x) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(x, other) || !ggml_are_same_shape(x, mul)) {
+            return false;
+        }
+        if (!elementwise_alias_safe(mul, x) || !elementwise_alias_safe(mul, other)) {
+            return false;
+        }
+        return true;
+    }
+
+    // UNARY + MUL + ADD: dst = acc + op(x) * other
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL &&
+        ops.begin()[2] == GGML_OP_ADD && unary_ops.size() == 1) {
+        const ggml_tensor * unary = cgraph->nodes[node_idx];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add   = cgraph->nodes[node_idx + 2];
+
+        const ggml_unary_op unary_op = ggml_get_unary_op(unary);
+        if (unary_op != unary_ops.begin()[0] || !ggml_sycl_fused_unary_has_kernel(unary_op)) {
+            return false;
+        }
+        const ggml_tensor * x     = unary->src[0];
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        const ggml_tensor * acc   = (add->src[0] == mul)   ? add->src[1] : add->src[0];
+        if (!x || !other || !acc || other == unary || acc == mul) {
+            return false;
+        }
+        if (x->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 ||
+            acc->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(x) || !ggml_is_contiguous(other) ||
+            !ggml_is_contiguous(acc) || !ggml_is_contiguous(add)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(x, other) || !ggml_are_same_shape(x, acc) || !ggml_are_same_shape(x, add)) {
+            return false;
+        }
+        if (!elementwise_alias_safe(add, x) || !elementwise_alias_safe(add, other) || !elementwise_alias_safe(add, acc)) {
+            return false;
+        }
+        return true;
+    }
+
     return false;
+}
+
+bool ggml_sycl_can_fuse_l2_clip(const ggml_cgraph * cgraph, int node_idx, bool has_scale) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return false;
+    }
+
+    static constexpr ggml_op ops_with_scale[9] = {
+        GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT,
+        GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    };
+    static constexpr ggml_op ops_no_scale[8] = {
+        GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT,
+        GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
+    };
+
+    const int n_ops = has_scale ? 9 : 8;
+    const int out_idx = node_idx + n_ops - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_ops, has_scale ? ops_with_scale : ops_no_scale, &out_idx, 1)) {
+        return false;
+    }
+
+    const int b = has_scale ? 1 : 0;
+    const ggml_tensor * mul0     = has_scale ? cgraph->nodes[node_idx] : nullptr;
+    const ggml_tensor * sqr_n    = cgraph->nodes[node_idx + b + 0];
+    const ggml_tensor * sum_n    = cgraph->nodes[node_idx + b + 1];
+    const ggml_tensor * sqrt_n   = cgraph->nodes[node_idx + b + 2];
+    const ggml_tensor * scale_n  = cgraph->nodes[node_idx + b + 3];
+    const ggml_tensor * fill_n   = cgraph->nodes[node_idx + b + 4];
+    const ggml_tensor * div_n    = cgraph->nodes[node_idx + b + 5];
+    const ggml_tensor * clamp_n  = cgraph->nodes[node_idx + b + 6];
+    const ggml_tensor * out_mul  = cgraph->nodes[node_idx + b + 7];
+
+    const ggml_tensor * cur_in   = has_scale ? mul0->src[0] : sqr_n->src[0];
+    const ggml_tensor * scale_in = has_scale ? mul0->src[1] : nullptr;
+    const ggml_tensor * cur_mid  = has_scale ? mul0 : cur_in;
+
+    if (!cur_in || (has_scale && !scale_in)) {
+        return false;
+    }
+    if (sqr_n->src[0] != cur_mid || sum_n->src[0] != sqr_n || sqrt_n->src[0] != sum_n ||
+        scale_n->src[0] != sqrt_n || fill_n->src[0] != scale_n ||
+        div_n->src[0] != fill_n || div_n->src[1] != scale_n ||
+        clamp_n->src[0] != div_n) {
+        return false;
+    }
+    if (!((out_mul->src[0] == cur_mid && out_mul->src[1] == clamp_n) ||
+          (out_mul->src[1] == cur_mid && out_mul->src[0] == clamp_n))) {
+        return false;
+    }
+
+    if (cur_in->type != GGML_TYPE_F32 || out_mul->type != GGML_TYPE_F32 ||
+        (has_scale && scale_in->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(cur_in) || !ggml_is_contiguous(out_mul) ||
+        !ggml_are_same_shape(cur_in, out_mul)) {
+        return false;
+    }
+    if (cur_in->ne[0] <= 0 || cur_in->ne[0] > 256) {
+        return false;
+    }
+    if (has_scale) {
+        if (!ggml_is_contiguous(scale_in) || scale_in->ne[0] != cur_in->ne[0] ||
+            (scale_in->ne[1] != 1 && scale_in->ne[1] != cur_in->ne[1]) ||
+            scale_in->ne[2] != 1 || scale_in->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    // Buffer overlap safety: out_mul may equal cur_in (each subgroup reads its full row before
+    // writing), otherwise out_mul must not overlap cur_in or scale_in.
+    auto disjoint = [](const ggml_tensor * a, const ggml_tensor * b) -> bool {
+        const uintptr_t as = (uintptr_t) a->data;
+        const uintptr_t ae = as + ggml_nbytes(a);
+        const uintptr_t bs = (uintptr_t) b->data;
+        const uintptr_t be = bs + ggml_nbytes(b);
+        return ae <= bs || be <= as;
+    };
+    if (out_mul->data != cur_in->data && !disjoint(out_mul, cur_in)) {
+        return false;
+    }
+    if (has_scale && !disjoint(out_mul, scale_in)) {
+        return false;
+    }
+
+    return true;
 }
