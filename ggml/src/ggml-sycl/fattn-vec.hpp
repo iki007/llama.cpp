@@ -74,7 +74,6 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                         const int32_t nb32,
                         const int64_t nb33,
                         const fattn_indexed_bias bias) {
-    GGML_UNUSED(bias);  // not taken: an indexed bias goes to the tile kernel (ggml_sycl_get_best_fattn_kernel)
 
 #ifdef SYCL_FLASH_ATTN
     // Skip unused kernel variants for faster compilation:
@@ -324,8 +323,18 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                     sum = logit_softcap * sycl::tanh(sum);
                 }
                 if (mask) {
-                    sum += slope * sycl::vec<sycl::half, 1>(maskh[j * ne11 + i_KQ])
-                                       .convert<float, sycl::rounding_mode::automatic>()[0];
+                    float m = sycl::vec<sycl::half, 1>(maskh[j * ne11 + i_KQ])
+                                  .convert<float, sycl::rounding_mode::automatic>()[0];
+                    // an indexed bias: the head's value of this key's bin, rounded with the mask to F16 (the dense
+                    // mask's rounding), from the bins-innermost table of launch_fattn
+                    if (bias.table) {
+                        const int64_t query = (int64_t) sequence * ne01.z() + ic0 + j;
+                        const int     bin   = bias.indices[query * bias.stride + k_VKQ_0 + i_KQ];
+                        if ((uint32_t) bin < (uint32_t) bias.n_bins) {
+                            m = (float) (sycl::half) (m + bias.table[(query * bias.n_head + head) * bias.n_bins + bin]);
+                        }
+                    }
+                    sum += slope * m;
                 }
 
                 KQ_max_new[j] = sycl::fmax((float) KQ_max_new[j], sum);
