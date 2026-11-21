@@ -130,6 +130,8 @@ int main() {
                 test_indexed_bias(backend, width, false, n_query);
                 test_indexed_bias(backend, width, true, n_query);
             }
+            // >= 1024 cells and >= 32 queries: the batched-GEMM (MKL) path of the SYCL backend, with its sinks
+            test_indexed_bias(backend, width, false, 65, 2048);
         }
         ggml_backend_free(backend);
     }

@@ -135,12 +135,19 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (per_head_mask && Q->ne[2] % mask->ne[2] != 0) {
         return BEST_FATTN_KERNEL_NONE;
     }
+    // an indexed bias (ggml_flash_attn_ext_add_indexed_bias) is applied by the tile kernel only, one head a group; for
+    // a few query rows the graph's dense per-head mask (supports_op false) is cheap and keeps the vector kernel
+    const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+    if (indexed_bias && (Q->ne[1] < 8 || !mask || max_bias != 0.0f || logit_softcap != 0.0f ||
+                         (K->ne[0] != 64 && K->ne[0] != 128) || V->ne[0] != K->ne[0])) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
-    if (Q->ne[1] >= 32 && !per_head_mask && !ggml_sycl_flash_attn_ext_onednn_failed(device)
+    if (Q->ne[1] >= 32 && !per_head_mask && !indexed_bias && !ggml_sycl_flash_attn_ext_onednn_failed(device)
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -163,9 +170,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !per_head_mask && !sinks && gqa_ratio >= 2 &&
+    // GGML_SYCL_MKL_FA_MIN_KV: the fewest K/V cells the MKL path takes (default 1024)
+    static const int mkl_fa_min_kv = ggml_sycl_get_env("GGML_SYCL_MKL_FA_MIN_KV", 1024);
+    // an indexed bias and its sinks are applied by the MKL softmax / normalization (fattn-mkl.cpp); sinks without an
+    // indexed bias stay on the kernels below as before
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !per_head_mask && (!sinks || indexed_bias) && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
-        Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
+        Q->ne[1] >= 32 && K->ne[1] >= mkl_fa_min_kv &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
         (Q->ne[3] == K->ne[3] || K->ne[3] == 1)) {
         // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
@@ -250,7 +261,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 
     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
-    if (!per_head_mask && ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
+    if (!per_head_mask && !indexed_bias && ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
         return BEST_FATTN_KERNEL_DPAS;
     }
 
@@ -262,12 +273,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (!per_head_mask && !ggml_sycl_flash_attn_ext_onednn_failed(device) && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (!per_head_mask && !indexed_bias && !ggml_sycl_flash_attn_ext_onednn_failed(device) && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
-    if (can_use_vector_kernel) {
+    if (can_use_vector_kernel && !indexed_bias) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
@@ -286,6 +297,46 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+thread_local ggml_sycl_fattn_bias_direct g_ggml_sycl_fattn_bias_direct;
+
+bool ggml_sycl_try_skip_bias_table_cont(const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FA_BIAS_DIRECT", 1) != 0;
+    const ggml_tensor * ct = cgraph->nodes[i];
+    if (!enabled || ct->op != GGML_OP_CONT || (ct->flags & GGML_TENSOR_FLAG_OUTPUT) || ct->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * pm = ct->src[0];
+    const ggml_tensor * x  = pm ? pm->src[0] : nullptr;
+    // x [n_bins, n_head, n_q] contiguous f32, pm its (1, 0, 2, 3) permute, ct = pm made contiguous [n_head, n_bins, n_q]
+    if (!x || pm->op != GGML_OP_PERMUTE || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[3] != 1 ||
+        pm->ne[0] != x->ne[1] || pm->ne[1] != x->ne[0] || pm->ne[2] != x->ne[2] || pm->nb[0] != x->nb[1] ||
+        pm->nb[1] != x->nb[0] || pm->nb[2] != x->nb[2] || pm->data != x->data || ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+    // its one consumer: a flash attention that takes it as the indexed bias table
+    int j = i + 1;
+    while (j < cgraph->n_nodes && !(cgraph->nodes[j]->op == GGML_OP_FLASH_ATTN_EXT && cgraph->nodes[j]->src[6] == ct)) {
+        ++j;
+    }
+    if (j == cgraph->n_nodes) {
+        return false;
+    }
+    // x must still hold the table there: once the CONT (its last reader) has run, the allocator may give x's block
+    // to a later node, so no node in between may write into it
+    const uintptr_t xs = (uintptr_t) x->data;
+    const uintptr_t xe = xs + ggml_nbytes(x);
+    for (int k = i + 1; k < j; ++k) {
+        const ggml_tensor * n  = cgraph->nodes[k];
+        const uintptr_t     ns = (uintptr_t) n->data;
+        const uintptr_t     ne = ns + ggml_nbytes(n);
+        if (ns < xe && xs < ne) {
+            return false;
+        }
+    }
+    g_ggml_sycl_fattn_bias_direct = { cgraph->nodes[j], (const float *) x->data };
+    return true;
 }
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
