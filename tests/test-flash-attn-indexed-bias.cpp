@@ -9,14 +9,20 @@
 
 // rel: the bins come from positions (ggml_flash_attn_ext_add_rel_pos_bias): cell c sits at position c, query j of
 // stream s at 3*j + 5*s + 40, and the bin is clamp(query position - cell position, 0, extent)
-static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768, bool rel = false) {
+// q8: a q8_0 cache laid out as the KV cache's (the heads of a cell in one row: a permuted view), which the decode
+// kernels read in place; the keys and values below are exact in q8_0 up to the f16 block scale
+static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768, bool rel = false,
+                              bool q8 = false) {
     constexpr int heads = 6, kv_heads = 2, streams = 2, bins = 17;
     const int cols = use_rows ? std::min(512, cells) : cells;
 
     ggml_context * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
     auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, n_query, heads, streams);
-    auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, width, cells, kv_heads, use_rows ? 1 : streams);
-    auto * v = ggml_dup_tensor(ctx, k);
+    const int kv_streams = use_rows ? 1 : streams;
+    ggml_tensor * k_rows = q8 ? ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, width, kv_heads, cells, kv_streams) : nullptr;
+    ggml_tensor * v_rows = q8 ? ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, width, kv_heads, cells, kv_streams) : nullptr;
+    auto * k = q8 ? ggml_permute(ctx, k_rows, 0, 2, 1, 3) : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, width, cells, kv_heads, kv_streams);
+    auto * v = q8 ? ggml_permute(ctx, v_rows, 0, 2, 1, 3) : ggml_dup_tensor(ctx, k);
     auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cols, n_query, 1, streams);
     auto * rows = use_rows ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, streams) : nullptr;
     auto * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, heads, bins, n_query*streams);
@@ -109,8 +115,28 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
         }
     }
     ggml_backend_tensor_set(q, queries.data(), 0, ggml_nbytes(q));
-    ggml_backend_tensor_set(k, keys.data(), 0, ggml_nbytes(k));
-    ggml_backend_tensor_set(v, values.data(), 0, ggml_nbytes(v));
+    if (q8) {
+        // [stream][kv head][cell][width] f16 -> [stream][cell][kv head] q8_0 rows
+        for (ggml_tensor * t : { k_rows, v_rows }) {
+            const std::vector<ggml_fp16_t> & src = t == k_rows ? keys : values;
+            std::vector<float>   f((size_t) width*kv_heads*cells*kv_streams);
+            std::vector<uint8_t> qd(ggml_nbytes(t));
+            for (int s = 0; s < kv_streams; ++s) {
+                for (int c = 0; c < cells; ++c) {
+                    for (int h = 0; h < kv_heads; ++h) {
+                        for (int x = 0; x < width; ++x) {
+                            f[(((size_t) s*cells + c)*kv_heads + h)*width + x] = ggml_fp16_to_fp32(src[(((size_t) s*kv_heads + h)*cells + c)*width + x]);
+                        }
+                    }
+                }
+            }
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), qd.data(), 0, (int64_t) kv_heads*cells*kv_streams, width, nullptr);
+            ggml_backend_tensor_set(t, qd.data(), 0, qd.size());
+        }
+    } else {
+        ggml_backend_tensor_set(k, keys.data(), 0, ggml_nbytes(k));
+        ggml_backend_tensor_set(v, values.data(), 0, ggml_nbytes(v));
+    }
     ggml_backend_tensor_set(mask, visibility.data(), 0, ggml_nbytes(mask));
     ggml_backend_tensor_set(table, biases.data(), 0, ggml_nbytes(table));
     ggml_backend_tensor_set(sinks, sink_logits, 0, sizeof(sink_logits));
@@ -138,7 +164,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
         GGML_ASSERT(std::isfinite(output[i]));
         max_error = std::max(max_error, fabsf(output[i] - expected[i/width]));
     }
-    printf("%s: width=%d, rows=%d, queries=%d, cells=%d, rel=%d, max error=%g\n", ggml_backend_name(backend), width, use_rows, n_query, cells, rel, max_error);
+    printf("%s: width=%d, rows=%d, queries=%d, cells=%d, rel=%d, q8=%d, max error=%g\n", ggml_backend_name(backend), width, use_rows, n_query, cells, rel, q8, max_error);
     GGML_ASSERT(max_error < 0.001f);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -165,6 +191,13 @@ int main() {
                 test_indexed_bias(backend, width, true, n_query, 768, true);
             }
             test_indexed_bias(backend, width, false, 65, 2048, true);
+            // a q8_0 cache in the KV cache's layout: the decode / verify kernels that read it in place
+            for (int n_query : {1, 4, 7}) {
+                for (bool rel : {false, true}) {
+                    test_indexed_bias(backend, width, false, n_query, 768, rel, true);
+                    test_indexed_bias(backend, width, false, n_query, 2048, rel, true);
+                }
+            }
         }
         ggml_backend_free(backend);
     }
