@@ -36,9 +36,10 @@ struct ggml_sycl_fattn_extra {
 // the reservation and hands out the pointers, so the two cannot disagree.
 // Each field is the address of one reserved block, or 0 if that block was not reserved,
 // in which case the caller allocates from the scratch pool instead.
-ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
+// The F16 copies of a quantized cache are reserved only for the kernels that read them (not MKL, not DPAS).
+ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst, int device);
 
-size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
+size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst, int device);
 
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 

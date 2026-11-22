@@ -507,7 +507,7 @@ static uintptr_t ggml_sycl_fattn_reserve_halves(ggml_sycl_fattn_extra & extra, s
     return block;
 }
 
-ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
+ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst, const int device) {
     ggml_sycl_fattn_extra extra;
 
     extra.end = (uintptr_t) dst->data + ggml_nbytes(dst);
@@ -521,6 +521,18 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     const ggml_tensor * V = dst->src[2];
     if (!Q || !K || !V) {
         return extra;
+    }
+
+    // MKL converts a quantized cache chunk by chunk in pool memory and DPAS reads it in place: neither reads the
+    // staging blocks, which for a quantized cache are the F16 size of all of K and V (2 GiB a layer at 512K cells).
+    // The choice is the dispatcher's: it depends on the shapes and the environment, and the only state it reads (a
+    // failed oneDNN) can only rule oneDNN out. GGML_SYCL_FA_STAGING_ALL=1 reserves for every kernel, as before.
+    static const bool staging_all = ggml_sycl_get_env("GGML_SYCL_FA_STAGING_ALL", 0) != 0;
+    if (!staging_all) {
+        const best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel(device, dst);
+        if (k == BEST_FATTN_KERNEL_MKL || k == BEST_FATTN_KERNEL_DPAS) {
+            return extra;
+        }
     }
 
     const int64_t d = K->ne[0];
@@ -565,7 +577,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     return extra;
 }
 
-size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst) {
-    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst, const int device) {
+    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst, device);
     return (size_t) (extra.end - (uintptr_t) dst->data);
 }

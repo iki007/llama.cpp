@@ -268,7 +268,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     dnnl::engine    eng    = ctx.engine_dnnl(stream);
     dnnl::stream    strm   = ctx.stream_dnnl(stream);
 
-    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst, ctx.device);
 
     // Q: always f32 -- copy to dense f16.
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Qf_pool;
