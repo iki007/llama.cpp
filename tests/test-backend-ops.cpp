@@ -14009,6 +14009,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // small f32 projections batched over tokens with more than 8 outputs a batch (Inkling's relative-bias table:
+    // [16, 1025] x [16, 24 heads, n tokens], the weight broadcast over the tokens)
+    for (int64_t nb : {2, 4, 7}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, 16, {1, 1}, {nb, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 131, 17, 32, {nb, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 9, 5, {nb, 2}, {1, 1}));
+    }
+
+    // small BF16 projections with a few columns (Inkling's attention-sink / conv-tap weights in a verify batch)
+    for (int64_t n : {2, 4, 7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 24, n, 2304, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 33, n, 130, {1, 1}, {1, 1}));
+    }
+
     // NVFP4 small batches (a speculative verify batch), where the backend may group the slots of an expert: 8 of 16
     // or 8 of 8 experts (every expert in several tokens), rows not a multiple of 4, skipped slots, up to 16 tokens
     for (int n : {2, 4, 7, 16}) {
@@ -15570,6 +15584,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n : { 1, 4 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
+    }
+    // the reorder (SoA) expert types at the same shapes (Inkling's layers 20-23: Q5_K gate_up, Q8_0 down), 1-8 tokens
+    for (ggml_type t : { GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_MXFP4 }) {
+        for (int n : { 1, 2, 4, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
+            // the down shape (k 1152) is not a whole number of K-quant blocks: k 2304 for those
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n,
+                                                        ggml_blck_size(t) == 256 ? 2304 : 1152));
+        }
     }
     // the same with 32 experts: random routing then shares ~1/3 of the slots of 4 tokens, about what Inkling's
     // consecutive tokens share (61% distinct)

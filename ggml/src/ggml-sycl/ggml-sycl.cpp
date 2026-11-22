@@ -3271,6 +3271,65 @@ static void launch_mul_mat_vec_f32_vec4_sycl(const float * x, const float * y, f
     });
 }
 
+// Small BF16 projections with 2-8 columns (Inkling's attention-sink and conv-tap weights, [2304, 24..32], in a
+// speculative verify batch): a work-group per row, the bf16 pairs read as 32-bit words, f32 accumulation. Without
+// it they went through a bf16 -> f32 conversion and oneMKL SGEMM (~9.5 us each).
+static constexpr int MM_BF16_SC_WG   = 128;
+static constexpr int MM_BF16_SC_MAXC = 8;
+
+static void mul_mat_bf16_small_cols_sycl(const void * vx, const float * y, float * dst, int ncols, int nrows,
+                                         int n_out, int ldc, queue_ptr stream) {
+    constexpr int WG  = MM_BF16_SC_WG;
+    constexpr int SG  = 16;
+    constexpr int NSG = WG / SG;
+    constexpr int MC  = MM_BF16_SC_MAXC;
+    const uint32_t * x2 = (const uint32_t *) vx;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(NSG * MC), cgh);
+        cgh.parallel_for(sycl::nd_range<1>((size_t) nrows * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int        row  = (int) it.get_group(0);
+            const int        tid  = (int) it.get_local_id(0);
+            const auto       sg   = it.get_sub_group();
+            const uint32_t * xr   = x2 + (size_t) row * (size_t) (ncols / 2);
+            float            acc[MC];
+#pragma unroll
+            for (int c = 0; c < MC; ++c) {
+                acc[c] = 0.0f;
+            }
+            for (int e2 = tid; e2 < ncols / 2; e2 += WG) {
+                const uint32_t w  = xr[e2];
+                const float    w0 = sycl::bit_cast<float>(w << 16);
+                const float    w1 = sycl::bit_cast<float>(w & 0xffff0000u);
+#pragma unroll
+                for (int c = 0; c < MC; ++c) {
+                    if (c < n_out) {
+                        const float * yc = y + (size_t) c * (size_t) ncols + 2 * e2;
+                        acc[c] = sycl::fma(w0, yc[0], acc[c]);
+                        acc[c] = sycl::fma(w1, yc[1], acc[c]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < MC; ++c) {
+                if (c < n_out) {
+                    const float r = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
+                    if (sg.leader()) {
+                        red[(int) sg.get_group_linear_id() * MC + c] = r;
+                    }
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            if (tid < n_out) {
+                float sum = 0.0f;
+                for (int g = 0; g < NSG; ++g) {
+                    sum += red[g * MC + tid];
+                }
+                dst[(size_t) tid * (size_t) ldc + row] = sum;
+            }
+        });
+    });
+}
+
 // Direct F32 GEMV / small-N GEMM for small projections on BMG G31, avoiding oneMKL SGEMM
 // dispatch overhead while preserving full F32 accumulation precision.
 static void mul_mat_vec_f32_small_sycl(const float * x, const float * y, float * dst,
@@ -3643,6 +3702,28 @@ static void mul_mat_vec_f32_small_batched_sycl(ggml_backend_sycl_context & ctx,
                         d_b[(size_t) c * (size_t) nrows + row] = s[c];
                     }
                 });
+        } else if (n_batch * (global_rows / 128) < 512) {
+            // few batches (a verify batch): a work-item per (batch, output, row). One work-item per (batch, row)
+            // looping over up to 32 outputs ran ~36 work-groups for Inkling's relative-bias table at 4 tokens
+            // (21 us); with many batches (a prompt) it keeps the row in registers and is faster. Same summation order.
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch * (size_t) n_out, global_rows), sycl::range<2>(1, 128)),
+                [=](sycl::nd_item<2> it) {
+                    const int bc  = (int) it.get_group(0);
+                    const int b   = bc / n_out;
+                    const int c   = bc - b * n_out;
+                    const int row = (int) it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const float * x_row = x + (size_t) (b / i02_divisor) * x_b_stride + (size_t) row * (size_t) ncols;
+                    const float * yc    = y + (size_t) b * y_b_stride + (size_t) c * (size_t) ncols;
+                    float sum = 0.0f;
+                    for (int col = 0; col < ncols; ++col) {
+                        sum = sycl::fma(x_row[col], yc[col], sum);
+                    }
+                    d[(size_t) b * d_b_stride + (size_t) c * (size_t) nrows + row] = sum;
+                });
         } else {
             stream->parallel_for(
                 sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, global_rows), sycl::range<2>(1, 128)),
@@ -3793,6 +3874,12 @@ inline void ggml_sycl_op_mul_mat_sycl(
         ((src1_ncols <= 8 && row_diff <= (2 * 1024 * 1024) / ne00) ||
          (ne00 <= 32 && src1_ncols <= 32 && row_diff <= (2 * 1024 * 1024) / (ne00 * src1_ncols)))) {
         mul_mat_vec_f32_small_sycl((const float *) src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc, stream);
+        return;
+    }
+    if (is_bmg_g31_arch(id) && src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && ne00 % 2 == 0 &&
+        ne00 <= 8192 && row_diff > 0 && row_diff <= 256 && src1_ncols >= 2 && src1_ncols <= MM_BF16_SC_MAXC &&
+        ggml_is_contiguous(src0)) {
+        mul_mat_bf16_small_cols_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc, stream);
         return;
     }
 
@@ -6210,12 +6297,17 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    const bool multi_tok_nvfp4 = (src0->type == GGML_TYPE_NVFP4 && ne12 > 1 && ne12 <= 16 &&
-                                  ids->ne[1] == ne12 && dst->ne[2] == ne12 &&
-                                  src1->ne[3] == 1 && dst->ne[3] == 1 &&
-                                  ids->ne[2] == 1 && ids->ne[3] == 1 &&
-                                  ids->nb[1] % sizeof(int32_t) == 0);
-    if (!multi_tok_nvfp4 && (ne12 != 1 || ids->ne[1] != 1)) return false;
+    // small batches (speculative verify): NVFP4 up to 16 tokens; the reorder (SoA) types up to
+    // GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK (default 8; 0 = one token only, the grouped GEMM above that)
+    static const int reorder_max_tok = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK", 8);
+    const int64_t max_tok = src0->type == GGML_TYPE_NVFP4 ? 16 :
+                            ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) ? reorder_max_tok : 1;
+    const bool multi_tok = (ne12 > 1 && ne12 <= max_tok &&
+                            ids->ne[1] == ne12 && dst->ne[2] == ne12 &&
+                            src1->ne[3] == 1 && dst->ne[3] == 1 &&
+                            ids->ne[2] == 1 && ids->ne[3] == 1 &&
+                            ids->nb[1] % sizeof(int32_t) == 0);
+    if (!multi_tok && (ne12 != 1 || ids->ne[1] != 1)) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
@@ -6258,14 +6350,14 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const ggml_tensor_extra_gpu * src0_extra =
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
-    if (use_reorder && n_tokens > 1) {
-        return false;
-    }
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
         (size_t) n_src1_rows * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
-    if (use_reorder) {
+    static const bool dedup     = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP", 1) != 0;
+    const bool        use_dedup = !use_reorder && dedup &&
+                                  ggml_sycl_mul_mat_vec_q_id_dedup_supported(src0->type, n_tokens, n_experts_used);
+    if (use_reorder || use_dedup) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
             (const float *) src1->data, src1_ddq, (int) ne10, (int) n_src1_rows,
             src1_padded_cols, stream);
@@ -6286,10 +6378,10 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
             (float *) dst->data, (int) ne10, nrows, n_experts_used,
             /*expert_weight_stride=*/ src0->nb[2],
             /*dst_row_stride=*/ dst->nb[1],
-            src1_row_stride, stream);
+            src1_row_stride, stream,
+            n_tokens, ids_row_stride, dst->nb[2], src1_tok_stride);
     }
-    static const bool dedup = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP", 1) != 0;
-    if (dedup && n_tokens > 1 && src0->type == GGML_TYPE_NVFP4) {
+    if (use_dedup) {
         if (ggml_sycl_mul_mat_vec_q_id_dedup(
                 src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne10, nrows, n_experts_used,
