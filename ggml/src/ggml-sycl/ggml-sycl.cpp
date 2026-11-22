@@ -64,6 +64,7 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/depth_mix.hpp"
 #include "ggml-sycl/loop_ctrl.hpp"
+#include "ggml-sycl/moe_glue.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
@@ -7410,6 +7411,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (node->op == GGML_OP_REPEAT) {
+            const int glue_nodes_to_skip = ggml_sycl_try_moe_glue_fusion(*sycl_ctx, cgraph, i);
+            if (glue_nodes_to_skip > 0) {
+                i += glue_nodes_to_skip;
+                continue;
+            }
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
