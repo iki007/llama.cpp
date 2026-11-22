@@ -4764,6 +4764,17 @@ struct test_unary_scale_fusion : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "UNARY_SCALE_FUSION";
+// Inkling's depth mix: attention of learned queries over [stack rows..., rms_norm(cur)], the chain that backends
+// may fuse (RMS_NORM, CONCAT, TRANSPOSE, CONT, REPEAT, MUL_MAT, SOFT_MAX, MUL_MAT)
+struct test_depth_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_stack;
+    const int64_t n_q;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX";
     }
 
     bool run_whole_graph() override { return true; }
@@ -4828,6 +4839,30 @@ struct test_unary_scale_fusion : public test_case {
         }
         ggml_set_name(cur, "out");
         return cur;
+    std::string vars() override { return VARS_TO_STR4(n_embd, n_stack, n_q, n_tokens); }
+
+    test_depth_mix(int64_t n_embd = 256, int64_t n_stack = 2, int64_t n_q = 1, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_stack(n_stack), n_q(n_q), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_stack, n_tokens);
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(stack, "stack");
+        ggml_set_name(query, "query");
+
+        ggml_tensor * row     = ggml_rms_norm(ctx, cur, 1e-6f);
+        ggml_tensor * states  = ggml_concat(ctx, stack, row, 1);
+        ggml_tensor * queries = n_tokens == 1
+            ? ggml_reshape_3d(ctx, query, n_embd, n_q, 1)
+            : ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_q, n_tokens));
+        ggml_tensor * scores  = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf((float) n_embd), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -12058,6 +12093,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_unary_scale_fusion(GGML_UNARY_OP_GELU,       type, { 256, 16, 1, 1 }, 0.25f, 0.0f, 1.0f, 0.0f, "glu_guard"));
     }
     test_cases.emplace_back(new test_unary_scale_fusion(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, { 256, 16, 1, 1 }, 0.25f, 0.0f, 2.0f, 0.0f, "lower"));
+    // depth mix (Inkling)
+    for (int64_t n_embd : { 256, 2304, 192 }) {
+        for (int64_t n_stack : { 1, 2, 4, 7, 8 }) {
+            for (int64_t n_q : { 1, 3, 5 }) {
+                for (int64_t n_tokens : { 1, 5, 64 }) {
+                    test_cases.emplace_back(new test_depth_mix(n_embd, n_stack, n_q, n_tokens));
+                }
+            }
+        }
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
