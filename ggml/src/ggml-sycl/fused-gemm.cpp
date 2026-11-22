@@ -1479,7 +1479,11 @@ bool ggml_sycl_grouped_dequant_gemm_device_supported(ggml_type src0_type, bool r
     if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
         !ggml_sycl_xmx_gather_type_enabled(src0_type) || !fg_visit_type(src0_type, reordered, [](auto) {}) ||
         !ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, std::min(n_as, total_rows),
-                                                (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_UNBOUNDED) != 0)) {
+                                                (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_UNBOUNDED) != 0 ||
+                                                    // NVFP4 has no faster path past the bound (the per-expert
+                                                    // fallback dequantizes to f32 for SGEMM): Inkling prompts at
+                                                    // ubatch 2048 1243 -> 2152 t/s
+                                                    src0_type == GGML_TYPE_NVFP4)) {
         return false;
     }
     const sycl::device device = stream->get_device();
