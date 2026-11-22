@@ -12169,7 +12169,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_unary_scale_fusion(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, { 256, 16, 1, 1 }, 0.25f, 0.0f, 2.0f, 0.0f, "lower"));
     // depth mix (Inkling)
     for (int64_t n_embd : { 256, 2304, 192 }) {
-        for (int64_t n_stack : { 1, 2, 4, 7, 8 }) {
+        for (int64_t n_stack : { 1, 2, 4, 7, 8, 23 }) {
             for (int64_t n_q : { 1, 3, 5 }) {
                 for (int64_t n_tokens : { 1, 5, 64 }) {
                     test_cases.emplace_back(new test_depth_mix(n_embd, n_stack, n_q, n_tokens));

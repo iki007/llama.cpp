@@ -106,6 +106,126 @@ static void depth_mix_launch(const float * cur, const float * stack, const size_
     });
 }
 
+// One token, split over the elements: kernel 1 runs a work-group per (query, 256-element chunk) and writes the
+// chunk's part of every row score and of the sum of squares of cur; kernel 2 runs the same grid, adds the parts of
+// its query, takes the softmax in sub-group 0 and writes its chunk of the weighted sum. More work-groups than the
+// one-per-query kernel above, which runs a query on one Xe core; same reduction order inside a chunk only.
+static constexpr int DEPTH_MIX_S_CH  = 256;
+static constexpr int DEPTH_MIX_S_NSG = DEPTH_MIX_S_CH / DEPTH_MIX_SG;
+
+static void depth_mix_split_launch(const float * cur, const float * stack, const size_t stack_row_stride,
+                                   const int n_stack, const char * q, const size_t q_col_stride, const int n_q,
+                                   float * out, const int n_embd, const float eps, const float sm_scale, float * parts,
+                                   dpct::queue_ptr stream) {
+    const int n_ch = (n_embd + DEPTH_MIX_S_CH - 1) / DEPTH_MIX_S_CH;
+    const sycl::nd_range<2> grid(sycl::range<2>((size_t) n_q, (size_t) n_ch * DEPTH_MIX_S_CH),
+                                 sycl::range<2>(1, DEPTH_MIX_S_CH));
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> part(sycl::range<1>(DEPTH_MIX_S_NSG * DEPTH_MIX_SLOTS), cgh);
+        cgh.parallel_for(grid, [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(DEPTH_MIX_SG)]] {
+            const auto    sg     = it.get_sub_group();
+            const int     sgid   = (int) sg.get_group_linear_id();
+            const int     lane   = (int) sg.get_local_linear_id();
+            const int     qi     = (int) it.get_group(0);
+            const int     ch     = (int) it.get_group(1);
+            const int     e      = ch * DEPTH_MIX_S_CH + (int) it.get_local_id(1);
+            const int     n_rows = n_stack + 1;
+            const float * qv     = (const float *) (q + (size_t) qi * q_col_stride);
+
+            float acc[DEPTH_MIX_SLOTS];
+#pragma unroll
+            for (int b = 0; b < DEPTH_MIX_SLOTS; ++b) {
+                acc[b] = 0.0f;
+            }
+            if (e < n_embd) {
+                const float qe = qv[e];
+                const float x  = cur[e];
+                acc[DEPTH_MIX_MAX_ROWS] = x * x;
+                acc[n_stack]            = x * qe;
+#pragma unroll
+                for (int b = 0; b < DEPTH_MIX_MAX_ROWS; ++b) {
+                    if (b < n_stack) {
+                        acc[b] = stack[(size_t) b * stack_row_stride + e] * qe;
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < DEPTH_MIX_SLOTS; ++b) {
+                if (b < n_rows || b == DEPTH_MIX_MAX_ROWS) {
+                    const float r = sycl::reduce_over_group(sg, acc[b], sycl::plus<float>());
+                    if (lane == 0) {
+                        part[sgid * DEPTH_MIX_SLOTS + b] = r;
+                    }
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            // slot b of the chunk: sub-group b / SG adds the NSG parts in lane b % SG
+            static_assert(DEPTH_MIX_S_NSG <= DEPTH_MIX_SG, "one lane a part");
+            for (int b = sgid; b < DEPTH_MIX_SLOTS; b += DEPTH_MIX_S_NSG) {
+                if (b < n_rows || b == DEPTH_MIX_MAX_ROWS) {
+                    const float t = lane < DEPTH_MIX_S_NSG ? part[lane * DEPTH_MIX_SLOTS + b] : 0.0f;
+                    const float r = sycl::reduce_over_group(sg, t, sycl::plus<float>());
+                    if (lane == 0) {
+                        parts[((size_t) qi * n_ch + ch) * DEPTH_MIX_SLOTS + b] = r;
+                    }
+                }
+            }
+        });
+    });
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> w(sycl::range<1>(DEPTH_MIX_SLOTS), cgh);
+        cgh.parallel_for(grid, [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(DEPTH_MIX_SG)]] {
+            const auto    sg     = it.get_sub_group();
+            const int     sgid   = (int) sg.get_group_linear_id();
+            const int     lane   = (int) sg.get_local_linear_id();
+            const int     qi     = (int) it.get_group(0);
+            const int     ch     = (int) it.get_group(1);
+            const int     e      = ch * DEPTH_MIX_S_CH + (int) it.get_local_id(1);
+            const int     n_rows = n_stack + 1;
+            const float * pq     = parts + (size_t) qi * n_ch * DEPTH_MIX_SLOTS;
+
+            if (sgid == 0) {
+                // lane l: rows l and l + SG, and (lane 0) the sum of squares; added over the chunks
+                static_assert(DEPTH_MIX_MAX_ROWS <= 2 * DEPTH_MIX_SG, "two rows per lane");
+                const int r0 = lane;
+                const int r1 = lane + DEPTH_MIX_SG;
+                float     t0 = 0.0f;
+                float     t1 = 0.0f;
+                float     ss = 0.0f;
+                for (int c = 0; c < n_ch; ++c) {
+                    const float * pc = pq + (size_t) c * DEPTH_MIX_SLOTS;
+                    t0 += r0 < n_rows ? pc[r0] : 0.0f;
+                    t1 += r1 < n_rows ? pc[r1] : 0.0f;
+                    ss += pc[DEPTH_MIX_MAX_ROWS];
+                }
+                const float scale = sycl::rsqrt(ss / n_embd + eps);
+                const float s0    = r0 < n_rows ? (r0 == n_stack ? t0 * scale : t0) * sm_scale : -INFINITY;
+                const float s1    = r1 < n_rows ? (r1 == n_stack ? t1 * scale : t1) * sm_scale : -INFINITY;
+                const float smax  = sycl::reduce_over_group(sg, sycl::fmax(s0, s1), sycl::maximum<float>());
+                const float e0    = r0 < n_rows ? sycl::exp(s0 - smax) : 0.0f;
+                const float e1    = r1 < n_rows ? sycl::exp(s1 - smax) : 0.0f;
+                const float inv   = 1.0f / sycl::reduce_over_group(sg, e0 + e1, sycl::plus<float>());
+                // the weight of cur carries its norm scale
+                if (r0 < n_rows) {
+                    w[r0] = e0 * inv * (r0 == n_stack ? scale : 1.0f);
+                }
+                if (r1 < n_rows) {
+                    w[r1] = e1 * inv * (r1 == n_stack ? scale : 1.0f);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            if (e < n_embd) {
+                float o = 0.0f;
+                for (int b = 0; b < n_stack; ++b) {
+                    o += stack[(size_t) b * stack_row_stride + e] * w[b];
+                }
+                o += cur[e] * w[n_stack];
+                out[(size_t) qi * n_embd + e] = o;
+            }
+        });
+    });
+}
+
 // Many tokens: one work-group per token. Work-item tid holds elements tid + k * wg (k < EPT) of all NR state rows
 // in registers, so every row is read from memory once for the scores of all n_q queries and for the weighted
 // sums. The sub-group parts of the scores go to local memory, the first work-items add them up, and every
@@ -363,7 +483,14 @@ int ggml_sycl_try_depth_mix_fusion(ggml_backend_sycl_context & ctx, const ggml_c
 
     scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2);
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    if (n_tokens == 1) {
+    static const bool split = ggml_sycl_get_env("GGML_SYCL_DEPTH_MIX_SPLIT", 1) != 0;
+    if (n_tokens == 1 && split) {
+        const int n_ch = (int) ((n_embd + DEPTH_MIX_S_CH - 1) / DEPTH_MIX_S_CH);
+        ggml_sycl_pool_alloc<float> parts(ctx.pool(), (size_t) n_q * n_ch * DEPTH_MIX_SLOTS);
+        depth_mix_split_launch((const float *) cur->data, (const float *) stack->data, stack->nb[1] / sizeof(float),
+                               (int) n_stack, (const char *) qs->data, qs->nb[1], (int) n_q, (float *) out->data,
+                               (int) n_embd, eps, sm_scale, parts.get(), ctx.stream());
+    } else if (n_tokens == 1) {
         depth_mix_launch((const float *) cur->data, (const float *) stack->data, stack->nb[1] / sizeof(float),
                          (int) n_stack, (const char *) qs->data, qs->nb[1], (int) n_q, (float *) out->data,
                          (int) n_embd, eps, sm_scale, ctx.stream());
