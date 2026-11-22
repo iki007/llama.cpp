@@ -50,6 +50,14 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             dst_tok_stride = 0,   // bytes between tokens in dst_base
     size_t             src1_tok_stride = 0); // bytes between tokens in vy
 
+// The same for n_tokens > 1 with the slots grouped by expert, so an expert's rows are read once for all its tokens
+// (NVFP4 and up to 128 routed slots only; returns false otherwise).
+bool ggml_sycl_mul_mat_vec_q_id_dedup(enum ggml_type src0_type, const void * vx_base, const void * vy,
+                                      const int32_t * ids_dev, float * dst_base, int ncols, int nrows,
+                                      int n_experts_used, size_t expert_weight_stride, size_t dst_row_stride,
+                                      size_t src1_row_stride, dpct::queue_ptr stream, int n_tokens,
+                                      size_t ids_row_stride, size_t dst_tok_stride, size_t src1_tok_stride);
+
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
 // vy: src1 quantized with quantize_and_reorder_q8_1_soa (per-row SoA). Returns false if src0_type isn't handled.
