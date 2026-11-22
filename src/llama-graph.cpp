@@ -1446,7 +1446,21 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos->buffer) {
+    if (rel_cell_pos) {
+        if (rel_cell_pos->buffer) {
+            attn_ctx->get_base()->set_input_rel_cell_pos(rel_cell_pos, inp_attn->self_attn_mask.rows, ubatch);
+        }
+        if (rel_cell_pos_swa->buffer) {
+            attn_ctx->get_swa()->set_input_rel_cell_pos(rel_cell_pos_swa, inp_attn->self_attn_mask_swa.rows, ubatch);
+        }
+        if (rel_tok_pos->buffer) {
+            std::vector<float> pos(ubatch->n_tokens);
+            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                pos[i] = (float) ubatch->pos[i];
+            }
+            ggml_backend_tensor_set(rel_tok_pos, pos.data(), 0, ggml_nbytes(rel_tok_pos));
+        }
+    } else if (self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, inp_attn->self_attn_mask.rows, ubatch, extent);
     }
 
@@ -1460,7 +1474,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos_swa->buffer) {
+    if (!rel_cell_pos && self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, inp_attn->self_attn_mask_swa.rows, ubatch, extent_swa);
     }
 
@@ -4478,13 +4492,47 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->get_attn()->self_attn_mask.raw->ne[0], ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos);
-    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    static const bool host_rel = getenv("LLAMA_REL_POS_HOST") != nullptr;
+    const ggml_tensor * mask     = inp->get_attn()->self_attn_mask.raw;
+    const ggml_tensor * mask_swa = inp->get_attn()->self_attn_mask_swa.raw;
+    if (host_rel || mask->ne[3] != mask_swa->ne[3] || ubatch.n_tokens % mask->ne[3] != 0) {
+        inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mask->ne[0], ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos);
+        ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
 
-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->get_attn()->self_attn_mask_swa.raw->ne[0], ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos_swa);
-    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+        inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mask_swa->ne[0], ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos_swa);
+        ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    } else {
+        // the n_kv x n_batch bins from n_kv + n_batch positions, on the device: a host loop and an upload of 4 bytes per
+        // (cell, token) cost ~60 ms per 512-token ubatch at 128K cells
+        const int64_t n_slice = mask->ne[3];
+        inp->rel_tok_pos = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens/n_slice, n_slice);
+        ggml_set_input(inp->rel_tok_pos);
+        ggml_set_name(inp->rel_tok_pos, "attn_inp_rel_tok_pos");
+
+        inp->rel_cell_pos = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, mask->ne[0], 1, n_slice);
+        ggml_set_input(inp->rel_cell_pos);
+        ggml_set_name(inp->rel_cell_pos, "attn_inp_rel_cell_pos");
+
+        inp->rel_cell_pos_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, mask_swa->ne[0], 1, n_slice);
+        ggml_set_input(inp->rel_cell_pos_swa);
+        ggml_set_name(inp->rel_cell_pos_swa, "attn_inp_rel_cell_pos_swa");
+
+        // distance = token position - cell position; [0, extent) is its own bin, everything else (an empty, future or
+        // more distant cell) the last one: clamp to [-1, extent], then -1 -> extent
+        auto bins = [&](ggml_tensor * cell_pos, uint32_t ext) {
+            ggml_tensor * d = ggml_repeat_4d(ctx0, inp->rel_tok_pos, cell_pos->ne[0], inp->rel_tok_pos->ne[1], n_slice, 1);
+            d = ggml_sub(ctx0, d, cell_pos);
+            d = ggml_clamp(ctx0, d, -1.0f, (float) ext);
+            d = ggml_add(ctx0, d, ggml_scale(ctx0, ggml_step(ctx0, ggml_neg(ctx0, d)), (float) ext + 1.0f));
+            return ggml_cast(ctx0, ggml_reshape_2d(ctx0, d, cell_pos->ne[0], ubatch.n_tokens), GGML_TYPE_I32);
+        };
+        inp->self_rel_pos     = bins(inp->rel_cell_pos, extent);
+        inp->self_rel_pos_swa = bins(inp->rel_cell_pos_swa, extent_swa);
+        ggml_set_name(inp->self_rel_pos, "attn_rel_pos");
+        ggml_set_name(inp->self_rel_pos_swa, "attn_rel_pos_swa");
+    }
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
