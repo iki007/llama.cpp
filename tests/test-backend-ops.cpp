@@ -4700,6 +4700,80 @@ struct test_depth_mix : public test_case {
     }
 };
 
+// Inkling's loop controller: (cur - tanh(W_f g)*cur) + tanh(W_g g)*msg with g = W_d [rms_norm(cur); rms_norm(msg)],
+// the chain that backends may fuse. sep computes msg between the two norms (the K controller's layout in the model);
+// view makes cur and msg strided row views as the model's mixed rows and messages are.
+struct test_loop_ctrl : public test_case {
+    const int64_t n_embd;
+    const int64_t rank;
+    const int64_t n_tokens;
+    const bool    sep;
+    const bool    view;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LOOP_CTRL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override { return VARS_TO_STR5(n_embd, rank, n_tokens, sep, view); }
+
+    test_loop_ctrl(int64_t n_embd = 256, int64_t rank = 64, int64_t n_tokens = 1, bool sep = false, bool view = false)
+        : n_embd(n_embd), rank(rank), n_tokens(n_tokens), sep(sep), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur;
+        ggml_tensor * msg;
+        if (view) {
+            ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 3, n_tokens);
+            ggml_tensor * msgs = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+            ggml_set_name(rows, "rows");
+            ggml_set_name(msgs, "msgs");
+            cur = ggml_view_2d(ctx, rows, n_embd, n_tokens, rows->nb[2], 2*rows->nb[1]);
+            msg = ggml_view_2d(ctx, msgs, n_embd, n_tokens, msgs->nb[2], 1*msgs->nb[1]);
+        } else {
+            cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            msg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(cur, "cur");
+            ggml_set_name(msg, "msg");
+        }
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_embd, rank);
+        ggml_tensor * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, n_embd);
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, n_embd);
+        ggml_set_name(wd, "w_down");
+        ggml_set_name(wf, "w_forget");
+        ggml_set_name(wg, "w_gain");
+        if (sep) {
+            msg = ggml_scale(ctx, msg, 0.5f);
+        }
+
+        ggml_tensor * gate   = ggml_concat(ctx, ggml_rms_norm(ctx, cur, 1e-6f), ggml_rms_norm(ctx, msg, 1e-6f), 0);
+        gate = ggml_mul_mat(ctx, wd, gate);
+        ggml_tensor * gain   = ggml_tanh(ctx, ggml_mul_mat(ctx, wg, gate));
+        ggml_tensor * forget = ggml_tanh(ctx, ggml_mul_mat(ctx, wf, gate));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, msg));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // unit-scale gate and tanh arguments, so the tanh is not saturated
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "w_down") == 0) {
+                const float a = sqrtf(3.0f/(2*n_embd));
+                init_tensor_uniform(t, -a, a);
+            } else if (strcmp(t->name, "w_forget") == 0 || strcmp(t->name, "w_gain") == 0) {
+                const float a = sqrtf(3.0f/rank);
+                init_tensor_uniform(t, -a, a);
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10877,6 +10951,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int64_t n_tokens : { 1, 5, 64 }) {
                     test_cases.emplace_back(new test_depth_mix(n_embd, n_stack, n_q, n_tokens));
                 }
+            }
+        }
+    }
+
+    // loop controller (Inkling); 9 tokens is past the fused kernel's limit
+    for (int64_t n_embd : { 256, 2304, 200 }) {
+        for (int64_t rank : { 64, 48 }) {
+            for (int64_t n_tokens : { 1, 2, 4, 8, 9 }) {
+                for (bool sep : { false, true }) {
+                    test_cases.emplace_back(new test_loop_ctrl(n_embd, rank, n_tokens, sep, false));
+                }
+                test_cases.emplace_back(new test_loop_ctrl(n_embd, rank, n_tokens, false, true));
             }
         }
     }
