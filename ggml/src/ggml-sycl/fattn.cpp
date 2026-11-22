@@ -21,6 +21,7 @@
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
+#include "fattn-xmx-prompt.hpp"
 #include "convert.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -100,6 +101,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 / q8_0 K/V decode on Xe2 XMX
+    BEST_FATTN_KERNEL_XMXP     = 130, // prompt batches, head 128, f16 K/V on Xe2 XMX (fattn-xmx-prompt.cpp)
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
@@ -144,6 +146,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // prompt batches over an f16 cache, head 128, with or without an indexed bias
+    if (!per_head_mask && ggml_sycl_flash_attn_ext_xmx_prompt_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMXP;
+    }
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
@@ -393,6 +400,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
         if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
         if (k == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
+        if (k == BEST_FATTN_KERNEL_XMXP) kname = "XMXP";
         int64_t delta = 0;
         if (Dk == 256) {
             delta = cur_nkv - last_nkv_d256;
@@ -430,6 +438,14 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_XMXP:
+            // the 2D block loads need 64-byte aligned head slices; another layout takes the tile kernel (f16: no staging)
+            if (ggml_sycl_flash_attn_ext_xmx_prompt_data_ok(dst)) {
+                ggml_sycl_flash_attn_ext_xmx_prompt(ctx, dst);
+            } else {
+                ggml_sycl_flash_attn_ext_tile(ctx, dst);
+            }
             break;
     }
 
@@ -524,7 +540,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst, const i
     static const bool staging_all = ggml_sycl_get_env("GGML_SYCL_FA_STAGING_ALL", 0) != 0;
     if (!staging_all) {
         const best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel(device, dst);
-        if (k == BEST_FATTN_KERNEL_MKL || k == BEST_FATTN_KERNEL_DPAS) {
+        if (k == BEST_FATTN_KERNEL_MKL || k == BEST_FATTN_KERNEL_DPAS || k == BEST_FATTN_KERNEL_XMXP) {
             return extra;
         }
     }
