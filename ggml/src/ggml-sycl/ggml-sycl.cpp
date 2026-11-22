@@ -63,6 +63,7 @@
 
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/depth_mix.hpp"
+#include "ggml-sycl/loop_ctrl.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
@@ -7365,6 +7366,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if (node->op == GGML_OP_RMS_NORM) {
+            const int ctrl_nodes_to_skip = ggml_sycl_try_loop_ctrl_fusion(*sycl_ctx, cgraph, i);
+            if (ctrl_nodes_to_skip != 0) {
+                i += ctrl_nodes_to_skip > 0 ? ctrl_nodes_to_skip : 0;
+                continue;
+            }
             const int mix_nodes_to_skip = ggml_sycl_try_depth_mix_fusion(*sycl_ctx, cgraph, i);
             if (mix_nodes_to_skip > 0) {
                 i += mix_nodes_to_skip;
