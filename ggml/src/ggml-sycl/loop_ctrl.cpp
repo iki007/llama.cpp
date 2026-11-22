@@ -7,9 +7,10 @@
 // Kernel 1: the down projection as partial dot products. Work-group (r, p) reads quarter p of row r of W_down
 // (parts 0 and 1 against cur, 2 and 3 against msg, unnormalized) for every token; the work-groups of row 0 also
 // sum the squares of their quarter, so the norm scales are applied in kernel 2 and the CONCAT is never built.
-// Kernel 2: one sub-group per output element i. Lane l holds gate entries l + 16 j (j < 4) of every token, rebuilt
-// from the partials, and the same entries of rows i of W_forget and W_gain; two sub-group sums give the tanh
-// arguments. The reduction order differs from the unfused kernels: the result matches them to rounding.
+// Kernel 2: the work-group first builds the gate of every token from the partials in local memory; then one
+// sub-group per output element i: lane l holds entries l + 16 j (j < 4) of rows i of W_forget and W_gain; two
+// sub-group sums a token give the tanh arguments. The reduction order differs from the unfused kernels: the result
+// matches them to rounding.
 static constexpr int LC_SG     = 16;
 static constexpr int LC_WG1    = 128;
 static constexpr int LC_PARTS  = 4;
@@ -43,12 +44,17 @@ static void loop_ctrl_launch(const loop_ctrl_args & a, float * part, dpct::queue
     float * ssq = part + (size_t) a.n_tokens * LC_PARTS * a.rank;
     {
         const loop_ctrl_args k = a;
-        stream->parallel_for(
+        stream->submit([&](sycl::handler & cgh) {
+            // sub-group sums of every token's dot product and sum of squares, then one barrier
+            sycl::local_accessor<float, 1> red(sycl::range<1>(LC_WG1 / LC_SG * 2 * LC_MAXT), cgh);
+            cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t) a.rank, (size_t) LC_PARTS * LC_WG1), sycl::range<2>(1, LC_WG1)),
             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(LC_SG)]] {
                 const int r   = (int) it.get_group(0);
                 const int p   = (int) it.get_group(1);
                 const int tid = (int) it.get_local_id(1);
+                const auto sg   = it.get_sub_group();
+                const int  sgid = (int) sg.get_group_linear_id();
 
                 const int     half = (k.n_embd + 1) / 2;
                 const int     e0   = (p & 1) * half;
@@ -79,29 +85,56 @@ static void loop_ctrl_launch(const loop_ctrl_args & a, float * part, dpct::queue
 #pragma unroll
                 for (int t = 0; t < LC_MAXT; ++t) {
                     if (t < k.n_tokens) {
-                        const float s = sycl::reduce_over_group(it.get_group(), acc[t], sycl::plus<float>());
-                        if (tid == 0) {
-                            part[((size_t) t * LC_PARTS + p) * k.rank + r] = s;
-                        }
-                        if (sq) {
-                            const float q = sycl::reduce_over_group(it.get_group(), ss[t], sycl::plus<float>());
-                            if (tid == 0) {
-                                ssq[t * LC_PARTS + p] = q;
-                            }
+                        const float s = sycl::reduce_over_group(sg, acc[t], sycl::plus<float>());
+                        const float q = sq ? sycl::reduce_over_group(sg, ss[t], sycl::plus<float>()) : 0.0f;
+                        if (sg.leader()) {
+                            red[sgid * 2 * LC_MAXT + t]           = s;
+                            red[sgid * 2 * LC_MAXT + LC_MAXT + t] = q;
                         }
                     }
                 }
+                sycl::group_barrier(it.get_group());
+                // work-item v < n_tokens adds the dot products of token v, LC_MAXT + v the sums of squares
+                const int v = tid;
+                const int t = v % LC_MAXT;
+                if (v < 2 * LC_MAXT && t < k.n_tokens && (v < LC_MAXT || sq)) {
+                    float sum = 0.0f;
+                    for (int g = 0; g < LC_WG1 / LC_SG; ++g) {
+                        sum += red[g * 2 * LC_MAXT + v];
+                    }
+                    if (v < LC_MAXT) {
+                        part[((size_t) t * LC_PARTS + p) * k.rank + r] = sum;
+                    } else {
+                        ssq[t * LC_PARTS + p] = sum;
+                    }
+                }
             });
+        });
     }
     {
         const loop_ctrl_args k = a;
         const size_t n_wg = ((size_t) a.n_embd + LC_ROWS2 - 1) / LC_ROWS2;
-        stream->parallel_for(
+        stream->submit([&](sycl::handler & cgh) {
+            // the gate of every token, built once a work-group from the partials
+            sycl::local_accessor<float, 1> gate(sycl::range<1>(LC_MAXT * LC_MAXR), cgh);
+            cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(n_wg * LC_WG2), sycl::range<1>(LC_WG2)),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(LC_SG)]] {
                 const auto sg   = it.get_sub_group();
                 const int  lane = (int) sg.get_local_linear_id();
+                const int  tid  = (int) it.get_local_id(0);
                 const int  i    = (int) it.get_group(0) * LC_ROWS2 + (int) sg.get_group_linear_id();
+                const float inv_n = 1.0f / (float) k.n_embd;
+                for (int v = tid; v < k.n_tokens * k.rank; v += LC_WG2) {
+                    const int     t  = v / k.rank;
+                    const int     c  = v - t * k.rank;
+                    const float * pt = part + (size_t) t * LC_PARTS * k.rank;
+                    const float * st = ssq + t * LC_PARTS;
+                    const float   sc = sycl::rsqrt((st[0] + st[1]) * inv_n + k.eps_c);
+                    const float   sm = sycl::rsqrt((st[2] + st[3]) * inv_n + k.eps_m);
+                    gate[t * LC_MAXR + c] = sc * (pt[c] + pt[k.rank + c]) + sm * (pt[2 * k.rank + c] + pt[3 * k.rank + c]);
+                }
+                sycl::group_barrier(it.get_group());
                 if (i >= k.n_embd) {
                     return;
                 }
@@ -115,21 +148,16 @@ static void loop_ctrl_launch(const loop_ctrl_args & a, float * part, dpct::queue
                     f[j] = c < k.rank ? wf[c] : 0.0f;
                     g[j] = c < k.rank ? wg[c] : 0.0f;
                 }
-                const float inv_n = 1.0f / (float) k.n_embd;
 #pragma unroll
                 for (int t = 0; t < LC_MAXT; ++t) {
                     if (t < k.n_tokens) {
-                        const float * pt = part + (size_t) t * LC_PARTS * k.rank;
-                        const float * st = ssq + t * LC_PARTS;
-                        const float   sc = sycl::rsqrt((st[0] + st[1]) * inv_n + k.eps_c);
-                        const float   sm = sycl::rsqrt((st[2] + st[3]) * inv_n + k.eps_m);
-                        float         fs = 0.0f;
-                        float         gs = 0.0f;
+                        float fs = 0.0f;
+                        float gs = 0.0f;
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
                             const int c = lane + j * LC_SG;
                             if (c < k.rank) {
-                                const float d = sc * (pt[c] + pt[k.rank + c]) + sm * (pt[2 * k.rank + c] + pt[3 * k.rank + c]);
+                                const float d = gate[t * LC_MAXR + c];
                                 fs += f[j] * d;
                                 gs += g[j] * d;
                             }
@@ -146,6 +174,7 @@ static void loop_ctrl_launch(const loop_ctrl_args & a, float * part, dpct::queue
                     }
                 }
             });
+        });
     }
 }
 
