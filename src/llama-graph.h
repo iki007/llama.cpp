@@ -819,6 +819,11 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // the bins computed on the device from the positions (LLAMA_REL_POS_HOST=1: filled on the host instead)
+    ggml_tensor * rel_tok_pos      = nullptr; // F32 [1, n_batch / n_slices, n_slices]
+    ggml_tensor * rel_cell_pos     = nullptr; // F32 [n_kv,     1, n_slices]
+    ggml_tensor * rel_cell_pos_swa = nullptr; // F32 [n_kv_swa, 1, n_slices]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
