@@ -51,7 +51,9 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             src1_tok_stride = 0); // bytes between tokens in vy
 
 // The same for n_tokens > 1 with the slots grouped by expert, so an expert's rows are read once for all its tokens
-// (NVFP4 and up to 128 routed slots only; returns false otherwise).
+// (NVFP4 and up to 128 routed slots only; returns false otherwise). vy: src1 quantized with
+// quantize_and_reorder_q8_1_soa (per-row SoA).
+bool ggml_sycl_mul_mat_vec_q_id_dedup_supported(enum ggml_type src0_type, int n_tokens, int n_experts_used);
 bool ggml_sycl_mul_mat_vec_q_id_dedup(enum ggml_type src0_type, const void * vx_base, const void * vy,
                                       const int32_t * ids_dev, float * dst_base, int ncols, int nrows,
                                       int n_experts_used, size_t expert_weight_stride, size_t dst_row_stride,
@@ -73,7 +75,11 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             expert_weight_stride,
     size_t             dst_row_stride,
     size_t             src1_row_stride,
-    dpct::queue_ptr    stream);
+    dpct::queue_ptr    stream,
+    int                n_tokens = 1,
+    size_t             ids_row_stride = 0,   // int32 elements between token rows in ids_dev
+    size_t             dst_tok_stride = 0,   // bytes between tokens in dst_base
+    size_t             src1_tok_stride = 0);
 
 // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
 // vx / vgate must share shape, stride and reorder layout. Returns false if unhandled.
