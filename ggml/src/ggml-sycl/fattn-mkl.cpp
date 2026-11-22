@@ -119,6 +119,9 @@ static void mkl_fa_init_softmax_state(
 // identical to the original one-item-per-row kernel: softcap before
 // mask, native::exp, -1e30 sentinel, half-precision S. Only the float
 // summation order differs (tree vs serial), i.e. last-ulp level.
+// REGS: keep each item's scores in registers between the two passes (taken for long chunks; the array would cost the
+// occupancy of short ones, -0.7% at a 2048-token prompt, so they get the kernel without it)
+template <bool REGS>
 static void mkl_fa_online_softmax_chunk(
     dpct::queue_ptr stream,
     float * __restrict KQ_f32,
@@ -188,11 +191,29 @@ static void mkl_fa_online_softmax_chunk(
                     }
                     return s;
                 };
-                // Pass 1: strided (coalesced) row-wise local maximum.
+                // Pass 1: strided (coalesced) row-wise local maximum. With the default work-group and chunk an item
+                // has at most SV scores, kept in registers for pass 2 (the score, with its mask and bias reads, is
+                // then computed once); same values and order, so the same bits.
+                constexpr int SV = MKL_FA_CHUNK_SIZE_KV / MKL_FA_WG_SIZE;
+                const bool    in_regs = REGS && local_size == MKL_FA_WG_SIZE && chunk_size <= MKL_FA_CHUNK_SIZE_KV;
+                float         sv[REGS ? SV : 1];
                 float local_max = -1e30f;
-                for (int i = local_id; i < chunk_size; i += local_size) {
-                    float s = score(i);
-                    if (s > local_max) local_max = s;
+                if constexpr (REGS) if (in_regs) {
+#pragma unroll
+                    for (int t = 0; t < SV; ++t) {
+                        const int i = local_id + t * MKL_FA_WG_SIZE;
+                        sv[t] = 0.0f;
+                        if (i < chunk_size) {
+                            sv[t] = score(i);
+                            if (sv[t] > local_max) local_max = sv[t];
+                        }
+                    }
+                }
+                if (!in_regs) {
+                    for (int i = local_id; i < chunk_size; i += local_size) {
+                        float s = score(i);
+                        if (s > local_max) local_max = s;
+                    }
                 }
                 const float final_local_max = sycl::reduce_over_group(
                     item.get_group(), local_max, sycl::maximum<float>());
@@ -206,11 +227,24 @@ static void mkl_fa_online_softmax_chunk(
                 }
                 // Pass 2: softmax numerators, strided; S row written once.
                 float local_sum = 0.0f;
-                for (int i = local_id; i < chunk_size; i += local_size) {
-                    float s = score(i);
-                    float val = sycl::native::exp(s - new_max);
-                    S_row[i] = sycl::half(val);
-                    local_sum += val;
+                if constexpr (REGS) if (in_regs) {
+#pragma unroll
+                    for (int t = 0; t < SV; ++t) {
+                        const int i = local_id + t * MKL_FA_WG_SIZE;
+                        if (i < chunk_size) {
+                            float val = sycl::native::exp(sv[t] - new_max);
+                            S_row[i] = sycl::half(val);
+                            local_sum += val;
+                        }
+                    }
+                }
+                if (!in_regs) {
+                    for (int i = local_id; i < chunk_size; i += local_size) {
+                        float s = score(i);
+                        float val = sycl::native::exp(s - new_max);
+                        S_row[i] = sycl::half(val);
+                        local_sum += val;
+                    }
                 }
                 const float total_sum = sycl::reduce_over_group(
                     item.get_group(), local_sum, sycl::plus<float>());
@@ -583,12 +617,41 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
                 int this_chunk = std::min(chunk_size, n_kv - chunk_start);
 
-                // 3a. Dequant this KV chunk to dense fp16 (once per chunk)
+                // 3a. Dequant this KV chunk to dense fp16 (once per chunk). An F16 cache is read in place instead:
+                //     its chunk is [this_chunk rows] x D halves at the cache's row stride, which the GEMMs take as their
+                //     leading dimension (a copy per chunk was ~11% of a 128K-deep Inkling prompt).
+                //     GGML_SYCL_MKL_FA_INPLACE=0 keeps the copies.
+                static const bool inplace_env = ggml_sycl_get_env("GGML_SYCL_MKL_FA_INPLACE", 1) != 0;
+                auto f16_mode = [](const mkl_fa_kv_desc & d) {
+                    return d.mode == MKL_FA_KV_MODE_F16_DENSE || d.mode == MKL_FA_KV_MODE_F16_INTERLEAVED;
+                };
+                auto chunk_base = [&](const mkl_fa_kv_desc & d) {
+                    return (const sycl::half *) (d.data + (int64_t) ikvh * d.nb2 + (int64_t) chunk_start * d.nb1 +
+                                                 (int64_t) ib * d.nb3);
+                };
+                const bool k_inplace = inplace_env && f16_mode(K_desc);
+                const bool v_inplace = inplace_env && (V_is_K_view ? k_inplace : f16_mode(V_desc));
+                const sycl::half * K_use = K_chunk_f16_ptr;
+                const sycl::half * V_use = V_chunk_f16_ptr;
+                int64_t            ldk   = DKQ;
+                int64_t            ldv   = DV;
                 {
                     MKL_TAKE_TIME(t0);
-                    mkl_fa_dequant_chunk(stream, K_desc, KQV,
-                        K_chunk_f16_ptr, ikvh, ib, chunk_start, this_chunk);
-                    if (!V_is_K_view) {
+                    if (k_inplace) {
+                        K_use = chunk_base(K_desc);
+                        ldk   = K_desc.nb1 / (int64_t) sizeof(sycl::half);
+                    } else {
+                        mkl_fa_dequant_chunk(stream, K_desc, KQV,
+                            K_chunk_f16_ptr, ikvh, ib, chunk_start, this_chunk);
+                    }
+                    if (V_is_K_view) {
+                        // V aliases K (its first DV columns): the same rows, the same stride
+                        V_use = K_use;
+                        ldv   = ldk;
+                    } else if (v_inplace) {
+                        V_use = chunk_base(V_desc);
+                        ldv   = V_desc.nb1 / (int64_t) sizeof(sycl::half);
+                    } else {
                         mkl_fa_dequant_chunk(stream, V_desc, KQV,
                             V_chunk_f16_ptr, ikvh, ib, chunk_start, this_chunk);
                     }
@@ -607,7 +670,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             transpose::trans, transpose::nontrans,
                             this_chunk, q_rows, DKQ,
                             alpha,
-                            K_chunk_f16_ptr, DKQ,
+                            K_use, ldk,
                             Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
                             beta,
                             KQ_f32_ptr, this_chunk,
@@ -617,7 +680,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     // Online softmax over this chunk for this query tile
                     {
                         MKL_TAKE_TIME(t0);
-                        mkl_fa_online_softmax_chunk(stream,
+                        // registers only for long chunks (see mkl_fa_online_softmax_chunk)
+                        (this_chunk >= 4096 ? mkl_fa_online_softmax_chunk<true> : mkl_fa_online_softmax_chunk<false>)(stream,
                             KQ_f32_ptr, S_f16_ptr,
                             KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
                             q0, q_rows, n_queries, DV,
@@ -637,7 +701,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             transpose::nontrans, transpose::nontrans,
                             DV, q_rows, this_chunk,
                             alpha,
-                            V_chunk_f16_ptr, DV,
+                            V_use, ldv,
                             S_f16_ptr, this_chunk,
                             beta,
                             VKQ_chunk_ptr, DV,
