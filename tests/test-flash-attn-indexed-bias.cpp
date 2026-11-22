@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <vector>
 
-static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768) {
+// rel: the bins come from positions (ggml_flash_attn_ext_add_rel_pos_bias): cell c sits at position c, query j of
+// stream s at 3*j + 5*s + 40, and the bin is clamp(query position - cell position, 0, extent)
+static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768, bool rel = false) {
     constexpr int heads = 6, kv_heads = 2, streams = 2, bins = 17;
     const int cols = use_rows ? std::min(512, cells) : cells;
 
@@ -19,6 +21,8 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
     auto * rows = use_rows ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, streams) : nullptr;
     auto * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, heads, bins, n_query*streams);
     auto * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, n_query*streams);
+    auto * positions = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols + n_query, streams);
+    constexpr int extent = bins - 1;
     auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
     auto * out = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, 1.0f/sqrtf(width), 0, 0);
     ggml_flash_attn_ext_add_sinks(out, sinks);
@@ -28,7 +32,12 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
     ggml_flash_attn_ext_add_indexed_bias(out, nullptr, nullptr);
     GGML_ASSERT(!ggml_flash_attn_ext_has_indexed_bias(out) && !out->src[6] && !out->src[7]);
     GGML_ASSERT(ggml_backend_supports_op(backend, out) == supports_plain);
-    ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+    if (rel) {
+        ggml_flash_attn_ext_add_rel_pos_bias(out, table, positions, extent);
+        GGML_ASSERT(ggml_flash_attn_ext_rel_pos_extent(out) == extent);
+    } else {
+        ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+    }
     ggml_prec_set_acc(out, GGML_PREC_F32);
 
     if (!ggml_backend_supports_op(backend, out)) {
@@ -43,6 +52,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
     ggml_backend_buffer_clear(buf, 0);
 
     std::vector<int32_t> row(cols*streams), idx(ggml_nelements(indices));
+    std::vector<float> pos(ggml_nelements(positions));
     std::vector<ggml_fp16_t> visibility(idx.size()), values(ggml_nelements(v));
     std::vector<ggml_fp16_t> keys(ggml_nelements(k));
     std::vector<float> queries(ggml_nelements(q));
@@ -79,6 +89,10 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
                     const int cell = row[s*cols + c];
                     const int i = query*cols + c;
                     idx[i] = (c + 3*query) % bins;
+                    if (rel) {
+                        const int d = (3*j + 5*s + 40) - (cell >= 0 ? cell : 0);
+                        idx[i] = d < 0 ? 0 : (d > extent ? extent : d);
+                    }
                     const bool visible = (s != 1 || j != 0) && cell >= 0 && (c + j) % 7 != 0;
                     visibility[i] = ggml_fp32_to_fp16(visible ? 0.25f : -INFINITY);
                     if (visible) {
@@ -100,7 +114,20 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
     ggml_backend_tensor_set(mask, visibility.data(), 0, ggml_nbytes(mask));
     ggml_backend_tensor_set(table, biases.data(), 0, ggml_nbytes(table));
     ggml_backend_tensor_set(sinks, sink_logits, 0, sizeof(sink_logits));
-    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    if (rel) {
+        for (int s = 0; s < streams; ++s) {
+            for (int c = 0; c < cols; ++c) {
+                const int cell = row[s*cols + c];
+                pos[s*(cols + n_query) + c] = (float) (cell >= 0 ? cell : 0);
+            }
+            for (int j = 0; j < n_query; ++j) {
+                pos[s*(cols + n_query) + cols + j] = (float) (3*j + 5*s + 40);
+            }
+        }
+        ggml_backend_tensor_set(positions, pos.data(), 0, ggml_nbytes(positions));
+    } else {
+        ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    }
     if (rows) {
         ggml_backend_tensor_set(rows, row.data(), 0, ggml_nbytes(rows));
     }
@@ -111,7 +138,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
         GGML_ASSERT(std::isfinite(output[i]));
         max_error = std::max(max_error, fabsf(output[i] - expected[i/width]));
     }
-    printf("%s: width=%d, rows=%d, queries=%d, cells=%d, max error=%g\n", ggml_backend_name(backend), width, use_rows, n_query, cells, max_error);
+    printf("%s: width=%d, rows=%d, queries=%d, cells=%d, rel=%d, max error=%g\n", ggml_backend_name(backend), width, use_rows, n_query, cells, rel, max_error);
     GGML_ASSERT(max_error < 0.001f);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -132,6 +159,12 @@ int main() {
             }
             // >= 1024 cells and >= 32 queries: the batched-GEMM (MKL) path of the SYCL backend, with its sinks
             test_indexed_bias(backend, width, false, 65, 2048);
+            // the bins from positions, on every path (one query, small batches, the prompt kernels, rows)
+            for (int n_query : {1, 7, 65}) {
+                test_indexed_bias(backend, width, false, n_query, 768, true);
+                test_indexed_bias(backend, width, true, n_query, 768, true);
+            }
+            test_indexed_bias(backend, width, false, 65, 2048, true);
         }
         ggml_backend_free(backend);
     }

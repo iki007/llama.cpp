@@ -501,7 +501,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                     // one head a group: add the head's bias of this key's bin, rounded with the mask to F16
                     if (bias.table) {
                         const int64_t query = (int64_t) sequence * ne01.z() + j;
-                        const int     bin   = bias.indices[query * bias.stride + k];
+                        const int     bin   = bias.bin(query, k);
                         if ((uint32_t) bin < (uint32_t) bias.n_bins) {
                             m = (float) (sycl::half) (m + bias.table[(query * bias.n_head + head) * bias.n_bins + bin]);
                         }

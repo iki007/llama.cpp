@@ -45,8 +45,11 @@ struct xp_args {
     size_t             m_nb1;
     const int32_t *    cls;    // [nq][n_blk]
     const float *      table;  // [nq][n_head][n_bins] (bins innermost) or null
-    const int32_t *    idx;    // [nq][idx_stride]
+    const int32_t *    idx;    // [nq][idx_stride], or null with pos
     int64_t            idx_stride;
+    const float *      pos;    // bins from positions: this stream's [pos_nkv cells, nq queries], extent
+    int64_t            pos_nkv;
+    int                extent;
     int                n_bins;
     const float *      sinks;  // [n_head] or null
     float *            dst;    // [nq][n_head][D]
@@ -254,7 +257,17 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
                     const sycl::half * mp = (const sycl::half *) (a.mask + (size_t) jr[i] * a.m_nb1) + gtok0;
                     simd<float, XP_BK> mk = convert<float>(block_load<sycl::half, XP_BK>(mp));
                     if (a.table) {
-                        const simd<int32_t, XP_BK> bin = block_load<int32_t, XP_BK>(a.idx + (size_t) jr[i] * a.idx_stride + gtok0);
+                        simd<int32_t, XP_BK> bin;
+                        if (a.pos) {
+                            // clamp(query position - cell position, 0, extent)
+                            const simd<float, XP_BK> cp = block_load<float, XP_BK>(a.pos + gtok0);
+                            simd<int32_t, XP_BK>     d  = convert<int32_t>(simd<float, XP_BK>(a.pos[a.pos_nkv + jr[i]]) - cp);
+                            d.merge(simd<int32_t, XP_BK>(0), d < 0);
+                            d.merge(simd<int32_t, XP_BK>(a.extent), d > a.extent);
+                            bin = d;
+                        } else {
+                            bin = block_load<int32_t, XP_BK>(a.idx + (size_t) jr[i] * a.idx_stride + gtok0);
+                        }
                         const simd_mask<XP_BK>     ok  = simd<uint32_t, XP_BK>(bin) < (uint32_t) a.n_bins;
                         simd<uint32_t, XP_BK>      off = simd<uint32_t, XP_BK>(bin) * 4u;
                         off.merge(simd<uint32_t, XP_BK>(0u), !ok);
@@ -380,21 +393,22 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
 }
 
 // the class of every (query, block): reads the mask and the bin indices once
-void xp_classes(const sycl::half * mask, const size_t m_stride, const int32_t * idx, const int64_t idx_stride,
+void xp_classes(const sycl::half * mask, const size_t m_stride, const fattn_indexed_bias bias, const int64_t q0,
                 const int nq, const int n_blk, int32_t * cls, dpct::queue_ptr stream) {
+    const bool has_bias = bias.table != nullptr;
     stream->parallel_for(sycl::range<2>((size_t) nq, (size_t) n_blk), [=](sycl::id<2> id) {
         const int        j  = (int) id[0];
         const int        b  = (int) id[1];
         const uint16_t * mp = (const uint16_t *) mask + (size_t) j * m_stride + (size_t) b * XP_BK;
-        const int32_t *  ip = idx ? idx + (size_t) j * idx_stride + (size_t) b * XP_BK : nullptr;
-        const int32_t    b0 = ip ? ip[0] : 0;
+        const int64_t    k0 = (int64_t) b * XP_BK;
+        const int32_t    b0 = has_bias ? bias.bin(q0 + j, k0) : 0;
         bool             dead = true, zero = true, same = true;
         for (int k = 0; k < XP_BK; ++k) {
             const uint16_t mv = mp[k];
             dead &= mv == 0xFC00;              // f16 -inf
             zero &= (mv & 0x7FFF) == 0;        // +-0
-            if (ip) {
-                same &= ip[k] == b0;
+            if (has_bias) {
+                same &= bias.bin(q0 + j, k0 + k) == b0;
             }
         }
         cls[(size_t) j * n_blk + b] = dead ? XP_DEAD : (zero && same && b0 >= 0 ? b0 : XP_MIXED);
@@ -560,8 +574,7 @@ void ggml_sycl_flash_attn_ext_xmx_prompt(ggml_backend_sycl_context & ctx, ggml_t
     for (int64_t s = 0; s < Q->ne[3]; ++s) {
         const char * Ms = (const char *) mask->data + (mask->ne[3] > 1 ? s * mask->nb[3] : 0);
         const int64_t q0 = s * nq;  // the stream's first query in the flattened bias rows
-        xp_classes((const sycl::half *) Ms, mask->nb[1] / sizeof(sycl::half), bias.indices ? bias.indices + q0 * bias.stride : nullptr,
-                   bias.stride, nq, n_blk, cls.get(), stream);
+        xp_classes((const sycl::half *) Ms, mask->nb[1] / sizeof(sycl::half), bias, q0, nq, n_blk, cls.get(), stream);
 
         xp_args a{};
         a.Q          = (const char *) Q->data + s * Q->nb[3];
@@ -579,6 +592,9 @@ void ggml_sycl_flash_attn_ext_xmx_prompt(ggml_backend_sycl_context & ctx, ggml_t
         a.table      = bias.table ? bias.table + (size_t) q0 * bias.n_head * bias.n_bins : nullptr;
         a.idx        = bias.indices ? bias.indices + q0 * bias.stride : nullptr;
         a.idx_stride = bias.stride;
+        a.pos        = bias.pos ? bias.pos + s * bias.pos_row : nullptr;
+        a.pos_nkv    = bias.pos_nkv;
+        a.extent     = bias.extent;
         a.n_bins     = (int) bias.n_bins;
         a.sinks      = sinks ? (const float *) sinks->data : nullptr;
         a.dst        = (float *) dst->data + (size_t) s * nq * n_head * XP_D;

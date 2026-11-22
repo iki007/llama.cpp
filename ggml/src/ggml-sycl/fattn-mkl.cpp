@@ -181,7 +181,7 @@ static void mkl_fa_online_softmax_chunk(
                         // (the tile kernel's and the dense mask's rounding); query0 = the stream's first query
                         if (bias.table) {
                             const int64_t query = query0 + q_row;
-                            const int bin = bias.indices[query * bias.stride + chunk_start + i];
+                            const int bin = bias.bin(query, chunk_start + i);
                             if ((uint32_t) bin < (uint32_t) bias.n_bins) {
                                 m = (float) (sycl::half) (m + bias.table[
                                     (query * bias.n_head + kvh_head + gqa_group) * bias.n_bins + bin]);
