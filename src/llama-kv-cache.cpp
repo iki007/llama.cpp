@@ -2025,6 +2025,26 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_rel_cell_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    const int64_t n_kv    = dst->ne[0];
+    const int64_t n_slice = dst->ne[2];
+    const int64_t n_tps   = ubatch->n_tokens / n_slice;
+    GGML_ASSERT(n_tps*n_slice == ubatch->n_tokens);
+    GGML_ASSERT(!rows || (rows->ne[0] == n_kv && rows->ne[1] == n_slice && ggml_backend_buffer_is_host(rows->buffer)));
+    std::vector<float> data(n_kv*n_slice);
+    for (int64_t s = 0; s < n_slice; ++s) {
+        // the tokens of a slice share one stream
+        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[s*n_tps][0]));
+        const int32_t * list = rows ? (const int32_t *) rows->data + s*n_kv : nullptr;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t cell = list ? list[j] : j;
+            data[s*n_kv + j] = cell < 0 || cells.is_empty(cell) ? LLAMA_REL_POS_EMPTY : (float) cells.pos_get(cell);
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3130,6 +3150,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, rows, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_rel_cell_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const {
+    kv->set_input_rel_cell_pos(dst, rows, ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
