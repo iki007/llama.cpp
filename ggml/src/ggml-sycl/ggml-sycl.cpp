@@ -6288,6 +6288,18 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
             /*dst_row_stride=*/ dst->nb[1],
             src1_row_stride, stream);
     }
+    static const bool dedup = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP", 1) != 0;
+    if (dedup && n_tokens > 1 && src0->type == GGML_TYPE_NVFP4) {
+        if (ggml_sycl_mul_mat_vec_q_id_dedup(
+                src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
+                (float *) dst->data, (int) ne10, nrows, n_experts_used,
+                /*expert_weight_stride=*/ src0->nb[2],
+                /*dst_row_stride=*/ dst->nb[1],
+                src1_row_stride, stream,
+                n_tokens, ids_row_stride, dst->nb[2], src1_tok_stride)) {
+            return true;
+        }
+    }
     return ggml_sycl_mul_mat_vec_q_id(
         src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
         (float *) dst->data, (int) ne10, nrows, n_experts_used,

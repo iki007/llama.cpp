@@ -14009,6 +14009,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // NVFP4 small batches (a speculative verify batch), where the backend may group the slots of an expert: 8 of 16
+    // or 8 of 8 experts (every expert in several tokens), rows not a multiple of 4, skipped slots, up to 16 tokens
+    for (int n : {2, 4, 7, 16}) {
+        for (int n_mats : {8, 16}) {
+            for (bool broadcast : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, n_mats, 8, broadcast, 67, n, 256));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, n_mats, 8, false, 67, n, 256, 0, false, true));
+        }
+    }
+
     // Both experts receive every token
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
         for (int n : {64, 65}) {
@@ -15553,6 +15564,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling 2 Mini experts (NVFP4, 128 x 8): gate_up shares the input, down reads one row per expert; 1 token and
+    // the DSpark verify batch
+    for (int n : { 1, 4 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
+    }
+    // the same with 32 experts: random routing then shares ~1/3 of the slots of 4 tokens, about what Inkling's
+    // consecutive tokens share (61% distinct)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 8, true,  2304, 4, 2304));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 8, false, 2304, 4, 1152));
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

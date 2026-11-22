@@ -2748,6 +2748,206 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
+// Several tokens (a speculative verify batch): the routed slots s = t * n_used + k are grouped by expert, so each
+// expert's rows are read once for all the tokens that chose it. The slots of an expert form groups of up to
+// MOE_DEDUP_MAXM in slot order; the work-groups of a group's first slot compute it, the others exit. Every sub-group
+// finds its group from the ids in registers (lane l holds slots l + 16 q), with sub-group reductions.
+static constexpr int MOE_DEDUP_MAXM      = 4;
+static constexpr int MOE_DEDUP_MAX_SLOTS = 8 * WARP_SIZE;
+
+// NVFP4: lane l takes ints 4 (l % 2) .. +3 of every 8th block from l / 2, as vec_dot_nvfp4_q8_1 does, and decodes
+// each weight int once for all the tokens of its group. A sub-group computes R consecutive rows together, so the
+// grouping is paid once for R rows (one row is only ~5 loop steps) and the loads of R rows are in flight at once.
+// x / n_used is taken as a float product: exact for the slot counts allowed (< 256).
+template <int R>
+static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+                                        float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+                                        const int n_tokens, const int ncols, const int nrows,
+                                        const int n_used, const size_t expert_weight_stride,
+                                        const size_t dst_row_stride, const size_t src1_row_stride,
+                                        const size_t ids_row_stride, const size_t dst_tok_stride,
+                                        const size_t src1_tok_stride, const sycl::nd_item<3> & item_ct1) {
+    constexpr int M     = MOE_DEDUP_MAXM;
+    const int     slot  = item_ct1.get_group(1);
+    const int     row0  = (item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1)) * R;
+    if (row0 >= nrows) {
+        return;
+    }
+    const auto  sg      = item_ct1.get_sub_group();
+    const int   lane    = item_ct1.get_local_id(2);
+    const int   n_slots = n_tokens * n_used;
+    const float inv_nu  = 1.0f / (float) n_used;
+    auto        tok_of  = [&](int x) { return (int) (((float) x + 0.5f) * inv_nu); };
+    auto        id_of   = [&](int x) {
+        const int t = tok_of(x);
+        return ids_dev[(size_t) t * ids_row_stride + (x - t * n_used)];
+    };
+    auto slot_off = [&](int x, size_t tok_stride, size_t row_stride) {
+        const int t = tok_of(x);
+        return (size_t) t * tok_stride + (size_t) (x - t * n_used) * row_stride;
+    };
+    const int i02 = id_of(slot);
+    if (i02 < 0) { // skipped slot
+        if (lane == 0) {
+            float * dst = (float *) ((char *) dst_base + slot_off(slot, dst_tok_stride, dst_row_stride));
+            for (int r = 0; r < R && row0 + r < nrows; ++r) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
+    constexpr int Q = MOE_DEDUP_MAX_SLOTS / WARP_SIZE;
+    int           idv[Q];
+    int           before = 0;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        const int x = lane + q * WARP_SIZE;
+        idv[q]      = q * WARP_SIZE < n_slots && x < n_slots ? id_of(x) : -1;
+        before += x < slot && idv[q] == i02;
+    }
+    const int rank = sycl::reduce_over_group(sg, before, sycl::plus<int>());
+    if (rank % M != 0) {
+        return;
+    }
+    // the next M - 1 slots of the same expert, in slot order
+    int sj[M];
+    int cnt = 1;
+    sj[0]   = slot;
+#pragma unroll
+    for (int j = 1; j < M; ++j) {
+        const int prev = sj[j - 1];
+        int       cand = INT_MAX;
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const int x = lane + q * WARP_SIZE;
+            if (x > prev && x < n_slots && idv[q] == i02) {
+                cand = sycl::min(cand, x);
+            }
+        }
+        cand  = sycl::reduce_over_group(sg, cand, sycl::minimum<int>());
+        sj[j] = cand == INT_MAX ? slot : cand;
+        cnt += cand != INT_MAX && cnt == j;
+    }
+
+    uint32_t yo[M];
+#pragma unroll
+    for (int j = 0; j < M; ++j) {
+        yo[j] = (uint32_t) slot_off(sj[j], src1_tok_stride, src1_row_stride);
+    }
+
+    const int blocks_per_row = ncols / QK_NVFP4;
+    const int iqs            = 4 * (lane % 2);
+    // the R rows in one loop, so the loads of all of them are in flight together; rows past nrows read row0
+    const block_nvfp4 * xr[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = row0 + r < nrows ? row0 + r : row0;
+        xr[r] = (const block_nvfp4 *) ((const char *) vx_base + (size_t) i02 * expert_weight_stride) +
+                (size_t) row * blocks_per_row;
+    }
+    float tmp[R][M];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int j = 0; j < M; ++j) {
+            tmp[r][j] = 0.0f;
+        }
+    }
+    for (int ib = lane / 2; ib < blocks_per_row; ib += WARP_SIZE / 2) {
+#pragma unroll
+        for (int h = 0; h < VDR_NVFP4_Q8_1_MMVQ / 2; ++h) {
+            const int iqs0 = iqs + 2 * h;
+            const int is   = iqs0 >> 1;
+            const int qb   = ib * (QK_NVFP4 / QK8_1) + (is >> 1);
+            const int i8   = (is & 1) << 2;
+            sycl::int2 v0[R];
+            sycl::int2 v1[R];
+            float      dw[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const block_nvfp4 * bx = xr[r] + ib;
+                v0[r] = get_int_from_mxfp4(get_int_b4(bx->qs, iqs0));
+                v1[r] = get_int_from_mxfp4(get_int_b4(bx->qs, iqs0 + 1));
+                dw[r] = ggml_sycl_ue4m3_to_fp32(bx->d[is]);
+            }
+#pragma unroll
+            for (int j = 0; j < M; ++j) {
+                if (j < cnt) {
+                    const block_q8_1 * b8 = (const block_q8_1 *) ((const char *) vy_base + yo[j]) + qb;
+                    const int   a0 = get_int_b4(b8->qs, i8 + 0);
+                    const int   a1 = get_int_b4(b8->qs, i8 + 1);
+                    const int   a2 = get_int_b4(b8->qs, i8 + 2);
+                    const int   a3 = get_int_b4(b8->qs, i8 + 3);
+                    const float d8 = (float) (b8->ds)[0];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        int sumi = ggml_sycl_dp4a(v0[r].x(), a0, 0);
+                        sumi     = ggml_sycl_dp4a(v0[r].y(), a2, sumi);
+                        sumi     = ggml_sycl_dp4a(v1[r].x(), a1, sumi);
+                        sumi     = ggml_sycl_dp4a(v1[r].y(), a3, sumi);
+                        tmp[r][j] += dw[r] * d8 * (float) sumi;
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < M; ++j) {
+        if (j < cnt) {
+            float * dst = (float *) ((char *) dst_base + slot_off(sj[j], dst_tok_stride, dst_row_stride));
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float t = tmp[r][j];
+#pragma unroll
+                for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                    t += dpct::permute_sub_group_by_xor(sg, t, mask);
+                }
+                if (lane == 0 && row0 + r < nrows) {
+                    dst[row0 + r] = t;
+                }
+            }
+        }
+    }
+}
+
+template <int R>
+static void launch_mul_mat_vec_nvfp4_moe_dedup(const void * vx_base, const void * vy, const int32_t * ids_dev,
+                                               float * dst_base, int ncols, int nrows, int n_used,
+                                               size_t expert_weight_stride, size_t dst_row_stride,
+                                               size_t src1_row_stride, dpct::queue_ptr stream, int n_tokens,
+                                               size_t ids_row_stride, size_t dst_tok_stride,
+                                               size_t src1_tok_stride) {
+    const int            n_slots     = n_tokens * n_used;
+    const int            rows_wg     = GGML_SYCL_MMV_Y * R;
+    const int            block_num_y = (nrows + rows_wg - 1) / rows_wg;
+    const sycl::range<3> block_nums(1, (unsigned) n_slots, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_nvfp4_moe_dedup<R>(vx_base, vy, dst_base, ids_dev, n_tokens, ncols, nrows,
+                                                            n_used, expert_weight_stride, dst_row_stride,
+                                                            src1_row_stride, ids_row_stride, dst_tok_stride,
+                                                            src1_tok_stride, item);
+                         });
+    });
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_dedup(enum ggml_type src0_type, const void * vx_base, const void * vy,
+                                      const int32_t * ids_dev, float * dst_base, int ncols, int nrows,
+                                      int n_experts_used, size_t expert_weight_stride, size_t dst_row_stride,
+                                      size_t src1_row_stride, dpct::queue_ptr stream, int n_tokens,
+                                      size_t ids_row_stride, size_t dst_tok_stride, size_t src1_tok_stride) {
+    if (src0_type != GGML_TYPE_NVFP4 || n_tokens * n_experts_used > MOE_DEDUP_MAX_SLOTS) {
+        return false;
+    }
+    // 4 rows a sub-group: 2 and 8 were slower (fewer loads in flight; registers)
+    launch_mul_mat_vec_nvfp4_moe_dedup<4>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                                          expert_weight_stride, dst_row_stride, src1_row_stride, stream, n_tokens,
+                                          ids_row_stride, dst_tok_stride, src1_tok_stride);
+    return true;
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
     switch (src0_type) {
         case GGML_TYPE_Q4_0:
