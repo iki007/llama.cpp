@@ -1021,7 +1021,7 @@ void launch_fattn(
     const int id  = ggml_sycl_get_device();
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
-    const ggml_sycl_fattn_extra  extra = ggml_sycl_fattn_get_extra(dst);
+    const ggml_sycl_fattn_extra  extra = ggml_sycl_fattn_get_extra(dst, ctx.device);
     // the pool is a stack: the bias table, allocated before the others, is declared first so that it is freed last
     ggml_sycl_pool_alloc<float>  bias_table_t(pool);
     ggml_sycl_pool_alloc<int>    KV_max(pool);
