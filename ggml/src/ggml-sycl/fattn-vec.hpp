@@ -329,7 +329,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                     // mask's rounding), from the bins-innermost table of launch_fattn
                     if (bias.table) {
                         const int64_t query = (int64_t) sequence * ne01.z() + ic0 + j;
-                        const int     bin   = bias.indices[query * bias.stride + k_VKQ_0 + i_KQ];
+                        const int     bin   = bias.bin(query, k_VKQ_0 + i_KQ);
                         if ((uint32_t) bin < (uint32_t) bias.n_bins) {
                             m = (float) (sycl::half) (m + bias.table[(query * bias.n_head + head) * bias.n_bins + bin]);
                         }
