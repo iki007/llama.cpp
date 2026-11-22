@@ -2301,6 +2301,19 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
+    // The same bias with the bins taken from positions instead of an [n_kv, n_queries] index tensor:
+    // positions is F32 [n_kv + n_q, n_streams], each stream's row holding the positions of its n_kv cells and then of
+    // its n_q queries; the bin of (query, cell) is clamp(query position - cell position, 0, extent). Cells the mask
+    // hides (empty, future, out of window) may hold any position: their bin is not used.
+    GGML_API void ggml_flash_attn_ext_add_rel_pos_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * positions,
+            int32_t              extent);
+
+    // > 0: the indexed bias takes its bins from positions (ggml_flash_attn_ext_add_rel_pos_bias); 0: from indices
+    GGML_API int32_t ggml_flash_attn_ext_rel_pos_extent(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

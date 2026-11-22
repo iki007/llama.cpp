@@ -819,10 +819,10 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
-    // the bins computed on the device from the positions (LLAMA_REL_POS_HOST=1: filled on the host instead)
-    ggml_tensor * rel_tok_pos      = nullptr; // F32 [1, n_batch / n_slices, n_slices]
-    ggml_tensor * rel_cell_pos     = nullptr; // F32 [n_kv,     1, n_slices]
-    ggml_tensor * rel_cell_pos_swa = nullptr; // F32 [n_kv_swa, 1, n_slices]
+    // rel_packed: self_rel_pos(_swa) are F32 [n_kv + n_batch / n_slices, n_slices], the positions of the cells and the
+    // tokens, from which the flash attention takes the bins (ggml_flash_attn_ext_add_rel_pos_bias);
+    // LLAMA_REL_POS_HOST=1: the I32 bins above, filled on the host
+    bool rel_packed = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1355,7 +1355,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * bias_table = nullptr,
-            ggml_tensor * bias_indices = nullptr) const;
+            ggml_tensor * bias_indices = nullptr,
+            int32_t       bias_extent = 0) const; // > 0: bias_indices holds positions (ggml_flash_attn_ext_add_rel_pos_bias)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

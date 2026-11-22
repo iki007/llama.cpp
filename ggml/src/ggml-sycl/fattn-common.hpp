@@ -24,10 +24,28 @@
 // (indices outside [0, n_bins) add nothing). Queries of all streams are flattened in stream order.
 struct fattn_indexed_bias {
     const float *   table;    // [n_bins, n_head, n_queries]: launch_fattn's transposed copy of the op's table
-    const int32_t * indices;  // [n_kv, n_queries]
+    const int32_t * indices;  // [n_kv, n_queries], or null when the bins come from positions
     int64_t         n_bins;
     int64_t         n_head;
     int64_t         stride;   // elements between the index rows of two queries
+    // ggml_flash_attn_ext_add_rel_pos_bias: the bin of (query, cell) is clamp(query position - cell position, 0,
+    // extent), from pos [n_streams][pos_row = pos_nkv cells + pos_nq queries]
+    const float *   pos     = nullptr;
+    int64_t         pos_nkv = 0;
+    int64_t         pos_nq  = 1;
+    int64_t         pos_row = 0;
+    int32_t         extent  = 0;
+
+    // the bin of key k for the flattened query (stream * n_q + query of the stream)
+    inline int bin(const int64_t query, const int64_t k) const {
+        if (pos) {
+            const int64_t s = query / pos_nq;
+            const float * p = pos + s * pos_row;
+            const int     d = (int) (p[pos_nkv + (query - s * pos_nq)] - p[k]);
+            return d < 0 ? 0 : (d > extent ? extent : d);
+        }
+        return indices[query * stride + k];
+    }
 };
 
 typedef void (*fattn_kernel_t)(
@@ -946,16 +964,32 @@ static fattn_indexed_bias ggml_sycl_fattn_indexed_bias(dpct::queue_ptr stream, c
     const ggml_tensor * table   = dst->src[6];
     const ggml_tensor * indices = dst->src[7];
     GGML_ASSERT(table && indices);
-    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && indices->type == GGML_TYPE_I32);
+    const int32_t extent = ggml_flash_attn_ext_rel_pos_extent(dst);
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) &&
+                indices->type == (extent > 0 ? GGML_TYPE_F32 : GGML_TYPE_I32));
     const int n_head = (int) table->ne[0];
     const int n_bins = (int) table->ne[1];
     const int n_q    = (int) table->ne[2];
     GGML_ASSERT((int64_t) n_head * n_bins * n_q <= INT32_MAX);
+    fattn_indexed_bias b = {};
+    b.n_bins = n_bins;
+    b.n_head = n_head;
+    if (extent > 0) {
+        // positions [n_kv + n_q of a stream, n_streams]
+        b.pos     = (const float *) indices->data;
+        b.pos_nq  = dst->src[0]->ne[1];
+        b.pos_nkv = indices->ne[0] - b.pos_nq;
+        b.pos_row = (int64_t) (indices->nb[1] / sizeof(float));
+        b.extent  = extent;
+    } else {
+        b.indices = (const int32_t *) indices->data;
+        b.stride  = (int64_t) (indices->nb[1] / sizeof(int32_t));
+    }
     // the graph loop skipped the table's CONT and handed on its bins-innermost source (ggml_sycl_try_skip_bias_table_cont)
     if (g_ggml_sycl_fattn_bias_direct.fa == dst) {
-        const float * t = g_ggml_sycl_fattn_bias_direct.table_t;
+        b.table = g_ggml_sycl_fattn_bias_direct.table_t;
         g_ggml_sycl_fattn_bias_direct = {};
-        return { t, (const int32_t *) indices->data, n_bins, n_head, (int64_t) (indices->nb[1] / sizeof(int32_t)) };
+        return b;
     }
     constexpr int TB = 32;
     constexpr int WG = 256;
@@ -985,7 +1019,8 @@ static fattn_indexed_bias ggml_sycl_fattn_indexed_bias(dpct::queue_ptr stream, c
                              }
                          });
     });
-    return { tdst, (const int32_t *) indices->data, n_bins, n_head, (int64_t) (indices->nb[1] / sizeof(int32_t)) };
+    b.table = tdst;
+    return b;
 }
 
 // use_large_grf lets the compiler choose the large register file. Opt in where spilling limits the kernel, not thread occupancy.

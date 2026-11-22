@@ -443,7 +443,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                                         // the mask to F16 (the dense mask's rounding)
                                         if (ok && p.bias.table) {
                                             const int64_t query = (int64_t) seq * p.ne01 + c;
-                                            const int     bin   = p.bias.indices[query * p.bias.stride + j];
+                                            const int     bin   = p.bias.bin(query, j);
                                             if ((uint32_t) bin < (uint32_t) p.bias.n_bins) {
                                                 mv = (float) (sycl::half) (mv + p.bias.table[(query * p.bias.n_head + kvh * G + r % G) * p.bias.n_bins + bin]);
                                             }

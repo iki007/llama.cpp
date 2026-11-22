@@ -263,9 +263,9 @@ public:
             const llama_ubatch * ubatch, const slot_info & sinfo, uint32_t kpool, uint32_t n_kv) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
-    // F32 [n_kv, 1, n_slices]: the position of each cell of the view (LLAMA_REL_POS_EMPTY for empty and padding cells),
-    // from which the graph computes the relative-position bins on the device
-    void set_input_rel_cell_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const;
+    // F32 [n_kv + n_tps, n_slices]: per slice the position of each cell of the view (LLAMA_REL_POS_EMPTY for empty and
+    // padding cells) and then of each token, for ggml_flash_attn_ext_add_rel_pos_bias
+    void set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -474,7 +474,7 @@ public:
             const llama_ubatch * ubatch, uint32_t kpool) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
-    void set_input_rel_cell_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const;
+    void set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
