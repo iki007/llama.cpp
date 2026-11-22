@@ -137,7 +137,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
     // an indexed bias (ggml_flash_attn_ext_add_indexed_bias) is applied by the tile kernel (one head a group), the MKL
-    // path and the vector kernel (one token)
+    // path, the vector kernel (one token) and the DPAS kernel (q4_0 / q8_0 cache, <= 31 rows)
     const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
     if (indexed_bias && (!mask || max_bias != 0.0f || logit_softcap != 0.0f ||
                          (K->ne[0] != 64 && K->ne[0] != 128) || V->ne[0] != K->ne[0])) {
@@ -268,7 +268,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 
     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
-    if (!per_head_mask && !indexed_bias && ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
+    // (the DPAS kernel applies an indexed bias at its mask read, fattn-dpas.cpp)
+    if (!per_head_mask && ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
         return BEST_FATTN_KERNEL_DPAS;
     }
 
@@ -332,13 +333,17 @@ bool ggml_sycl_try_skip_bias_table_cont(const ggml_cgraph * cgraph, const int i)
         return false;
     }
     // x must still hold the table there: once the CONT (its last reader) has run, the allocator may give x's block
-    // to a later node, so no node in between may write into it
+    // to a later node, so no node in between, nor the flash attention itself, may be placed over it. Each node is
+    // taken at its allocation size, not ggml_nbytes: the flash attention reserves scratch past its output for the
+    // F16 copies of a quantized cache (ggml_sycl_flash_attn_ext_get_alloc_size), and that scratch landed on x with
+    // a q8_0 cache (KLD 0.26 at 16K context).
     const uintptr_t xs = (uintptr_t) x->data;
     const uintptr_t xe = xs + ggml_nbytes(x);
-    for (int k = i + 1; k < j; ++k) {
+    for (int k = i + 1; k <= j; ++k) {
         const ggml_tensor * n  = cgraph->nodes[k];
+        const size_t        sz = n->buffer ? ggml_backend_buffer_get_alloc_size(n->buffer, n) : ggml_nbytes(n);
         const uintptr_t     ns = (uintptr_t) n->data;
-        const uintptr_t     ne = ns + ggml_nbytes(n);
+        const uintptr_t     ne = ns + sz;
         if (ns < xe && xs < ne) {
             return false;
         }

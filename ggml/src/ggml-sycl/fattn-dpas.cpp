@@ -196,6 +196,7 @@ struct fa_dpas_params {
     int64_t        nb11, nb12, nb13;
     int64_t        nb21, nb22, nb23;
     int64_t        nb31, nb33;
+    fattn_indexed_bias bias;  // an indexed bias (bins-innermost table), or a null table
 };
 
 // One work-group = one KV head x nq query tokens x one slice of the keys: S = Q K^T by s8 x s4 / s8 x s8 DPAS on the
@@ -437,7 +438,16 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                                     const int c = c0 + r / G;
                                     if (r < R) {
                                         const bool  ok = jv && c < p.ne01;
-                                        const float mv = (ok && mrow) ? static_cast<float>(mrow[((int64_t) c * p.nb31) / (int64_t) sizeof(sycl::half) + j]) : 0.0f;
+                                        float mv = (ok && mrow) ? static_cast<float>(mrow[((int64_t) c * p.nb31) / (int64_t) sizeof(sycl::half) + j]) : 0.0f;
+                                        // an indexed bias: row r's head (kvh * G + r % G) value of key j's bin, rounded with
+                                        // the mask to F16 (the dense mask's rounding)
+                                        if (ok && p.bias.table) {
+                                            const int64_t query = (int64_t) seq * p.ne01 + c;
+                                            const int     bin   = p.bias.indices[query * p.bias.stride + j];
+                                            if ((uint32_t) bin < (uint32_t) p.bias.n_bins) {
+                                                mv = (float) (sycl::half) (mv + p.bias.table[(query * p.bias.n_head + kvh * G + r % G) * p.bias.n_bins + bin]);
+                                            }
+                                        }
                                         sS[r * TK + kg * 16 + lane] = ok ? s[tt][m] + mv : -INFINITY;
                                     }
                                 }
@@ -615,6 +625,9 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     nsplit     = (ne11 + p.chunk - 1) / p.chunk;
     p.nsplit   = nsplit;
 
+    // the pool is a stack: the bias table, allocated before parts / meta, is declared first so that it is freed last
+    ggml_sycl_pool_alloc<float>        bias_table_t(ctx.pool());
+    p.bias = dst->src[6] ? ggml_sycl_fattn_indexed_bias(ctx.stream(), dst, bias_table_t) : fattn_indexed_bias{};
     ggml_sycl_pool_alloc<float>        parts(ctx.pool());
     ggml_sycl_pool_alloc<sycl::float2> meta(ctx.pool());
     if (nsplit > 1) {
