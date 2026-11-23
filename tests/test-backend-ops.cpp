@@ -15764,8 +15764,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, 4, 2304, {1, 1}, {1, 1}));
     }
     // Inkling 2 Mini experts (NVFP4, 128 x 8): gate_up shares the input, down reads one row per expert; 1 token and
-    // the DSpark verify batch
-    for (int n : { 1, 4 }) {
+    // the DSpark verify batch, and a 1024-token prompt ubatch
+    for (int n : { 1, 4, 1024 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
     }
