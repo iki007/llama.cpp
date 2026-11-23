@@ -3,6 +3,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 // One thread owns MR rows of one expert's weight and one BN-wide tile of the schedule, over the
 // whole K. Per k step (32 values) it loads the rows' stored bits, dequantizes them in registers to
@@ -481,6 +482,17 @@ template <int MR> struct grouped_gemm_esimd_a<block_nvfp4, MR> {
         v.template select<RC * 16, 1>(0) *= d0.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
         v.template select<RC * 16, 1>(RC * 16) *= d1.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
         return v;
+    }
+    // The rows' qs dwords of k step kb into L1 (the block's scales, 4 bytes before, mostly share their line).
+    // One k step ahead is the best distance (Inkling gate_up 2349 -> 2126 us, down 1279 -> 1192; 2, 3, 4 steps
+    // gain less, 4 nothing): the next step's loads issue early without holding registers. Loading that step into
+    // registers instead (a second raw, or its gather kept in flight) did not gain; prefetching B lost 7% (B is
+    // read by the consecutive threads of its tile, already in L1).
+    template <typename Sl> static ESIMD_INLINE void prefetch_rows(const Sl & s, const int kb) {
+        namespace ex = sycl::ext::intel::experimental::esimd;
+        using namespace sycl::ext::intel::esimd;
+        ex::lsc_prefetch<uint32_t, 4, ex::lsc_data_size::default_size, cache_hint::cached, cache_hint::cached, MR>(
+            (const uint32_t *) s.x, s.at(QS, kb / 2, 16 * (kb % 2)));
     }
 };
 
@@ -1077,6 +1089,9 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A, bool PAI
             }
             typename F::raw r;
             if constexpr (PAIR) {
+                if (kb + 1 < nstep) {
+                    F::prefetch_rows(sl, kb + 1);
+                }
                 F::load_kperm(r, sb, sl, kb, j);
             } else {
                 F::load(r, sb, sl, kb, j);
@@ -1217,6 +1232,7 @@ static int grouped_gemm_esimd_pair() {
     static const int pair = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM_PAIR", 1);
     return pair;
 }
+
 
 // kperm: B is packed k-permuted, for the PAIR kernel (only NVFP4 with 2D loads; ggml_sycl_grouped_gemm_esimd_kperm)
 template <typename block_q_t, typename T, bool AOS, typename A>
