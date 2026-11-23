@@ -4775,6 +4775,37 @@ struct test_loop_ctrl : public test_case {
     }
 };
 
+// Inkling's short convolution with a residual: (cur + ssm_conv(x, w)) * s, the chain backends may fuse
+struct test_conv_residual : public test_case {
+    const int64_t n_ch;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_RESIDUAL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override { return VARS_TO_STR2(n_ch, n_tokens); }
+
+    test_conv_residual(int64_t n_ch = 256, int64_t n_tokens = 1) : n_ch(n_ch), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_conv = 4;
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_conv - 1 + n_tokens, n_ch, 1);
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, n_ch);
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_set_name(cur, "cur");
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_ch, n_tokens);
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf((float) n_conv + 1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // The MoE FFN of build_moe_ffn() with per-expert weight scales (NVFP4 .scale tensors) and the SiTU activation
 // (Inkling): the element-wise chains after each expert GEMM, which backends may fuse. f32 experts keep the GEMMs exact
 // enough that the comparison is about the chains.
@@ -11047,6 +11078,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_depth_mix(n_embd, n_stack, n_q, n_tokens));
                 }
             }
+        }
+    }
+
+    // short convolution with a residual (Inkling)
+    for (int64_t n_ch : { 1024, 2304, 130 }) {
+        for (int64_t n_tokens : { 1, 4, 37 }) {
+            test_cases.emplace_back(new test_conv_residual(n_ch, n_tokens));
         }
     }
 
