@@ -760,8 +760,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        // unsorted: the test needs p and q of the draft token only, and a draw of the residual is exact in any fixed
+        // order; sorting the whole vocabulary (200K candidates) for each draft position cost most of a round's host time
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
+
+        // a dense q (one entry per token, in id order) is read by index
+        const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        bool dense = q.size() == n_vocab;
+        for (size_t k = 0; dense && k < q.size(); ++k) {
+            dense = q[k].id == (llama_token) k;
+        }
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
         if (masked) {
@@ -790,7 +799,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         };
 
         // q_x is never 0 for a token the draft produced, but guard the divide
-        const float q_x = prob_of(q.data(), q.size(), draft[i]);
+        const float q_x = dense && (size_t) draft[i] < q.size() ? q[draft[i]].p : prob_of(q.data(), q.size(), draft[i]);
 
         float p_x = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
