@@ -102,7 +102,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 / q8_0 K/V decode on Xe2 XMX
-    BEST_FATTN_KERNEL_XMXD     = 125, // decode / verify rows over a q8_0 cache read in place on Xe2 XMX (fattn-xmx-dec.cpp)
+    BEST_FATTN_KERNEL_XMXD     = 125, // decode / verify rows over a q8_0 (read in place) or f16 cache on Xe2 XMX (fattn-xmx-dec.cpp)
     BEST_FATTN_KERNEL_XMXP     = 130, // prompt batches, head 128, f16 K/V on Xe2 XMX (fattn-xmx-prompt.cpp)
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
@@ -456,7 +456,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_XMXD:
-            // the 2D loads read the q8_0 cache in place: another layout takes the DPAS kernel (also in place: no staging)
+            // the 2D loads read the cache (q8_0 in place, or f16) per head: another layout takes the DPAS kernel
             if (ggml_sycl_flash_attn_ext_xmx_dec_data_ok(dst)) {
                 ggml_sycl_flash_attn_ext_xmx_dec(ctx, dst);
             } else {

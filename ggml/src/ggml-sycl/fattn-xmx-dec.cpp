@@ -13,7 +13,7 @@
 
 #include "fattn-common.hpp"
 
-// Decode flash attention on XMX over a q8_0 cache read in place: the decode path of the fork's fattn-xmx.cpp
+// Decode flash attention on XMX over a q8_0 cache read in place, or an f16 cache: the decode path of the fork's fattn-xmx.cpp
 // (sycl-decode-mmvq; Recursive Flint, Qwen3.8-27B), with the indexed bias of the Inkling 2 models added at the mask
 // read. A work-group of D / 16 threads handles one KV head and one slice of the cache (split-K): per block of D tokens,
 // thread t scores tokens 16t..16t+15 for all g heads x query rows (M <= 64 DPAS rows; the q8_0 blocks are dequantized
@@ -501,6 +501,19 @@ static bool fa_xmx_q8_layout(const ggml_tensor * t, size_t & hb, int & hx) {
     return false;
 }
 
+// an f16 cache that fa_xmx_kernel reads with 2D loads, a surface per head: 64-byte aligned base and head offsets, a
+// 16-byte aligned row pitch of 64 bytes or more
+static bool fa_xmx_f16_layout(const ggml_tensor * t) {
+    return (uintptr_t) t->data % 64 == 0 && t->nb[1] % 16 == 0 && t->nb[1] >= 64 && t->nb[1] < (1u << 24) &&
+           t->nb[2] % 64 == 0;
+}
+
+static bool fa_xmx_kv_layout(const ggml_tensor * t) {
+    size_t hb = 0;
+    int    hx = 0;
+    return t->type == GGML_TYPE_Q8_0 ? fa_xmx_q8_layout(t, hb, hx) : fa_xmx_f16_layout(t);
+}
+
 }  // namespace
 
 bool ggml_sycl_flash_attn_ext_xmx_dec_supported(int device, const ggml_tensor * dst) {
@@ -521,15 +534,17 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_supported(int device, const ggml_tensor * 
     float max_bias = 0.0f, softcap = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
-    // a q8_0 cache read in place, a dense mask (no n_kv_max hint), decode and verify rows
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || dst->type != GGML_TYPE_F32 ||
+    // a q8_0 cache read in place or an f16 cache, a dense mask (no n_kv_max hint), decode and verify rows
+    const bool q8  = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    const bool f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    if (Q->type != GGML_TYPE_F32 || !(q8 || f16) || dst->type != GGML_TYPE_F32 ||
         !mask || mask->type != GGML_TYPE_F16 || (sinks && sinks->type != GGML_TYPE_F32) || max_bias != 0.0f ||
         softcap != 0.0f || dst->src[5] || ggml_get_op_params_i32(dst, 4) > 0) {
         return false;
     }
     const int64_t D = K->ne[0];
-    if ((D != FA_XMX_D && D != 128) || V->ne[0] != D || Q->ne[0] != D || K->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) ||
-        V->nb[0] != ggml_type_size(GGML_TYPE_Q8_0)) {
+    if ((D != FA_XMX_D && D != 128) || V->ne[0] != D || Q->ne[0] != D || K->nb[0] != ggml_type_size(K->type) ||
+        V->nb[0] != ggml_type_size(V->type)) {
         return false;
     }
     const int64_t ns = Q->ne[3];
@@ -542,9 +557,13 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_supported(int device, const ggml_tensor * 
     if (nq > max_q || g > 64 || K->ne[1] % D != 0 || mask->ne[0] < K->ne[1] || mask->ne[1] < nq) {
         return false;
     }
-    size_t hb = 0;
-    int    hx = 0;
-    if (!fa_xmx_q8_layout(K, hb, hx) || !fa_xmx_q8_layout(V, hb, hx)) {
+    if (!fa_xmx_kv_layout(K) || !fa_xmx_kv_layout(V)) {
+        return false;
+    }
+    // an f16 V that is a view of K (MLA-style caches) keeps the other kernels: the fallback of the dispatch (DPAS)
+    // reads only a q8_0 cache that way
+    const ggml_tensor * k_src = K->view_src ? K->view_src : K;
+    if (f16 && V->view_src == k_src && V->view_offs == (K->view_src ? K->view_offs : 0)) {
         return false;
     }
     if (ns > 1 && (Q->nb[3] % 16 != 0 || (mask->ne[3] > 1 && mask->nb[3] % 16 != 0) || K->nb[3] % 64 != 0 || V->nb[3] % 64 != 0)) {
@@ -561,10 +580,8 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_data_ok(const ggml_tensor * dst) {
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
-    size_t hb = 0;
-    int    hx = 0;
     return (uintptr_t) Q->data % 16 == 0 && (uintptr_t) mask->data % 16 == 0 && K->data != V->data &&
-           fa_xmx_q8_layout(K, hb, hx) && fa_xmx_q8_layout(V, hb, hx);
+           fa_xmx_kv_layout(K) && fa_xmx_kv_layout(V);
 }
 
 void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -600,9 +617,12 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
     const int nq_chunk = (nq + n_chunks - 1) / n_chunks;
     const int R8_max   = (g * nq_chunk + 7) / 8 * 8;
 
-    size_t k_hb = 0, v_hb = 0;
-    int    k_hx = 0, v_hx = 0;
-    GGML_ASSERT(fa_xmx_q8_layout(K, k_hb, k_hx) && fa_xmx_q8_layout(V, v_hb, v_hx));
+    const bool q8   = K->type == GGML_TYPE_Q8_0;
+    size_t     k_hb = 0, v_hb = 0;
+    int        k_hx = 0, v_hx = 0;
+    if (q8) {
+        GGML_ASSERT(fa_xmx_q8_layout(K, k_hb, k_hx) && fa_xmx_q8_layout(V, v_hb, v_hx));
+    }
 
     // a q8_0 cache read in place with up to 2 row groups (3 with several streams) runs with 128 registers a thread and
     // twice the work-groups (fattn-xmx.cpp of the fork); split the cache so that about GGML_SYCL_FA_XMX_WGS work-groups run
@@ -677,7 +697,11 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
         a.mask   = (const char *) mask->data + j0 * mask->nb[1];
         a.nq     = nqc;
         a.q_base = j0;
-        fa_xmx_launch_rg<false, true>(D, RG, a, n_kvh, grf128, stream);
+        if (q8) {
+            fa_xmx_launch_rg<false, true>(D, RG, a, n_kvh, grf128, stream);
+        } else {
+            fa_xmx_launch_rg<false, false>(D, RG, a, n_kvh, grf128, stream);
+        }
 
         // merge the slices: dst[j][kvh g + c][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp2(m_s - max_s m_s); an
         // attention sink (a logit with no value row, natural log units: times log2(e) here) joins the max and the sum
