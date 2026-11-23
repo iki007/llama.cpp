@@ -254,11 +254,11 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
     auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
     const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
-    auto * base = g.build_lora_mm(output, hidden, scale);
-    auto * bias = g.build_lora_mm(output, correction, scale);
-    ggml_prec_set_acc(base, GGML_PREC_F32);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
-    auto * logits = ggml_add(g.ctx0, base, bias);
+    // output . hidden + output . correction as one product of the sum: one read of the vocabulary head a step
+    // instead of two (the draft step reads it per draft token, per sequence); the drafter's logits round
+    // differently, the target still verifies every draft
+    auto * logits = g.build_lora_mm(output, ggml_add(g.ctx0, hidden, correction), scale);
+    ggml_prec_set_acc(logits, GGML_PREC_F32);
     logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, hidden->ne[1], logits->nb[1], 0));
     const float cap = model.hparams.f_final_logit_softcapping;
     return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);
