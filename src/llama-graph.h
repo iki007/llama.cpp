@@ -1531,6 +1531,9 @@ struct llm_graph_context {
                 int64_t   n_cols,
                  size_t   offs) const;
 
+    // the rollback slot order {K-1, ..., 0} of the conv state stores, built once a graph
+    mutable ggml_tensor * conv_slot_rev = nullptr;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,
