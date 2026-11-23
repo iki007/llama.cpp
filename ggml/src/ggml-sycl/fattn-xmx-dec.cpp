@@ -606,12 +606,15 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
 
     // a q8_0 cache read in place with up to 2 row groups (3 with several streams) runs with 128 registers a thread and
     // twice the work-groups (fattn-xmx.cpp of the fork); split the cache so that about GGML_SYCL_FA_XMX_WGS work-groups run
+    // at head size 256. A work-group has D / 16 threads, so head size 128 takes twice the work-groups for the same
+    // threads: the split then fills the card's thread slots once (Inkling 2 Mini, 8 KV heads, q8_0 at 256K: 4-row
+    // verify 1401 -> 1213 us; 1.5x or 2x the threads leave a partial second wave, 1.4-1.6x slower)
     static const int target_wgs = ggml_sycl_get_env("GGML_SYCL_FA_XMX_WGS", 64);
     static const int grf128_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_GRF128", 1);
     const int        RG_max     = R8_max / 8;
     const bool       grf128     = grf128_env && (RG_max <= 2 || (RG_max == 3 && n_str > 1));
     const int        n_hs       = n_str * n_kvh;
-    const int        n_wgs      = grf128 ? 2 * target_wgs : target_wgs;
+    const int        n_wgs      = (grf128 ? 2 * target_wgs : target_wgs) * (FA_XMX_D / D);
     int              nsplit     = std::max(1, std::min(nblk, (n_wgs + n_hs - 1) / n_hs));
     const int        bps        = (nblk + nsplit - 1) / nsplit;
     nsplit                      = (nblk + bps - 1) / bps;

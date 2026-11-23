@@ -15117,6 +15117,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // Inkling 2 Mini decode and 4-token verify attention over a q8_0 cache at 64K and 256K
+    for (int kv : { 65536, 262144, }) {
+        for (int nb : { 1, 4, }) {
+            // heads interleaved in the token row, as in the KV cache
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
+
     // Inkling 2 Mini prompt attention: head 128, 8 KV heads x 3, 512 queries over a sliding window (1536 cells) and
     // full-attention depths
     for (int kv : { 1536, 32768, 131072, }) {
