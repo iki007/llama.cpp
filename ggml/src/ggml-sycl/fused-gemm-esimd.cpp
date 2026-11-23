@@ -443,6 +443,45 @@ template <int MR> struct grouped_gemm_esimd_a<block_nvfp4, MR> {
         v.template select<RC * 16, 1>(RC * 16) *= d1.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
         return v;
     }
+
+    // The k-permuted order the PAIR kernel reads (B packed to match, see ggml_sycl_grouped_gemm_esimd_kperm):
+    // dpas k pair q of k half h holds k = 16h + q and 16h + q + 8, the low and the high nibble of byte q of
+    // the sub-block, so the pair table's dwords are the dpas A as gathered. load_kperm keeps each k half as
+    // [row][8 bytes], interleaving the dwords of the gather's [dword][row] (in place of the [row][4 dwords]
+    // transpose of load), and decode_kperm needs no reshuffle of halves.
+    template <typename Sl>
+    static ESIMD_INLINE void load_kperm(raw & r, sb_t & sb, const Sl & s, const int kb, const int j) {
+        using namespace grouped_gemm_esimd;
+        // the qs field starts on a dword in every block (ok(): AoS only, 36-byte blocks)
+        simd<uint32_t, MR * 4> g = gather<uint32_t, MR * 4, 4>((const uint32_t *) s.x, s.at(QS, kb / 2, 16 * j));
+        r.q.template select<MR, 2>(0)          = g.template select<MR, 1>(0);
+        r.q.template select<MR, 2>(1)          = g.template select<MR, 1>(MR);
+        r.q.template select<MR, 2>(2 * MR)     = g.template select<MR, 1>(2 * MR);
+        r.q.template select<MR, 2>(2 * MR + 1) = g.template select<MR, 1>(3 * MR);
+        if (j == 0) {
+            r.d0 = sb.d[0];
+            r.d1 = sb.d[1];
+        } else {
+            r.d0 = sb.d[2];
+            r.d1 = sb.d[3];
+        }
+    }
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode_kperm(raw & r) {
+        using namespace grouped_gemm_esimd;
+        constexpr int           RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 2>  q0 = r.q.template select<RC * 2, 1>(g * RC * 2);
+        simd<uint32_t, RC * 2>  q1 = r.q.template select<RC * 2, 1>(2 * MR + g * RC * 2);
+        simd<uint32_t, RC * 16> off;
+        off.template select<RC * 8, 1>(0)      = q0.template bit_cast_view<uint8_t>();
+        off.template select<RC * 8, 1>(RC * 8) = q1.template bit_cast_view<uint8_t>();
+        simd<uint32_t, RC * 16> pr = slm_gather<uint32_t, RC * 16>(off * 4);
+        a_halves                v  = pr.template bit_cast_view<sycl::half>();
+        simd<sycl::half, RC>    d0 = r.d0.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>    d1 = r.d1.template select<RC, 1>(g * RC);
+        v.template select<RC * 16, 1>(0) *= d0.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        v.template select<RC * 16, 1>(RC * 16) *= d1.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        return v;
+    }
 };
 
 // [qs 128][d 2][scales_h 2][scales_l 4] per 256 values; k step ib8 of a superblock is sub-block ib8
@@ -912,6 +951,7 @@ template <int MR> struct grouped_gemm_esimd_a<block_iq3_xxs, MR> {
 // alone only when the tile before it is another expert's (otherwise that tile's thread has it). Every tile
 // is computed once. The tiles of an expert are consecutive in the route map and in the packed B, so the
 // pair's columns are those of one 64-wide tile; the column groups past the pair's last column are skipped.
+// PAIR reads B packed k-permuted (F::load_kperm, F::decode_kperm; see ggml_sycl_grouped_gemm_esimd_kperm).
 template <typename block_q_t, int KS, typename T, bool AOS, typename A, bool PAIR = false> struct grouped_gemm_esimd_kernel {
     using F = grouped_gemm_esimd_a<block_q_t, A::MR>;
 
@@ -1036,7 +1076,11 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A, bool PAI
                 F::load_sb(sb, sl, kb / KPB);
             }
             typename F::raw r;
-            F::load(r, sb, sl, kb, j);
+            if constexpr (PAIR) {
+                F::load_kperm(r, sb, sl, kb, j);
+            } else {
+                F::load(r, sb, sl, kb, j);
+            }
             simd<uint32_t, 16 * NW> b[NT]; // [16 k pairs][NW columns] each
             if constexpr (A::L2D) {
 #pragma unroll
@@ -1072,6 +1116,8 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A, bool PAI
                     auto am = all.template bit_cast_view<sycl::half, MR, GROUPED_GEMM_QK>();
                     av.template select<RC * 16, 1>(0)       = am.template select<RC, 1, 16, 1>(g * RC, 0);
                     av.template select<RC * 16, 1>(RC * 16) = am.template select<RC, 1, 16, 1>(g * RC, 16);
+                } else if constexpr (PAIR) {
+                    av = F::template decode_kperm<g>(r);
                 } else {
                     av = F::template decode<g>(r);
                 }
@@ -1165,6 +1211,14 @@ bool ggml_sycl_grouped_gemm_esimd_enabled() {
 #endif
 }
 
+// GGML_SYCL_GROUPED_GEMM_PAIR (NVFP4, 2D loads): 1 pairs of tiles with the arch's rows a thread, 2 with 16
+// rows (half the accumulators), 0 off
+static int grouped_gemm_esimd_pair() {
+    static const int pair = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM_PAIR", 1);
+    return pair;
+}
+
+// kperm: B is packed k-permuted, for the PAIR kernel (only NVFP4 with 2D loads; ggml_sycl_grouped_gemm_esimd_kperm)
 template <typename block_q_t, typename T, bool AOS, typename A>
 static void grouped_gemm_esimd_launch(const char *                        src0_dd,
                                       size_t                              expert_stride,
@@ -1176,13 +1230,11 @@ static void grouped_gemm_esimd_launch(const char *                        src0_d
                                       int                                 K,
                                       const ggml_sycl_grouped_gemm_rows & dst_rows,
                                       int64_t                             n_tiles,
+                                      bool                                kperm,
                                       dpct::queue_ptr                     stream) {
-    // GGML_SYCL_GROUPED_GEMM_PAIR (NVFP4, 2D loads): 1 pairs of tiles with the arch's rows a thread, 2 with 16
-    // rows (half the accumulators), 0 off
-    static const int pair = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM_PAIR", 1);
     if constexpr (A::L2D && std::is_same_v<block_q_t, block_nvfp4>) {
-        if (pair != 0 && ggml_sycl_grouped_gemm_esimd_mode() != 2) {
-            if (pair == 2) {
+        if (kperm) {
+            if (grouped_gemm_esimd_pair() == 2) {
                 using A16 = grouped_gemm_arch<A::NW, 16, A::L2D>;
                 const sycl::nd_range<1> r16((size_t) n_tiles * (M / A16::MR), 1);
                 stream->parallel_for(r16, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A16, true>{
@@ -1197,6 +1249,7 @@ static void grouped_gemm_esimd_launch(const char *                        src0_d
             return;
         }
     }
+    GGML_ASSERT(!kperm && "B packed k-permuted for a kernel that reads it in order");
     const sycl::nd_range<1> range((size_t) n_tiles * (M / A::MR), 1);
     if (ggml_sycl_grouped_gemm_esimd_mode() == 2) {
         stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, GGML_SYCL_GROUPED_GEMM_KSPLIT, T, AOS, A>{
@@ -1205,6 +1258,18 @@ static void grouped_gemm_esimd_launch(const char *                        src0_d
         stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A>{
                                         src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows });
     }
+}
+
+// the shapes the kernel covers: whole row groups and stored blocks, every K-split range non-empty (also in
+// mode 1, so both modes take the same shapes); B is read with 2D block loads, which want 64-byte aligned
+// surfaces and pitches, or with 16-byte aligned block loads of whole tiles
+template <typename block_q_t, typename T, typename A>
+static bool grouped_gemm_esimd_shape_ok(const char * src0_dd, size_t expert_stride, const T * packed, int M, int Npad,
+                                        int K, bool reordered) {
+    using F = grouped_gemm_esimd_a<block_q_t, A::MR>;
+    return M % A::MR == 0 && F::ok(K, !reordered) && K >= GROUPED_GEMM_QK * GGML_SYCL_GROUPED_GEMM_KSPLIT &&
+           grouped_gemm_esimd_weights_ok(src0_dd, expert_stride, reordered && A::L2D) &&
+           ((uintptr_t) packed % 64) == 0 && Npad % 16 == 0;
 }
 
 template <typename block_q_t, typename T, typename A>
@@ -1219,24 +1284,35 @@ static bool grouped_gemm_esimd_run(const char *                        src0_dd,
                                    const ggml_sycl_grouped_gemm_rows & dst_rows,
                                    bool                                reordered,
                                    int64_t                             n_tiles,
+                                   bool                                kperm,
                                    dpct::queue_ptr                     stream) {
-    using F = grouped_gemm_esimd_a<block_q_t, A::MR>;
-    // whole row groups and stored blocks, every K-split range non-empty (also in mode 1, so both
-    // modes take the same shapes); B is read with 2D block loads, which want 64-byte aligned
-    // surfaces and pitches, or with 16-byte aligned block loads of whole tiles
-    if (M % A::MR != 0 || !F::ok(K, !reordered) || K < GROUPED_GEMM_QK * GGML_SYCL_GROUPED_GEMM_KSPLIT ||
-        !grouped_gemm_esimd_weights_ok(src0_dd, expert_stride, reordered && A::L2D) || ((uintptr_t) packed % 64) != 0 ||
-        Npad % 16 != 0) {
+    if (!grouped_gemm_esimd_shape_ok<block_q_t, T, A>(src0_dd, expert_stride, packed, M, Npad, K, reordered)) {
+        // ggml_sycl_grouped_gemm_esimd_kperm checks the same shapes, so a k-permuted B always gets here
+        GGML_ASSERT(!kperm && "B packed k-permuted for a shape the ESIMD kernel does not take");
         return false;
     }
     if (reordered) {
         grouped_gemm_esimd_launch<block_q_t, T, false, A>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                          dst_rows, n_tiles, stream);
+                                                          dst_rows, n_tiles, kperm, stream);
     } else {
         grouped_gemm_esimd_launch<block_q_t, T, true, A>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                         dst_rows, n_tiles, stream);
+                                                         dst_rows, n_tiles, kperm, stream);
     }
     return true;
+}
+
+template <typename block_q_t, typename T, int NW>
+bool ggml_sycl_grouped_gemm_esimd_kperm(const char * src0_dd, size_t expert_stride, const T * packed, int M, int Npad,
+                                        int K, bool reordered) {
+    if constexpr (NW == 16 && grouped_gemm_xe2::L2D && std::is_same_v<block_q_t, block_nvfp4>) {
+        return ggml_sycl_grouped_gemm_esimd_enabled() && grouped_gemm_esimd_pair() != 0 &&
+               ggml_sycl_grouped_gemm_esimd_mode() != 2 &&
+               grouped_gemm_esimd_shape_ok<block_q_t, T, grouped_gemm_xe2>(src0_dd, expert_stride, packed, M, Npad, K,
+                                                                           reordered);
+    } else {
+        (void) src0_dd; (void) expert_stride; (void) packed; (void) M; (void) Npad; (void) K; (void) reordered;
+        return false;
+    }
 }
 
 template <typename block_q_t, typename T, int NW>
@@ -1251,23 +1327,28 @@ bool ggml_sycl_grouped_gemm_esimd(const char *                        src0_dd,
                                   const ggml_sycl_grouped_gemm_rows & dst_rows,
                                   bool                                reordered,
                                   int64_t                             n_tiles,
+                                  bool                                kperm,
                                   dpct::queue_ptr                     stream) {
     static_assert(grouped_gemm_esimd_a<block_q_t>::supported == ggml_sycl_grouped_gemm_esimd_has<block_q_t>,
                   "the header's format list and the formats implemented here must agree");
     static_assert(NW == 8 || NW == 16, "the dpas widths of Xe-HPG and of Xe2 / Xe-HPC");
     if constexpr (NW == 16) {
         return grouped_gemm_esimd_run<block_q_t, T, grouped_gemm_xe2>(src0_dd, expert_stride, tiles, packed, dst, M,
-                                                                      Npad, K, dst_rows, reordered, n_tiles, stream);
+                                                                      Npad, K, dst_rows, reordered, n_tiles, kperm,
+                                                                      stream);
     } else {
         return grouped_gemm_esimd_run<block_q_t, T, grouped_gemm_xehpg>(src0_dd, expert_stride, tiles, packed, dst, M,
-                                                                        Npad, K, dst_rows, reordered, n_tiles, stream);
+                                                                        Npad, K, dst_rows, reordered, n_tiles, kperm,
+                                                                        stream);
     }
 }
 
 #define GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, T, NW)                                               \
     template bool ggml_sycl_grouped_gemm_esimd<block_q_t, T, NW>(                                     \
         const char *, size_t, const ggml_sycl_grouped_gemm_tile *, const T *, float *, int, int, int, \
-        const ggml_sycl_grouped_gemm_rows &, bool, int64_t, dpct::queue_ptr);
+        const ggml_sycl_grouped_gemm_rows &, bool, int64_t, bool, dpct::queue_ptr);                   \
+    template bool ggml_sycl_grouped_gemm_esimd_kperm<block_q_t, T, NW>(const char *, size_t, const T *, int, int, \
+                                                                      int, bool);
 #define GROUPED_GEMM_ESIMD_INSTANCE(block_q_t)                                \
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::half, 16)                  \
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 16) \
