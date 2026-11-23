@@ -255,7 +255,7 @@ public:
     void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
     // F32 [n_kv + n_tps, n_slices]: per slice the position of each cell of the view (LLAMA_REL_POS_EMPTY for empty and
     // padding cells) and then of each token, for ggml_flash_attn_ext_add_rel_pos_bias
-    void set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const;
+    void set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, bool seq_only = false) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -461,7 +461,7 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
-    void set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const;
+    void set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, bool seq_only = false) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

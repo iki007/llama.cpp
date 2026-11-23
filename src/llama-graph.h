@@ -824,6 +824,12 @@ public:
     // LLAMA_REL_POS_HOST=1: the I32 bins above, filled on the host
     bool rel_packed = false;
 
+    // mask_dev: the full-attention layers take self_attn_mask_dev (F16, the shape of self_attn_mask.raw), computed in
+    // the graph from the packed positions, and the host mask is neither filled nor uploaded; for one-sequence causal
+    // ubatches with 1D positions (rel_mask_dev_ok), LLAMA_KQ_MASK_HOST=1 keeps the host mask
+    bool          mask_dev           = false;
+    ggml_tensor * self_attn_mask_dev = nullptr;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
