@@ -3240,6 +3240,184 @@ static void mul_mat_vec_q_moe_reorder(
     }
 }
 
+// The reorder (SoA) types for 2-8 tokens with the slots grouped by expert, as mul_mat_vec_nvfp4_moe_dedup: the
+// sub-groups of the first slot of each group of up to MOE_DEDUP_MAXM slots of an expert read its rows once and dot
+// them with every token of the group; the others exit. A sub-group takes MOE_REORDER_DEDUP_R rows, so the grouping
+// prologue is paid once for them. The types with shared weights (reorder_vec_dot_shared_weights) and Q8_0 unpack a
+// weight block once for all members; the others call the type's vec_dot once a member. Every member's sum is
+// accumulated in the order of mul_mat_vec_q_moe_reorder, so the results are the same bits.
+static constexpr int MOE_REORDER_DEDUP_R = 4;
+
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_reorder_dedup(
+    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+    const int ncols, const int nrows, const int n_used, const int n_tokens,
+    const size_t expert_weight_stride, const size_t dst_row_stride, const size_t src1_row_stride,
+    const size_t ids_row_stride, const size_t dst_tok_stride, const size_t src1_tok_stride,
+    const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+    constexpr int       M     = MOE_DEDUP_MAXM;
+    constexpr int       R     = MOE_REORDER_DEDUP_R;
+    constexpr ggml_type gtype = reorder_vec_dot_q_sycl::gtype;
+
+    const int slot     = item_ct1.get_group(1);
+    const int row_base = (item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1)) * R;
+    if (row_base >= nrows) {
+        return;
+    }
+    const auto  sg      = item_ct1.get_sub_group();
+    const int   lane    = sg.get_local_linear_id();
+    const int   n_slots = n_tokens * n_used;
+    const float inv_nu  = 1.0f / (float) n_used;
+    auto        tok_of  = [&](int x) { return (int) (((float) x + 0.5f) * inv_nu); };
+    auto        id_of   = [&](int x) {
+        const int t = tok_of(x);
+        return ids_dev[(size_t) t * ids_row_stride + (x - t * n_used)];
+    };
+    auto slot_off = [&](int x, size_t tok_stride, size_t row_stride) {
+        const int t = tok_of(x);
+        return (size_t) t * tok_stride + (size_t) (x - t * n_used) * row_stride;
+    };
+    const int i02 = id_of(slot);
+    if (i02 < 0) { // skipped slot
+        if (sg.leader()) {
+            float * dst = (float *) ((char *) dst_base + slot_off(slot, dst_tok_stride, dst_row_stride));
+            for (int r = 0; r < R && row_base + r < nrows; ++r) {
+                dst[row_base + r] = 0.0f;
+            }
+        }
+        return;
+    }
+    constexpr int Q = MOE_DEDUP_MAX_SLOTS / WARP_SIZE;
+    int           idv[Q];
+    int           before = 0;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        const int x = lane + q * WARP_SIZE;
+        idv[q]      = q * WARP_SIZE < n_slots && x < n_slots ? id_of(x) : -1;
+        before += x < slot && idv[q] == i02;
+    }
+    const int rank = sycl::reduce_over_group(sg, before, sycl::plus<int>());
+    if (rank % M != 0) {
+        return;
+    }
+    int sj[M];
+    int cnt = 1;
+    sj[0]   = slot;
+#pragma unroll
+    for (int j = 1; j < M; ++j) {
+        const int prev = sj[j - 1];
+        int       cand = INT_MAX;
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const int x = lane + q * WARP_SIZE;
+            if (x > prev && x < n_slots && idv[q] == i02) {
+                cand = sycl::min(cand, x);
+            }
+        }
+        cand  = sycl::reduce_over_group(sg, cand, sycl::minimum<int>());
+        sj[j] = cand == INT_MAX ? slot : cand;
+        cnt += cand != INT_MAX && cnt == j;
+    }
+    const char * vys[M];
+#pragma unroll
+    for (int j = 0; j < M; ++j) {
+        vys[j] = (const char *) vy_base + slot_off(sj[j], src1_tok_stride, src1_row_stride);
+    }
+
+    const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+
+    constexpr int vdr_mmvq = gtype == GGML_TYPE_Q8_0 ? VDR_Q8_0_Q8_1_MMVQ : block_traits::vdr_mmvq;
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    for (int r = 0; r < R; ++r) {
+        const int row = row_base + r;
+        if (row >= nrows) {
+            break;
+        }
+        float partial[M];
+#pragma unroll
+        for (int j = 0; j < M; ++j) {
+            partial[j] = 0.0f;
+        }
+        for (int i = lane / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+            const int  ibx       = row * blocks_per_row + i;
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+            const int  iby       = i * block_type::block_to_q8_1_ratio();
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int iqs = elem + vdr_mmvq * (lane % block_elements_per_subgroup);
+                if constexpr (gtype == GGML_TYPE_Q8_0) {
+                    // reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> with the weights unpacked once
+                    const uint8_t * base = (const uint8_t *) vx;
+                    const int8_t *  qs   = (const int8_t *) (base + bx_offset.first);
+                    const float     d    = (float) *(const ggml_half *) (base + d_offset.first);
+                    int             v[vdr_mmvq];
+#pragma unroll
+                    for (int k = 0; k < vdr_mmvq; ++k) {
+                        v[k] = get_int_from_int8(qs, iqs + k);
+                    }
+#pragma unroll
+                    for (int j = 0; j < M; ++j) {
+                        if (j < cnt) {
+                            const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            int            sumi = 0;
+#pragma unroll
+                            for (int k = 0; k < vdr_mmvq; ++k) {
+                                sumi = dpct::dp4a(v[k], get_int_from_int8_aligned(q8, iqs + k), sumi);
+                            }
+                            const sycl::half2 ds = *(const sycl::half2 *) (vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += d * static_cast<float>(ds[0]) * sumi;
+                        }
+                    }
+                } else if constexpr (reorder_vec_dot_shared_weights<gtype>::value) {
+                    const auto w = reorder_vec_dot_q_sycl::load(vx, bx_offset, d_offset, iqs);
+#pragma unroll
+                    for (int j = 0; j < M; ++j) {
+                        if (j < cnt) {
+                            const int8_t *      q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * ds = (const sycl::half2 *) (vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += reorder_vec_dot_q_sycl::dot(w, q8, ds, iqs);
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < M; ++j) {
+                        if (j < cnt) {
+                            const int8_t *      q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * ds = (const sycl::half2 *) (vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8, ds, iqs);
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < M; ++j) {
+            if (j < cnt) {
+                float sum = partial[j];
+                if constexpr (gtype == GGML_TYPE_Q8_0) {
+                    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                        sum += dpct::permute_sub_group_by_xor(sg, sum, mask);
+                    }
+                } else {
+                    sum = sycl::reduce_over_group(sg, sum, std::plus<>());
+                }
+                if (sg.leader()) {
+                    float * dst = (float *) ((char *) dst_base + slot_off(sj[j], dst_tok_stride, dst_row_stride));
+                    dst[row] = sum;
+                }
+            }
+        }
+    }
+}
+
 template <typename reorder_vec_dot_q_sycl>
 static void launch_mul_mat_vec_q_moe_reorder(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
@@ -3249,8 +3427,25 @@ static void launch_mul_mat_vec_q_moe_reorder(
     dpct::queue_ptr stream,
     const int n_tokens, const size_t ids_row_stride, const size_t dst_tok_stride, const size_t src1_tok_stride) {
     const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
-    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    static const bool    dedup   = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP_REORDER", 1) != 0;
+    if (dedup && n_tokens > 1 && n_tokens * n_experts_used <= MOE_DEDUP_MAX_SLOTS) {
+        const int            rows_per_wg = GGML_SYCL_MMV_Y * MOE_REORDER_DEDUP_R;
+        const sycl::range<3> block_nums(1, (unsigned) (n_tokens * n_experts_used),
+                                        (unsigned) ((nrows + rows_per_wg - 1) / rows_per_wg));
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_reorder_dedup<reorder_vec_dot_q_sycl>(
+                        vx_base, vy, dst_base, ids_dev, ncols, nrows, n_experts_used, n_tokens,
+                        expert_weight_stride, dst_row_stride, src1_row_stride,
+                        ids_row_stride, dst_tok_stride, src1_tok_stride, item);
+                });
+        });
+        return;
+    }
+    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
