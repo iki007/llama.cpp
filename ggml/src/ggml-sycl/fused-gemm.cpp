@@ -1074,6 +1074,38 @@ static inline int fg_pack_k0(const int kq, const bool kperm, const int V) {
     return kperm ? 32 * (kq / 16) + 16 * ((kq / 8) & 1) + (kq & 7) : V * kq;
 }
 
+// 8 packed k pairs of one B column (V == 2) from the 16 floats at `in` (16-byte aligned): k-permuted, pair q holds
+// in[q] and in[q + 8]; else in[2q] and in[2q + 1]. out is pair 0 of the column, the pairs are `pitch` elements apart.
+// A work-item reads its row's 64 contiguous bytes in four vector loads, and the work-items of consecutive columns
+// write each packed row contiguously: one work-item a pair (8 bytes of 16 rows a sub-group) took 2.1x the time.
+template <typename E, typename T>
+static __dpct_inline__ void fg_pack_b8(const float * __restrict__ in, T * __restrict__ out, const size_t pitch,
+                                       const bool kperm) {
+    static_assert(sizeof(T) == 2, "two values a dword");
+    float f[16];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const sycl::float4 v = *(const sycl::float4 *) (in + 4 * i);
+        f[4 * i]     = v.x();
+        f[4 * i + 1] = v.y();
+        f[4 * i + 2] = v.z();
+        f[4 * i + 3] = v.w();
+    }
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const uint32_t lo = sycl::bit_cast<uint16_t>(E::cvt(kperm ? f[q] : f[2 * q]));
+        const uint32_t hi = sycl::bit_cast<uint16_t>(E::cvt(kperm ? f[q + 8] : f[2 * q + 1]));
+        *(uint32_t *) (out + q * pitch) = lo | (hi << 16);
+    }
+}
+
+template <typename T> static __dpct_inline__ void fg_pack_b8_zero(T * out, const size_t pitch) {
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        *(uint32_t *) (out + q * pitch) = 0;
+    }
+}
+
 // src1 f32 rows -> packed [K/V][n_tiles*BN][V], tile t holds its rows [n0, n1) at columns t*BN..,
 // zero past n1. The column runs fastest so a sub-group writes one contiguous run.
 template <typename S>
@@ -1083,6 +1115,25 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
     constexpr int V = S::VNNI;
     const int kqs   = K / V;
     const int kd    = kperm ? 8 : 1;
+    if constexpr (V == 2) {
+        if (K % 16 == 0 && (uintptr_t) y % 16 == 0) {
+            const int kbs = K / 16;
+            stream->parallel_for(sycl::range<1>((size_t) Npad * kbs), [=](sycl::id<1> id) {
+                const size_t                      idx  = id[0];
+                const int                         kb   = idx / Npad;
+                const int                         n    = idx - (size_t) kb * Npad;
+                const ggml_sycl_grouped_gemm_tile tile = tiles[n / S::BN];
+                const int                         row  = tile.n0 + n % S::BN;
+                typename S::tsb * out = packed + ((size_t) (8 * kb) * Npad + n) * V;
+                if (row < tile.n1) {
+                    fg_pack_b8<E>(y + (size_t) row * K + 16 * kb, out, (size_t) Npad * V, kperm);
+                } else {
+                    fg_pack_b8_zero(out, (size_t) Npad * V);
+                }
+            });
+            return;
+        }
+    }
     stream->parallel_for(sycl::range<1>((size_t) Npad * kqs), [=](sycl::id<1> id) {
         const size_t                      idx  = id[0];
         const int                         kq   = idx / Npad;
@@ -1466,28 +1517,54 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
         const bool kperm = fg_grouped_kperm<S>(src0_type, reordered, src0_base, expert_stride, packed, (int) M, Npad,
                                                (int) K);
         const int kd = kperm ? 8 : 1;
-        stream->parallel_for(sycl::range<1>((size_t) Npad * (K / V)), [=](sycl::id<1> id) {
-            const size_t idx = id[0];
-            const int kq = idx / Npad;
-            const int n = idx - (size_t) kq * Npad;
-            const ggml_sycl_grouped_gemm_tile tile = tile_ptr[n / S::BN];
-            const int row = tile.n0 + n % S::BN;
-            typename S::tsb vals[V] = {};
-            if (row < tile.n1) {
-                const mmid_row_mapping mapping = src1.map[row];
-                const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) +
-                                   fg_pack_k0(kq, kperm, V);
+        // a run of 16 k (8 packed pairs) a work-item where the rows allow 16-byte loads, else one pair
+        bool packed16 = false;
+        if constexpr (V == 2) {
+            if (K % 16 == 0 && (uintptr_t) src1.base % 16 == 0 && src1.nb1 % 16 == 0 && src1.nb2 % 16 == 0) {
+                packed16 = true;
+                const int kbs = (int) K / 16;
+                stream->parallel_for(sycl::range<1>((size_t) Npad * kbs), [=](sycl::id<1> id) {
+                    const size_t                      idx  = id[0];
+                    const int                         kb   = idx / Npad;
+                    const int                         n    = idx - (size_t) kb * Npad;
+                    const ggml_sycl_grouped_gemm_tile tile = tile_ptr[n / S::BN];
+                    const int                         row  = tile.n0 + n % S::BN;
+                    typename S::tsb *                 out  = packed + ((size_t) (8 * kb) * Npad + n) * V;
+                    if (row < tile.n1) {
+                        const mmid_row_mapping mapping = src1.map[row];
+                        const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 +
+                                                            mapping.i2 * src1.nb2) + 16 * kb;
+                        fg_pack_b8<E>(in, out, (size_t) Npad * V, kperm);
+                    } else {
+                        fg_pack_b8_zero(out, (size_t) Npad * V);
+                    }
+                });
+            }
+        }
+        if (!packed16) {
+            stream->parallel_for(sycl::range<1>((size_t) Npad * (K / V)), [=](sycl::id<1> id) {
+                const size_t idx = id[0];
+                const int kq = idx / Npad;
+                const int n = idx - (size_t) kq * Npad;
+                const ggml_sycl_grouped_gemm_tile tile = tile_ptr[n / S::BN];
+                const int row = tile.n0 + n % S::BN;
+                typename S::tsb vals[V] = {};
+                if (row < tile.n1) {
+                    const mmid_row_mapping mapping = src1.map[row];
+                    const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) +
+                                       fg_pack_k0(kq, kperm, V);
+#pragma unroll
+                    for (int v = 0; v < V; ++v) {
+                        vals[v] = E::cvt(in[v * kd]);
+                    }
+                }
+                typename S::tsb * out = packed + ((size_t) kq * Npad + n) * V;
 #pragma unroll
                 for (int v = 0; v < V; ++v) {
-                    vals[v] = E::cvt(in[v * kd]);
+                    out[v] = vals[v];
                 }
-            }
-            typename S::tsb * out = packed + ((size_t) kq * Npad + n) * V;
-#pragma unroll
-            for (int v = 0; v < V; ++v) {
-                out[v] = vals[v];
-            }
-        });
+            });
+        }
         const int64_t groups_m = (M + S::SG_ROWS - 1) / S::SG_ROWS;
         return fg_visit_type(src0_type, reordered, [&](auto tag) {
             using T = decltype(tag);
