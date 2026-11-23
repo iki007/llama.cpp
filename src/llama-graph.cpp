@@ -4345,12 +4345,16 @@ void llm_graph_context::build_conv_state_store(
     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
     const int64_t Kw = std::min(n, K);
 
-    // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
-    // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
-    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
-    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
-    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
-    cb(s_slot_rev, "s_slot_rev", -1);
+    // the slot order {K-1, ..., 0}, built once a graph (three launches per conv layer before), of which each layer
+    // takes its tail {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
+    if (conv_slot_rev == nullptr) {
+        ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+        s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+        s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+        cb(s_slot_rev, "s_slot_rev", -1);
+        conv_slot_rev = s_slot_rev;
+    }
+    ggml_tensor * s_slot_rev = conv_slot_rev;
 
     ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
 
