@@ -2025,7 +2025,10 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
-void llama_kv_cache::set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const {
+// seq_only: a cell without the slice's sequence also gets LLAMA_REL_POS_EMPTY, so that the positions alone give the
+// causal mask of a one-sequence ubatch (llm_graph_input_mem_hybrid_iswa_rel::mask_dev); its bin does not matter, the
+// mask hides the cell either way
+void llama_kv_cache::set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, bool seq_only) const {
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     const int64_t n_slice = dst->ne[1];
     const int64_t n_tps   = ubatch->n_tokens / n_slice;
@@ -2035,12 +2038,14 @@ void llama_kv_cache::set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tens
     std::vector<float> data(dst->ne[0]*n_slice);
     for (int64_t s = 0; s < n_slice; ++s) {
         // the tokens of a slice share one stream
-        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[s*n_tps][0]));
+        const llama_seq_id seq = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = v_cells.at(seq_to_stream.at(seq));
         const int32_t * list = rows ? (const int32_t *) rows->data + s*n_kv : nullptr;
         float * row = data.data() + s*dst->ne[0];
         for (int64_t j = 0; j < n_kv; ++j) {
             const int64_t cell = list ? list[j] : j;
-            row[j] = cell < 0 || cells.is_empty(cell) ? LLAMA_REL_POS_EMPTY : (float) cells.pos_get(cell);
+            row[j] = cell < 0 || cells.is_empty(cell) || (seq_only && !cells.seq_has(cell, seq)) ? LLAMA_REL_POS_EMPTY
+                                                                                                 : (float) cells.pos_get(cell);
         }
         for (int64_t i = 0; i < n_tps; ++i) {
             row[n_kv + i] = (float) ubatch->pos[s*n_tps + i];
@@ -3156,8 +3161,8 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const ggm
     kv->set_input_relative_pos(dst, rows, ubatch, extent);
 }
 
-void llama_kv_cache_context::set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch) const {
-    kv->set_input_rel_pos_packed(dst, rows, ubatch);
+void llama_kv_cache_context::set_input_rel_pos_packed(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, bool seq_only) const {
+    kv->set_input_rel_pos_packed(dst, rows, ubatch, seq_only);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
