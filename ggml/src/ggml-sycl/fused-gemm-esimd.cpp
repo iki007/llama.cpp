@@ -907,7 +907,12 @@ template <int MR> struct grouped_gemm_esimd_a<block_iq3_xxs, MR> {
 // T is the dpas operand type, sycl::half or bfloat16: the type B is packed in. A is decoded in half
 // either way and converted for bf16 (see the double rounding note at the conversion). AOS: the weight
 // is in the canonical block layout rather than the reorder (SoA) one. A: the grouped_gemm_arch built for.
-template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct grouped_gemm_esimd_kernel {
+// PAIR: a thread takes two consecutive tiles of one expert (64 columns), so each stored block of its rows is
+// decoded once for both: an even tile also takes the next tile when that is its expert's, an odd tile runs
+// alone only when the tile before it is another expert's (otherwise that tile's thread has it). Every tile
+// is computed once. The tiles of an expert are consecutive in the route map and in the packed B, so the
+// pair's columns are those of one 64-wide tile; the column groups past the pair's last column are skipped.
+template <typename block_q_t, int KS, typename T, bool AOS, typename A, bool PAIR = false> struct grouped_gemm_esimd_kernel {
     using F = grouped_gemm_esimd_a<block_q_t, A::MR>;
 
     const char *              src0_dd;
@@ -919,6 +924,7 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
     int                       Npad;
     int                       K;
     ggml_sycl_grouped_gemm_rows         dst_rows;
+    int                       n_tiles = 0; // entries of tiles (PAIR reads the next one)
 
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         if constexpr (grouped_gemm_built<A>()) {
@@ -933,8 +939,9 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
         constexpr int NW = A::NW;
         constexpr int RC = GROUPED_GEMM_RC;
         constexpr int RG = MR / RC; // dpas row groups of this thread
-        constexpr int BN = GGML_SYCL_GROUPED_GEMM_BN;
-        constexpr int NT = BN / NW;
+        constexpr int BN1 = GGML_SYCL_GROUPED_GEMM_BN;   // the columns of one schedule tile
+        constexpr int BN  = PAIR ? 2 * BN1 : BN1;        // the columns of one thread
+        constexpr int NT  = BN / NW;
 
         if constexpr (F::slm_bytes > 0) {
             // the format's lookup table; a work-group is one thread, so nothing else writes it
@@ -951,7 +958,22 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
         if (tile.n1 <= tile.n0) {
             return;
         }
-        const int b0 = t * BN; // the tile's packed-B columns
+        int ncols = tile.n1 - tile.n0;
+        if constexpr (PAIR) {
+            if (t % 2 == 1) {
+                if (tiles[t - 1].expert == tile.expert) {
+                    return;
+                }
+            } else if (t + 1 < n_tiles) {
+                const ggml_sycl_grouped_gemm_tile nx = tiles[t + 1];
+                if (nx.expert == tile.expert && nx.n1 > nx.n0) {
+                    ncols += nx.n1 - nx.n0;
+                }
+            }
+        }
+        // the column groups of NW that hold columns (all of them without PAIR)
+        const int nt_live = PAIR ? (ncols + NW - 1) / NW : NT;
+        const int b0 = t * BN1; // the tile's packed-B columns
 
         // the slice of this expert
         const int             bpr = K / F::qk;
@@ -983,7 +1005,6 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
 
         // The tile's route map, gathered once up front; the K loop hides its latency, and the epilogue
         // below reads it at compile-time indices.
-        const int          ncols = tile.n1 - tile.n0;
         simd_mask<BN>      cm    = simd<int32_t, BN>(0, 1) < ncols;
         simd<int32_t, BN>  i2 = 0, r1 = 0; // r1: the dst row slot, i1 % ne1
         if (dst_rows.map) {
@@ -1020,7 +1041,9 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
             if constexpr (A::L2D) {
 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
-                    b[nt] = load_2d<uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW, kb * 16);
+                    if (!PAIR || nt < nt_live) {
+                        b[nt] = load_2d<uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW, kb * 16);
+                    }
                 }
             } else {
                 simd<uint32_t, 16 * BN> bm;
@@ -1066,9 +1089,11 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
                     }
 #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) {
-                        simd<uint32_t, 8 * NW> bh32 = b[nt].template select<8 * NW, 1>(h * 8 * NW);
-                        simd<T, 16 * NW>       bh   = bh32.template bit_cast_view<T>();
-                        acc[g][nt] = xmx::dpas<8, RC, float, float>(acc[g][nt], bh, at);
+                        if (!PAIR || nt < nt_live) {
+                            simd<uint32_t, 8 * NW> bh32 = b[nt].template select<8 * NW, 1>(h * 8 * NW);
+                            simd<T, 16 * NW>       bh   = bh32.template bit_cast_view<T>();
+                            acc[g][nt] = xmx::dpas<8, RC, float, float>(acc[g][nt], bh, at);
+                        }
                     }
                 }
             };
@@ -1152,6 +1177,26 @@ static void grouped_gemm_esimd_launch(const char *                        src0_d
                                       const ggml_sycl_grouped_gemm_rows & dst_rows,
                                       int64_t                             n_tiles,
                                       dpct::queue_ptr                     stream) {
+    // GGML_SYCL_GROUPED_GEMM_PAIR (NVFP4, 2D loads): 1 pairs of tiles with the arch's rows a thread, 2 with 16
+    // rows (half the accumulators), 0 off
+    static const int pair = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM_PAIR", 1);
+    if constexpr (A::L2D && std::is_same_v<block_q_t, block_nvfp4>) {
+        if (pair != 0 && ggml_sycl_grouped_gemm_esimd_mode() != 2) {
+            if (pair == 2) {
+                using A16 = grouped_gemm_arch<A::NW, 16, A::L2D>;
+                const sycl::nd_range<1> r16((size_t) n_tiles * (M / A16::MR), 1);
+                stream->parallel_for(r16, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A16, true>{
+                                              src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows,
+                                              (int) n_tiles });
+            } else {
+                const sycl::nd_range<1> r32((size_t) n_tiles * (M / A::MR), 1);
+                stream->parallel_for(r32, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A, true>{
+                                              src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows,
+                                              (int) n_tiles });
+            }
+            return;
+        }
+    }
     const sycl::nd_range<1> range((size_t) n_tiles * (M / A::MR), 1);
     if (ggml_sycl_grouped_gemm_esimd_mode() == 2) {
         stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, GGML_SYCL_GROUPED_GEMM_KSPLIT, T, AOS, A>{
