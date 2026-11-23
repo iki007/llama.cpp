@@ -65,6 +65,7 @@
 #include "ggml-sycl/depth_mix.hpp"
 #include "ggml-sycl/loop_ctrl.hpp"
 #include "ggml-sycl/moe_glue.hpp"
+#include "ggml-sycl/conv_glue.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
@@ -7570,6 +7571,21 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_op_add_scale_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i += 1;
             continue;
+        }
+
+        if (node->op == GGML_OP_CONCAT) {
+            const int store_nodes_to_skip = ggml_sycl_try_conv_store_fusion(*sycl_ctx, cgraph, i);
+            if (store_nodes_to_skip > 0) {
+                i += store_nodes_to_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_SSM_CONV) {
+            const int conv_nodes_to_skip = ggml_sycl_try_conv_glue_fusion(*sycl_ctx, cgraph, i);
+            if (conv_nodes_to_skip > 0) {
+                i += conv_nodes_to_skip;
+                continue;
+            }
         }
 
         if (node->op == GGML_OP_SSM_CONV &&
