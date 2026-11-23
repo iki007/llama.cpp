@@ -1023,16 +1023,17 @@ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t exper
                                         const ggml_sycl_grouped_gemm_tile * tiles_ptr, const typename S::tsb * packed,
                                         float * dst, const int M, const int Npad, const int K, const int64_t n_tiles,
                                         const int64_t groups_m, dpct::queue_ptr stream,
-                                        ggml_sycl_grouped_gemm_rows dst_rows = {}) {
+                                        ggml_sycl_grouped_gemm_rows dst_rows = {}, const bool kperm = false) {
     if constexpr (fg_esimd_combo<S>() && ggml_sycl_grouped_gemm_esimd_has<block_q_t>) {
         // the register-operand ESIMD kernel, either weight layout: no SLM A image (GGML_SYCL_MMID_ESIMD)
         if (ggml_sycl_grouped_gemm_esimd_enabled() &&
             ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb, S::SG>(src0_dd, expert_stride, tiles_ptr, packed,
                                                                             dst, M, Npad, K, dst_rows, reordered,
-                                                                            n_tiles, stream)) {
+                                                                            n_tiles, kperm, stream)) {
             return;
         }
     }
+    GGML_ASSERT(!kperm && "B packed k-permuted for the joint_matrix kernel");
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<typename S::tsa, 1> tile_a(FG_KSPLIT * S::SG_ROWS * FG_BK, cgh);
         sycl::local_accessor<float, 1>          tile_c(FG_KSPLIT * S::SG_ROWS * S::BN, cgh);
@@ -1051,14 +1052,37 @@ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t exper
     });
 }
 
+// Whether the grouped call is taken by the ESIMD kernel that reads B k-permuted (the NVFP4 kernel of tile
+// pairs, see ggml_sycl_grouped_gemm_esimd_kperm), decided before B is packed and passed on to the launch
+template <typename S>
+static bool fg_grouped_kperm(ggml_type src0_type, bool reordered, const void * src0, size_t expert_stride,
+                             const typename S::tsb * packed, int M, int Npad, int K) {
+    if constexpr (fg_esimd_combo<S>() && S::VNNI == 2) {
+        return src0_type == GGML_TYPE_NVFP4 &&
+               ggml_sycl_grouped_gemm_esimd_kperm<block_nvfp4, typename S::tsb, S::SG>(
+                   (const char *) src0, expert_stride, packed, M, Npad, K, reordered);
+    } else {
+        (void) src0_type; (void) reordered; (void) src0; (void) expert_stride; (void) packed; (void) M; (void) Npad;
+        (void) K;
+        return false;
+    }
+}
+
+// the first k of packed k pair kq and the distance to its second: k-permuted (kperm, V == 2), pair q of k
+// half h of a 32-k step holds k = 16h + q and 16h + q + 8; else the V consecutive k from V * kq
+static inline int fg_pack_k0(const int kq, const bool kperm, const int V) {
+    return kperm ? 32 * (kq / 16) + 16 * ((kq / 8) & 1) + (kq & 7) : V * kq;
+}
+
 // src1 f32 rows -> packed [K/V][n_tiles*BN][V], tile t holds its rows [n0, n1) at columns t*BN..,
 // zero past n1. The column runs fastest so a sub-group writes one contiguous run.
 template <typename S>
 static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const ggml_sycl_grouped_gemm_tile * tiles,
-                                int Npad, int K, dpct::queue_ptr stream) {
+                                int Npad, int K, dpct::queue_ptr stream, const bool kperm = false) {
     using E        = typename S::EB;
     constexpr int V = S::VNNI;
     const int kqs   = K / V;
+    const int kd    = kperm ? 8 : 1;
     stream->parallel_for(sycl::range<1>((size_t) Npad * kqs), [=](sycl::id<1> id) {
         const size_t                      idx  = id[0];
         const int                         kq   = idx / Npad;
@@ -1068,10 +1092,10 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
         // one guarded load run per work-item, as a per-element select costs ~1.5% prefill
         typename S::tsb vals[V] = {};
         if (row < tile.n1) {
-            const float * src = y + (size_t) row * K + V * kq;
+            const float * src = y + (size_t) row * K + fg_pack_k0(kq, kperm, V);
 #pragma unroll
             for (int v = 0; v < V; ++v) {
-                vals[v] = E::cvt(src[v]);
+                vals[v] = E::cvt(src[v * kd]);
             }
         }
         typename S::tsb * out = packed + ((size_t) kq * Npad + n) * V;
@@ -1255,7 +1279,9 @@ static bool fg_grouped_run(ggml_type src0_type, bool reordered, const void * src
         stream->memcpy(tiles_dev.get(), tiles.data(), n_tiles * sizeof(ggml_sycl_grouped_gemm_tile))));
 
     ggml_sycl_pool_alloc<typename S::tsb> packed_b(pool, (size_t) K * max_tiles * S::BN);
-    grouped_gemm_pack_b<S>(src1, packed_b.get(), tiles_dev.get(), Npad, (int) K, stream);
+    const bool kperm = fg_grouped_kperm<S>(src0_type, reordered, src0_base, expert_stride, packed_b.get(), (int) M,
+                                           Npad, (int) K);
+    grouped_gemm_pack_b<S>(src1, packed_b.get(), tiles_dev.get(), Npad, (int) K, stream, kperm);
 
     const typename S::tsb *             packed    = packed_b.get();
     const ggml_sycl_grouped_gemm_tile * tiles_ptr = tiles_dev.get();
@@ -1264,7 +1290,7 @@ static bool fg_grouped_run(ggml_type src0_type, bool reordered, const void * src
         using T = decltype(tag);
         grouped_dequant_gemm_launch<S, typename T::type, T::reordered>(src0_dd, expert_stride, tiles_ptr, packed, dst,
                                                                        (int) M, Npad, (int) K, n_tiles, groups_m,
-                                                                       stream);
+                                                                       stream, {}, kperm);
     });
 }
 
@@ -1437,6 +1463,9 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
         typename S::tsb * packed = packed_b.get();
         using E = typename S::EB;
         constexpr int V = S::VNNI;
+        const bool kperm = fg_grouped_kperm<S>(src0_type, reordered, src0_base, expert_stride, packed, (int) M, Npad,
+                                               (int) K);
+        const int kd = kperm ? 8 : 1;
         stream->parallel_for(sycl::range<1>((size_t) Npad * (K / V)), [=](sycl::id<1> id) {
             const size_t idx = id[0];
             const int kq = idx / Npad;
@@ -1446,10 +1475,11 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
             typename S::tsb vals[V] = {};
             if (row < tile.n1) {
                 const mmid_row_mapping mapping = src1.map[row];
-                const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) + V * kq;
+                const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) +
+                                   fg_pack_k0(kq, kperm, V);
 #pragma unroll
                 for (int v = 0; v < V; ++v) {
-                    vals[v] = E::cvt(in[v]);
+                    vals[v] = E::cvt(in[v * kd]);
                 }
             }
             typename S::tsb * out = packed + ((size_t) kq * Npad + n) * V;
@@ -1462,7 +1492,7 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
         return fg_visit_type(src0_type, reordered, [&](auto tag) {
             using T = decltype(tag);
             grouped_dequant_gemm_launch<S, typename T::type, T::reordered>((const char *) src0_base, expert_stride,
-                tile_ptr, packed, (float *) dst.base, (int) M, Npad, (int) K, max_tiles, groups_m, stream, dst);
+                tile_ptr, packed, (float *) dst.base, (int) M, Npad, (int) K, max_tiles, groups_m, stream, dst, kperm);
         });
     }
 }
