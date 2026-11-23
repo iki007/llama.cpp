@@ -4835,6 +4835,41 @@ struct test_loop_ctrl : public test_case {
     }
 };
 
+// Several mat-muls that read the same input (a layer's projections), out = concat of their outputs: a backend may
+// quantize the shared input once
+struct test_mul_mat_shared : public test_case {
+    const ggml_type type;
+    const int64_t   k;
+    const int64_t   n;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override { return VARS_TO_STR3(type, k, n); }
+
+    test_mul_mat_shared(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 256, int64_t n = 4) : type(type), k(k), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        const int64_t rows[3] = { 96, 32, 64 };
+        ggml_tensor * out = nullptr;
+        for (int i = 2; i >= 0; --i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, rows[i]);
+            ggml_tensor * m = ggml_mul_mat(ctx, w, x);
+            out = out ? ggml_concat(ctx, m, out, 0) : m;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling's short convolution with a residual: (cur + ssm_conv(x, w)) * s, the chain backends may fuse
 struct test_conv_residual : public test_case {
     const int64_t n_ch;
@@ -11455,6 +11490,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // mat-muls sharing their input (a verify batch of 4 columns and one token)
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        test_cases.emplace_back(new test_mul_mat_shared(type, 2304, 4));
+        test_cases.emplace_back(new test_mul_mat_shared(type, 2304, 1));
     }
 
     // short convolution with a residual (Inkling)

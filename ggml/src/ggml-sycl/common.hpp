@@ -574,6 +574,30 @@ struct ggml_backend_sycl_context {
     // pool
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];
 
+    // the q8_1 copies of the last few mat-mul inputs of this graph run (ggml_sycl_op_mul_mat): several projections
+    // of a layer read the same input; a copy is reused only within one graph run (epoch) for the same tensor, data
+    // and layout. The buffers live with the context.
+    struct q8_cache_entry {
+        const ggml_tensor * src1   = nullptr;
+        const void *        data   = nullptr;
+        int64_t             ne10   = 0, nrows1 = 0, padded = 0;
+        int                 fmt    = -1;
+        uint64_t            epoch  = 0, used = 0;
+        char *              buf    = nullptr;
+        size_t              size   = 0;
+        sycl::queue *       q      = nullptr;
+        ~q8_cache_entry() {
+            if (buf != nullptr) {
+                sycl::free(buf, *q);
+            }
+        }
+    };
+    static constexpr int q8_cache_n = 4;
+    q8_cache_entry       q8_cache[q8_cache_n];
+    uint64_t             q8_cache_epoch = 1;
+    uint64_t             q8_cache_tick  = 0;
+    bool                 q8_cache_recording = false;  // off while a SYCL graph records: the graph keeps the buffers it saw
+
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
     std::vector<mmid_row_mapping> mmid_row_mapping_host;

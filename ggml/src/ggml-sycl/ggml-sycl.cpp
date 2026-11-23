@@ -4320,6 +4320,58 @@ static void ggml_sycl_set_peer_access(const int n_tokens, [[maybe_unused]] int m
     peer_access_enabled = enable_peer_access;
 }
 
+// The q8_1 copy of src1 for a mat-mul: reused from ctx.q8_cache when an earlier mat-mul of the same graph run
+// quantized the same tensor (same data, shape and layout) — the Q, K, V, gate and rel projections of a layer read
+// one or a few inputs. The input is still unread by this node, so the allocator kept its memory: the copy is
+// current. Small batches only (decode and verify), so the buffers stay small. GGML_SYCL_Q8_CACHE=0 turns it off.
+template <template <int> typename quantize_f>
+static char * ggml_sycl_src1_q8_cached(ggml_backend_sycl_context & ctx, const ggml_tensor * src1, const float * src1_ddf,
+                                       int64_t ne10, int64_t nrows1, int64_t padded, size_t bytes, queue_ptr stream) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_Q8_CACHE", 1) != 0;
+    if (!enabled || nrows1 > 64 || ctx.q8_cache_recording) {
+        return nullptr;
+    }
+    const int fmt = std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>, quantize_and_reorder_q8_1_soa<QK8_1 / WARP_SIZE>> ? 1 : 0;
+    auto & c = ctx.q8_cache;
+    for (auto & e : c) {
+        if (e.epoch == ctx.q8_cache_epoch && e.src1 == src1 && e.data == src1->data && e.ne10 == ne10 &&
+            e.nrows1 == nrows1 && e.padded == padded && e.fmt == fmt) {
+            e.used = ++ctx.q8_cache_tick;
+            return e.buf;
+        }
+    }
+    // the least recently used entry takes it
+    auto * v = &c[0];
+    for (auto & e : c) {
+        if (e.used < v->used) {
+            v = &e;
+        }
+    }
+    if (v->size < bytes) {
+        if (v->buf != nullptr) {
+            stream->wait();
+            sycl::free(v->buf, *v->q);
+        }
+        v->q    = stream;
+        v->buf  = (char *) sycl::malloc_device(bytes, *stream);
+        v->size = v->buf ? bytes : 0;
+        if (v->buf == nullptr) {
+            v->epoch = 0;
+            return nullptr;
+        }
+    }
+    quantize_row_q8_1_sycl<quantize_f>(src1_ddf, v->buf, ne10, nrows1, padded, stream);
+    v->src1   = src1;
+    v->data   = src1->data;
+    v->ne10   = ne10;
+    v->nrows1 = nrows1;
+    v->padded = padded;
+    v->fmt    = fmt;
+    v->epoch  = ctx.q8_cache_epoch;
+    v->used   = ++ctx.q8_cache_tick;
+    return v->buf;
+}
+
 template <template <int> typename quantize_f>
 static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                  const ggml_tensor *src1, ggml_tensor *dst,
@@ -4445,9 +4497,14 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            char * cached = nullptr;
+            if (!split && src1_on_device && src1_is_contiguous) {
+                cached = ggml_sycl_src1_q8_cached<quantize_f>(ctx, src1, dev[i].src1_ddf, ne10, nrows1, src1_padded_col_size,
+                                                              nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs, stream);
+            }
+            dev[i].src1_ddq = cached ? cached : dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
 
-            if (src1_on_device && src1_is_contiguous) {
+            if (cached == nullptr && src1_on_device && src1_is_contiguous) {
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
@@ -7848,6 +7905,8 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    // a new graph run: no q8_1 copy of an input carries over (the same tensors hold new data)
+    ++sycl_ctx->q8_cache_epoch;
 
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()
@@ -7918,7 +7977,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
 
                 model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+                sycl_ctx->q8_cache_recording = true;
                 ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+                sycl_ctx->q8_cache_recording = false;
                 model_sycl_graph.end_recording();
 
                 if (!graph->exec_graph || !graph_update_support) {
