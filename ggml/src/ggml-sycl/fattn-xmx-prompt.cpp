@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstring>
+#include <type_traits>
 
 #include "convert.hpp"
 #include "fattn-common.hpp"
@@ -21,6 +22,11 @@
 // Block classes (one pre-pass a call, [n_q][n_blk]): XP_DEAD = the mask is -inf for the whole block (skipped),
 // >= 0 = the mask is 0 and every key has that bin (one bias value a row: at depth, every key past the relative extent
 // has the last bin), XP_MIXED = mask and bias per token.
+//
+// A q8_0 cache (Q8) is read in place: all 16 threads share each block, so dequantizing it in every thread would cost
+// ~2x the DPAS time in ALU work. Instead each thread dequantizes one q8_0 block (32 dims) of 16 tokens of K and of V,
+// once a work-group, into SLM as the B operands the f16 path loads (two 32 KB buffers: block b + 1 is written while
+// block b is read, one barrier a block), and every thread reads its operands from SLM.
 
 namespace {
 
@@ -65,6 +71,10 @@ struct xp_args {
     // is global block kv_blk0 (classes, mask, bias), it continues the rows of the earlier chunks (cont) and always
     // leaves partial rows (part_always) for xp_merge
     int                n_blk_loc, kv_blk0, cont, part_always;
+    // a q8_0 cache read in place: per KV head, bytes added to the base (head-major) or dwords added to the 2D x offset
+    // (heads interleaved in the token row), as fattn-xmx-dec.cpp
+    size_t             k_hb, v_hb;
+    int                k_hx, v_hx;
 };
 
 template <typename F> struct xp_grf256 {
@@ -100,10 +110,18 @@ ESIMD_INLINE esimd::simd<float, 8> xp_row_sum(esimd::simd<float, 128> p) {
     return s2.select<8, 2>(0) + s2.select<8, 2>(1);
 }
 
-template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_item<1> & it) {
+template <int D, bool Q8> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_item<1> & it) {
     using namespace esimd;
     constexpr int KS = D / 16;      // k-steps of a score, dim groups of O
     constexpr int NB = XP_BK / 16;  // 16-token groups of a block
+    // Q8 SLM: per buffer the K tiles [n][ks] then the V tiles [n][dg], each one 16 x 16 f16 B operand
+    constexpr uint32_t XQ_TILE = 512;
+    constexpr uint32_t XQ_V    = NB * KS * XQ_TILE;
+    constexpr uint32_t XQ_BUF  = 2 * XQ_V;
+    static_assert(!Q8 || NB * (D / 32) == XP_NT, "a thread dequantizes one q8_0 block of 16 tokens");
+    if constexpr (Q8) {
+        slm_init<2 * XQ_BUF>();
+    }
 
     const int t     = (int) it.get_local_id(0);
     const int wg    = (int) it.get_group(0);
@@ -111,7 +129,8 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
     const int split = (wg / a.n_wg_kvh) % a.nsplit;
     const int kvh   = wg / (a.n_wg_kvh * a.nsplit);
     const int rgi   = chunk * XP_NT + t;
-    if (rgi >= a.n_rg) {
+    // Q8: a thread without rows still dequantizes its share and joins the barriers (its rows are all invalid)
+    if (!Q8 && rgi >= a.n_rg) {
         return;
     }
     const int M = a.nq * a.g;
@@ -163,6 +182,75 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
     // V: one VNNI-transformed load of 32 tokens x 2 blocks of 16 dims = four B operands
     esimd_x::config_2d_mem_access<sycl::half, 16, 32, 2> v_desc(Vh, surf_w, surf_h, (unsigned) a.v_nb1 - 1, 0, 0);
 
+    // Q8: thread t dequantizes q8_0 block qj (dims 32 qj..32 qj + 31, 34 bytes at byte 34 qj of the head row) of the
+    // 16 tokens qn of a block. Its 2D dword loads start at the dword holding the block's scale, which is at byte 0
+    // (even block) or 2 (odd block) of that dword: K as [9 dwords][16 tokens] (transposed, so a dim pair of the 16
+    // tokens is a strided byte region of one dword row, already the VNNI B layout), V as [16 tokens][16 dwords]
+    const int        qn  = t >> 2;
+    const int        qj  = t & 3;
+    const uint32_t * Kq  = (const uint32_t *) ((const char *) a.K + (size_t) kvh * a.k_hb);
+    const uint32_t * Vq  = (const uint32_t *) ((const char *) a.V + (size_t) kvh * a.v_hb);
+    const int        qkx = kvh * a.k_hx + 34 * qj / 4;
+    const int        qvx = kvh * a.v_hx + 34 * qj / 4;
+    esimd_x::config_2d_mem_access<uint32_t, 8, 16, 1>  kq8_desc(Kq, (unsigned) a.k_nb1 - 1, surf_h, (unsigned) a.k_nb1 - 1, qkx, 0);
+    esimd_x::config_2d_mem_access<uint32_t, 1, 16, 1>  kq1_desc(Kq, (unsigned) a.k_nb1 - 1, surf_h, (unsigned) a.k_nb1 - 1, qkx + 8, 0);
+    esimd_x::config_2d_mem_access<uint32_t, 16, 16, 1> vq_desc(Vq, (unsigned) a.v_nb1 - 1, surf_h, (unsigned) a.v_nb1 - 1, qvx, 0);
+    simd<uint32_t, 9 * 16>  kw;  // this thread's K window of the block to dequantize next
+    simd<uint32_t, 16 * 16> vw;  // and its V window
+    auto q8_load = [&](int b) {
+        const int y = b * XP_BK + 16 * qn;
+        kq8_desc.set_y(y);
+        kq1_desc.set_y(y);
+        vq_desc.set_y(y);
+        kw.template select<128, 1>(0)  = esimd_x::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(kq8_desc);
+        kw.template select<16, 1>(128) = esimd_x::lsc_load_2d<uint32_t, 1, 16, 1, true, false>(kq1_desc);
+        vw                             = esimd_x::lsc_load_2d<uint32_t, 16, 16, 1, false, false>(vq_desc);
+    };
+    // dequantized like the f16 copy (dequantize_q8_0: f16(int8) * f16 scale, the exact int8 rounded once by the
+    // product), so the B operands equal the f16 path's bit for bit; ODD: the scale at byte 2 of the first dword
+    auto q8_store_t = [&](int b, auto odd) {
+        constexpr int  O    = decltype(odd)::value ? 2 : 0;
+        const uint32_t base = (uint32_t) (b & 1) * XQ_BUF + (uint32_t) (qn * KS + 2 * qj) * XQ_TILE;
+        // K: tile c2 = dim pairs 8 c2..8 c2 + 7 of the block, a pair = bytes O + 2 + 2p of the 16 tokens
+        auto                       kh = kw.template bit_cast_view<sycl::half>();
+        auto                       kb = kw.template bit_cast_view<int8_t, 9 * 16, 4>();
+        const simd<sycl::half, 16> kd = kh.template select<16, 2>(O / 2);
+        const simd<sycl::half, 32> kr = kd.template replicate_vs_w_hs<16, 1, 2, 0>(0);
+#pragma unroll
+        for (int c2 = 0; c2 < 2; ++c2) {
+            simd<sycl::half, 256> bt;
+#pragma unroll
+            for (int kp = 0; kp < 8; ++kp) {
+                const int              byte = O + 2 + 2 * (8 * c2 + kp);
+                const simd<int8_t, 32> qv   = kb.template select<16, 1, 2, 1>((byte / 4) * 16, byte % 4);
+                bt.template select<32, 1>(32 * kp) = convert<sycl::half>(qv) * kr;
+            }
+            slm_block_store<sycl::half, 256>(base + c2 * XQ_TILE, bt);
+        }
+        // V: [16 tokens][32 dims] from byte O + 2 of each row, then token pairs interleaved into the VNNI layout
+        auto                       vb8 = vw.template bit_cast_view<int8_t, 16, 64>();
+        auto                       vh  = vw.template bit_cast_view<sycl::half, 16, 32>();
+        const simd<int8_t, 512>    vq  = vb8.template select<16, 1, 32, 1>(0, O + 2);
+        const simd<sycl::half, 16> vd  = vh.template select<16, 1, 1, 1>(0, O / 2);
+        simd<sycl::half, 512>      hv  = convert<sycl::half>(vq) * vd.template replicate_vs_w_hs<16, 1, 32, 0>(0);
+        auto                       hv2 = hv.template bit_cast_view<sycl::half, 16, 32>();
+#pragma unroll
+        for (int c2 = 0; c2 < 2; ++c2) {
+            simd<sycl::half, 256> vt;
+            auto                  vt2 = vt.template bit_cast_view<sycl::half, 8, 32>();
+            vt2.template select<8, 1, 16, 2>(0, 0) = hv2.template select<8, 2, 16, 1>(0, 16 * c2);
+            vt2.template select<8, 1, 16, 2>(0, 1) = hv2.template select<8, 2, 16, 1>(1, 16 * c2);
+            slm_block_store<sycl::half, 256>(base + XQ_V + c2 * XQ_TILE, vt);
+        }
+    };
+    auto q8_store = [&](int b) {
+        if (qj & 1) {
+            q8_store_t(b, std::true_type{});
+        } else {
+            q8_store_t(b, std::false_type{});
+        }
+    };
+
     simd<float, 8>       m = -FLT_MAX;  // running row max (log2 domain)
     simd<float, 8>       l = 0.0f;      // running row sum
     simd<float, KS * 128> o = 0.0f;     // [dim group][8 rows][16 dims]
@@ -198,7 +286,22 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
 
     const int b0 = split * a.bps;
     const int b1 = b0 + a.bps < a.n_blk_loc ? b0 + a.bps : a.n_blk_loc;
+    if constexpr (Q8) {
+        if (b0 < b1) {
+            q8_load(b0);
+        }
+    }
     for (int b = b0; b < b1; ++b) {
+        if constexpr (Q8) {
+            // block b to SLM buffer b & 1, whose last readers (block b - 2) all passed the barrier of block b - 1; the
+            // load of block b + 1 runs during the barrier and the compute of block b. Every thread takes part in every
+            // block, also one dead for its rows
+            q8_store(b);
+            if (b + 1 < b1) {
+                q8_load(b + 1);
+            }
+            barrier();
+        }
         simd<int32_t, 8> cl = gather<int32_t, 8>(a.cls, cls_off + (uint32_t) (b + a.kv_blk0) * 4u);
         cl.merge(simd<int32_t, 8>(XP_DEAD), !valid);
         if ((cl == XP_DEAD).all()) {
@@ -206,7 +309,7 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
         }
         const int tok0  = b * XP_BK;                // in this launch's K / V
         const int gtok0 = (b + a.kv_blk0) * XP_BK;  // in the mask and the bias indices
-        if (a.prefetch && b + 1 < b1) {
+        if (!Q8 && a.prefetch && b + 1 < b1) {
             // 16 tiles: K or V (t / 8), 64-byte column (t % 4), 32-token half of the block ((t / 4) % 2)
             const int part = t & 7;
             esimd_x::lsc_prefetch_2d<uint32_t, 16, 32, 1, cache_hint::cached, cache_hint::cached>(
@@ -216,21 +319,35 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
 
         // S = Q K^T
         simd<float, NB * 128> s = 0.0f;
+        const uint32_t        xq = (uint32_t) (b & 1) * XQ_BUF;  // Q8: this block's SLM buffer
+        if constexpr (Q8) {
+            // the same DPAS sequence as the f16 loads below: per 16-token group, k-steps in order
 #pragma unroll
-        for (int n2 = 0; n2 < NB / 2; ++n2) {
-            k_desc.set_y(tok0 + 32 * n2);
+            for (int n = 0; n < NB; ++n) {
 #pragma unroll
-            for (int ks = 0; ks < KS; ++ks) {
-                k_desc.set_x(ks * 8);
-                simd<uint32_t, 256> kb = esimd_x::lsc_load_2d<uint32_t, 8, 32, 1, true, false>(k_desc);
-                auto                k2 = kb.template bit_cast_view<uint32_t, 8, 32>();
-#pragma unroll
-                for (int c = 0; c < 2; ++c) {
-                    const int           n  = 2 * n2 + c;
-                    simd<uint32_t, 128> bk = k2.template select<8, 1, 16, 1>(0, 16 * c);
+                for (int ks = 0; ks < KS; ++ks) {
+                    const simd<sycl::half, 256> bk = slm_block_load<sycl::half, 256>(xq + (uint32_t) (n * KS + ks) * XQ_TILE);
                     s.template select<128, 1>(128 * n) = xmx::dpas<8, 8, float, float>(
-                        simd<float, 128>(s.template select<128, 1>(128 * n)), bk.template bit_cast_view<sycl::half>().read(),
-                        simd<sycl::half, 128>(qa.template select<128, 1>(128 * ks)));
+                        simd<float, 128>(s.template select<128, 1>(128 * n)), bk, simd<sycl::half, 128>(qa.template select<128, 1>(128 * ks)));
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n2 = 0; n2 < NB / 2; ++n2) {
+                k_desc.set_y(tok0 + 32 * n2);
+#pragma unroll
+                for (int ks = 0; ks < KS; ++ks) {
+                    k_desc.set_x(ks * 8);
+                    simd<uint32_t, 256> kb = esimd_x::lsc_load_2d<uint32_t, 8, 32, 1, true, false>(k_desc);
+                    auto                k2 = kb.template bit_cast_view<uint32_t, 8, 32>();
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const int           n  = 2 * n2 + c;
+                        simd<uint32_t, 128> bk = k2.template select<8, 1, 16, 1>(0, 16 * c);
+                        s.template select<128, 1>(128 * n) = xmx::dpas<8, 8, float, float>(
+                            simd<float, 128>(s.template select<128, 1>(128 * n)), bk.template bit_cast_view<sycl::half>().read(),
+                            simd<sycl::half, 128>(qa.template select<128, 1>(128 * ks)));
+                    }
                 }
             }
         }
@@ -313,23 +430,40 @@ template <int D> ESIMD_INLINE void xp_kernel(const xp_args & a, const sycl::nd_i
             o.template select<128, 1>(128 * dg) *= arep;
         }
 
-        // O += P V; a load's block c holds dims 32 dg2 + 16 c, its tokens 0..15 then 16..31 (each 256 halves)
+        // O += P V; Q8: tile (n, dg) of SLM, in the order of the f16 path (per dim group: tokens 0..15 then 16..31 of
+        // each 32-token pair); f16: a load's block c holds dims 32 dg2 + 16 c, its tokens 0..15 then 16..31 (each 256
+        // halves)
+        if constexpr (Q8) {
 #pragma unroll
-        for (int n2 = 0; n2 < NB / 2; ++n2) {
-            const simd<sycl::half, 128> pa0 = convert<sycl::half>(simd<float, 128>(s.template select<128, 1>(128 * (2 * n2))));
-            const simd<sycl::half, 128> pa1 = convert<sycl::half>(simd<float, 128>(s.template select<128, 1>(128 * (2 * n2 + 1))));
-            v_desc.set_y(tok0 + 32 * n2);
+            for (int n2 = 0; n2 < NB / 2; ++n2) {
+                const simd<sycl::half, 128> pa0 = convert<sycl::half>(simd<float, 128>(s.template select<128, 1>(128 * (2 * n2))));
+                const simd<sycl::half, 128> pa1 = convert<sycl::half>(simd<float, 128>(s.template select<128, 1>(128 * (2 * n2 + 1))));
 #pragma unroll
-            for (int dg2 = 0; dg2 < KS / 2; ++dg2) {
-                v_desc.set_x(32 * dg2);
-                simd<sycl::half, 1024> vb = esimd_x::lsc_load_2d<sycl::half, 16, 32, 2, false, true>(v_desc);
+                for (int dg = 0; dg < KS; ++dg) {
+                    const simd<sycl::half, 256> vb0 = slm_block_load<sycl::half, 256>(xq + XQ_V + (uint32_t) (2 * n2 * KS + dg) * XQ_TILE);
+                    const simd<sycl::half, 256> vb1 = slm_block_load<sycl::half, 256>(xq + XQ_V + (uint32_t) ((2 * n2 + 1) * KS + dg) * XQ_TILE);
+                    o.template select<128, 1>(128 * dg) = xmx::dpas<8, 8, float, float>(simd<float, 128>(o.template select<128, 1>(128 * dg)), vb0, pa0);
+                    o.template select<128, 1>(128 * dg) = xmx::dpas<8, 8, float, float>(simd<float, 128>(o.template select<128, 1>(128 * dg)), vb1, pa1);
+                }
+            }
+        } else {
 #pragma unroll
-                for (int c = 0; c < 2; ++c) {
-                    const int dg = 2 * dg2 + c;
-                    o.template select<128, 1>(128 * dg) = xmx::dpas<8, 8, float, float>(
-                        simd<float, 128>(o.template select<128, 1>(128 * dg)), simd<sycl::half, 256>(vb.template select<256, 1>(512 * c)), pa0);
-                    o.template select<128, 1>(128 * dg) = xmx::dpas<8, 8, float, float>(
-                        simd<float, 128>(o.template select<128, 1>(128 * dg)), simd<sycl::half, 256>(vb.template select<256, 1>(512 * c + 256)), pa1);
+            for (int n2 = 0; n2 < NB / 2; ++n2) {
+                const simd<sycl::half, 128> pa0 = convert<sycl::half>(simd<float, 128>(s.template select<128, 1>(128 * (2 * n2))));
+                const simd<sycl::half, 128> pa1 = convert<sycl::half>(simd<float, 128>(s.template select<128, 1>(128 * (2 * n2 + 1))));
+                v_desc.set_y(tok0 + 32 * n2);
+#pragma unroll
+                for (int dg2 = 0; dg2 < KS / 2; ++dg2) {
+                    v_desc.set_x(32 * dg2);
+                    simd<sycl::half, 1024> vb = esimd_x::lsc_load_2d<sycl::half, 16, 32, 2, false, true>(v_desc);
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const int dg = 2 * dg2 + c;
+                        o.template select<128, 1>(128 * dg) = xmx::dpas<8, 8, float, float>(
+                            simd<float, 128>(o.template select<128, 1>(128 * dg)), simd<sycl::half, 256>(vb.template select<256, 1>(512 * c)), pa0);
+                        o.template select<128, 1>(128 * dg) = xmx::dpas<8, 8, float, float>(
+                            simd<float, 128>(o.template select<128, 1>(128 * dg)), simd<sycl::half, 256>(vb.template select<256, 1>(512 * c + 256)), pa1);
+                    }
                 }
             }
         }
@@ -448,6 +582,33 @@ void xp_merge(const float * part_o, const float * part_ml, const float * sinks, 
     });
 }
 
+// a q8_0 cache the 2D dword loads read in place (as fa_xmx_q8_layout of fattn-xmx-dec.cpp): contiguous blocks,
+// 64-byte aligned stream bases, a 16-byte aligned row pitch, each head at a 64-byte aligned offset (hb) or inside the
+// token row (hx, the KV cache's heads interleaved per token). Depends on the data pointers: checked at the launch
+static bool xp_q8_layout(const ggml_tensor * t, size_t & hb, int & hx) {
+    const size_t row = XP_D / QK8_0 * sizeof(block_q8_0);
+    if (t->type != GGML_TYPE_Q8_0 || t->nb[0] != sizeof(block_q8_0) || t->nb[1] % 16 != 0 || t->nb[1] < 64 ||
+        t->nb[1] >= (1u << 24)) {
+        return false;
+    }
+    for (int64_t s = 0; s < t->ne[3]; ++s) {
+        if (((uintptr_t) t->data + s * t->nb[3]) % 64 != 0) {
+            return false;
+        }
+    }
+    if (t->nb[2] % 64 == 0 && t->nb[1] >= row) {
+        hb = t->nb[2];
+        hx = 0;
+        return true;
+    }
+    if (t->nb[2] % 4 == 0 && (size_t) (t->ne[2] - 1) * t->nb[2] + row <= t->nb[1]) {
+        hb = 0;
+        hx = (int) (t->nb[2] / 4);
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 bool ggml_sycl_flash_attn_ext_xmx_prompt_supported(int device, const ggml_tensor * dst) {
@@ -555,7 +716,14 @@ void ggml_sycl_flash_attn_ext_xmx_prompt(ggml_backend_sycl_context & ctx, ggml_t
     static const int min_bps   = std::max(1, ggml_sycl_get_env("GGML_SYCL_FA_XMX_PROMPT_SPLIT_MIN", 32));
     // a quantized cache: chunks of GGML_SYCL_FA_XMX_PROMPT_CHUNK cells converted to f16 (32768: 128 MiB for 8 KV heads)
     static const int chunk_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_PROMPT_CHUNK", 32768);
-    const bool       conv      = K->type != GGML_TYPE_F16;
+    // a q8_0 cache in a layout the 2D loads take is read in place (GGML_SYCL_FA_XMX_PROMPT_Q8=0: converted like the
+    // other types)
+    static const int q8_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_PROMPT_Q8", 1);
+    size_t           k_hb = 0, v_hb = 0;
+    int              k_hx = 0, v_hx = 0;
+    const bool       q8   = q8_env && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && xp_q8_layout(K, k_hb, k_hx) &&
+                            xp_q8_layout(V, v_hb, v_hx);
+    const bool       conv      = K->type != GGML_TYPE_F16 && !q8;
     const int        chunk     = conv ? std::min(n_kv, std::max(XP_BK, chunk_env / XP_BK * XP_BK)) : n_kv;
     const int        n_chunk   = (n_kv + chunk - 1) / chunk;
     const int        n_blk_c   = chunk / XP_BK;  // blocks of a (full) chunk
@@ -612,6 +780,10 @@ void ggml_sycl_flash_attn_ext_xmx_prompt(ggml_backend_sycl_context & ctx, ggml_t
         a.part_ml     = nsplit > 1 || n_chunk > 1 ? part_ml.get() : nullptr;
         a.prefetch    = prefetch;
         a.part_always = n_chunk > 1;
+        a.k_hb        = k_hb;
+        a.v_hb        = v_hb;
+        a.k_hx        = k_hx;
+        a.v_hx        = v_hx;
 
         const sycl::nd_range<1> range(sycl::range<1>((size_t) n_kvh * nsplit * n_wg * XP_NT), sycl::range<1>(XP_NT));
         for (int c = 0; c < n_chunk; ++c) {
@@ -638,8 +810,13 @@ void ggml_sycl_flash_attn_ext_xmx_prompt(ggml_backend_sycl_context & ctx, ggml_t
                 a.k_nb1 = a.v_nb1 = XP_D * sizeof(sycl::half);
                 a.k_nb2 = a.v_nb2 = head;
             }
-            auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { xp_kernel<XP_D>(a, it); };
-            stream->parallel_for(range, xp_grf256<decltype(kern)>{ kern });
+            if (q8) {
+                auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { xp_kernel<XP_D, true>(a, it); };
+                stream->parallel_for(range, xp_grf256<decltype(kern)>{ kern });
+            } else {
+                auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { xp_kernel<XP_D, false>(a, it); };
+                stream->parallel_for(range, xp_grf256<decltype(kern)>{ kern });
+            }
         }
         if (nsplit > 1 || n_chunk > 1) {
             xp_merge(a.part_o, a.part_ml, a.sinks, a.dst, nsplit, nq, n_head, g, stream);
