@@ -2628,8 +2628,43 @@ static void scale_f32_sycl(const float *x, float *dst, const float scale, const 
 }
 
 
+// A few long rows (a vocabulary-sized sum: the Inkling2 DSpark drafter sums 200K values several times a draft step)
+// walked in sequence by one sub-group a row cost ~0.13 ms a call. Chunks of SUM_ROWS_CHUNK values take a work-group
+// each, and the existing kernel then sums each row's partials. Other shapes keep the one-pass kernel and its rounding.
+static constexpr int SUM_ROWS_CHUNK = 4096;
+
 static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
-                              const int nrows, queue_ptr stream) {
+                              const int nrows, queue_ptr stream, ggml_sycl_pool * pool = nullptr) {
+    if (pool && nrows < 64 && ncols >= 4*SUM_ROWS_CHUNK) {
+        constexpr int WG      = 256;
+        const int     nchunks = (ncols + SUM_ROWS_CHUNK - 1) / SUM_ROWS_CHUNK;
+        ggml_sycl_pool_alloc<float> part(*pool, (size_t) nrows * nchunks);
+        float * p = part.get();
+        stream->parallel_for(sycl::nd_range<2>(sycl::range<2>(nrows, (size_t) nchunks * WG), sycl::range<2>(1, WG)),
+                             [=](sycl::nd_item<2> it) {
+                                 const int     row = it.get_group(0);
+                                 const int     c   = it.get_group(1);
+                                 const int     i0  = c * SUM_ROWS_CHUNK;
+                                 const int     i1  = sycl::min(ncols, i0 + SUM_ROWS_CHUNK);
+                                 const float * xr  = x + (size_t) row * ncols;
+                                 float         sum = 0.0f;
+                                 for (int i = i0 + (int) it.get_local_id(1); i < i1; i += WG) {
+                                     sum += xr[i];
+                                 }
+                                 sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+                                 if (it.get_local_id(1) == 0) {
+                                     p[(size_t) row * nchunks + c] = sum;
+                                 }
+                             });
+        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+        const sycl::range<3> block_nums(1, nrows, 1);
+        stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1)
+                                 [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                     k_sum_rows_f32(p, dst, nchunks, item_ct1);
+                                 });
+        return;
+    }
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
     const sycl::range<3> block_nums(1, nrows, 1);
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
@@ -4062,7 +4097,7 @@ inline void ggml_sycl_op_sum(ggml_backend_sycl_context & ctx, ggml_tensor *dst) 
     // the kernel indexes in 32-bit
     GGML_ASSERT(ne <= INT32_MAX);
 
-    sum_rows_f32_sycl(src0_dd, dst_dd, ne, 1, main_stream);
+    sum_rows_f32_sycl(src0_dd, dst_dd, ne, 1, main_stream, &ctx.pool());
 }
 
 inline void ggml_sycl_op_sum_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -4078,7 +4113,7 @@ inline void ggml_sycl_op_sum_rows(ggml_backend_sycl_context & ctx, ggml_tensor *
     // the kernel indexes in 32-bit
     GGML_ASSERT(ncols * nrows <= INT32_MAX);
 
-    sum_rows_f32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
+    sum_rows_f32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream, &ctx.pool());
 }
 
 inline void ggml_sycl_op_mean(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -4096,7 +4131,7 @@ inline void ggml_sycl_op_mean(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     // the kernel indexes in 32-bit
     GGML_ASSERT(ncols * nrows <= INT32_MAX);
 
-    sum_rows_f32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream);
+    sum_rows_f32_sycl(src0_dd, dst_dd, ncols, nrows, main_stream, &ctx.pool());
 
     main_stream->parallel_for(
         sycl::range<1>(nrows),
