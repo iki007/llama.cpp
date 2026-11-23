@@ -1433,6 +1433,24 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     return res;
 }
 
+// the full-attention mask of this ubatch follows from the cell and token positions alone: one sequence (the other
+// sequences' cells get LLAMA_REL_POS_EMPTY), causal, 1D positions (the M-RoPE rule needs the cells' 2D positions).
+// The mask is built in F16 on the token positions relative to the middle token, which must be exact in F16
+// (|p| <= 2048): always true for consecutive positions up to 4096-token ubatches
+static bool rel_mask_dev_ok(const llama_ubatch & ubatch, const llama_cparams & cparams) {
+    static const bool host_mask = getenv("LLAMA_KQ_MASK_HOST") != nullptr;
+    if (host_mask || !cparams.causal_attn || ubatch.n_seqs_unq != 1 || ubatch.is_pos_2d()) {
+        return false;
+    }
+    const llama_pos mid = ubatch.pos[ubatch.n_tokens/2];
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (std::abs(ubatch.pos[i] - mid) > 2048) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
@@ -1448,7 +1466,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (rel_packed) {
         if (self_rel_pos->buffer) {
-            attn_ctx->get_base()->set_input_rel_pos_packed(self_rel_pos, inp_attn->self_attn_mask.rows, ubatch);
+            attn_ctx->get_base()->set_input_rel_pos_packed(self_rel_pos, inp_attn->self_attn_mask.rows, ubatch, mask_dev);
         }
         if (self_rel_pos_swa->buffer) {
             attn_ctx->get_swa()->set_input_rel_pos_packed(self_rel_pos_swa, inp_attn->self_attn_mask_swa.rows, ubatch);
@@ -1504,6 +1522,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= rel_packed ? (self_rel_pos->ne[0] - inp_attn->self_attn_mask.raw->ne[0])*self_rel_pos->ne[1] == params.ubatch.n_tokens
                       : self_rel_pos->ne[1] == params.ubatch.n_tokens;
+
+    // the device mask is built only for the ubatches it covers
+    res &= !mask_dev || rel_mask_dev_ok(params.ubatch, params.cparams);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -4542,6 +4563,30 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
         ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_packed_swa");
 
         inp->rel_packed = true;
+
+        // the full-attention mask from the same positions: keep (0) where token - cell >= 0, -inf elsewhere (empty
+        // and padding cells and the other sequences' cells sit at LLAMA_REL_POS_EMPTY = 2^24, positions are exact
+        // in F32). The host loop and the upload of the dense [n_kv, n_batch] F16 mask cost ~30 ms + ~60 ms a
+        // 1024-token ubatch at 256K cells, and the GPU waits for them; the graph ops take a few ms.
+        // The only full-size tensor is the F16 mask itself (an F32 [n_kv, n_batch] step costs 1.5 GiB at 384K cells
+        // x 1024 tokens): repeat in F16, then sub, clamp and mul run in place. The tokens relative to the middle one
+        // are exact in F16 (rel_mask_dev_ok), the cells stay F32 and the sub computes in F32, so tok - cell is exact
+        // before its F16 rounding, which keeps 0 and the sign (EMPTY and far cells may round to +-inf)
+        if (n_slice == 1 && mask->type == GGML_TYPE_F16 && hparams.f_max_alibi_bias == 0.0f &&
+            rel_mask_dev_ok(ubatch, cparams)) {
+            const int64_t n_kv = mask->ne[0];
+            ggml_tensor * pos  = inp->self_rel_pos;
+            ggml_tensor * base = ggml_view_1d(ctx0, pos, 1, (n_kv + n_tps/2)*pos->nb[0]);
+            ggml_tensor * cell = ggml_sub(ctx0, ggml_view_2d(ctx0, pos, n_kv, 1, pos->nb[1], 0), base);
+            ggml_tensor * tok  = ggml_sub(ctx0, ggml_view_2d(ctx0, pos, 1, n_tps, pos->nb[0], n_kv*pos->nb[0]), base);
+            tok = ggml_cast(ctx0, tok, GGML_TYPE_F16);
+            ggml_tensor * d = ggml_sub(ctx0, ggml_repeat_4d(ctx0, tok, n_kv, n_tps, 1, 1), cell); // F16 - F32 -> F16
+            d = ggml_clamp(ctx0, d, -1.0f, 0.0f);
+            d = ggml_mul(ctx0, d, ggml_fill(ctx0, base, 1e30f)); // -1e30 -> -inf; the SYCL SCALE is F32 only
+            inp->self_attn_mask_dev = d;
+            ggml_set_name(inp->self_attn_mask_dev, "attn_inp_kq_mask_dev");
+            inp->mask_dev = true;
+        }
     }
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
@@ -4566,8 +4611,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
 
     ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+    ggml_tensor * kq_mask = !is_swa && inp->mask_dev ? inp->self_attn_mask_dev : attn_mask.raw;
 
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, attn_mask.rows,
+    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, attn_mask.rows,
             sinks, nullptr, kq_scale, il, bias_table, indices,
             inp->rel_packed ? (int32_t) (is_swa ? inp->extent_swa : inp->extent) : 0);
 }
