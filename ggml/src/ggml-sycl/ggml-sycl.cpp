@@ -3276,12 +3276,11 @@ static void launch_mul_mat_vec_f32_vec4_sycl(const float * x, const float * y, f
 // Small BF16 projections with 2-8 columns (Inkling's attention-sink and conv-tap weights, [2304, 24..32], in a
 // speculative verify batch): a work-group per row, the bf16 pairs read as 32-bit words, f32 accumulation. Without
 // it they went through a bf16 -> f32 conversion and oneMKL SGEMM (~9.5 us each).
-static constexpr int MM_BF16_SC_WG   = 128;
 static constexpr int MM_BF16_SC_MAXC = 8;
 
-static void mul_mat_bf16_small_cols_sycl(const void * vx, const float * y, float * dst, int ncols, int nrows,
-                                         int n_out, int ldc, queue_ptr stream) {
-    constexpr int WG  = MM_BF16_SC_WG;
+template <int WG>
+static void mul_mat_bf16_small_cols_sycl_wg(const void * vx, const float * y, float * dst, int ncols, int nrows,
+                                            int n_out, int ldc, queue_ptr stream) {
     constexpr int SG  = 16;
     constexpr int NSG = WG / SG;
     constexpr int MC  = MM_BF16_SC_MAXC;
@@ -3330,6 +3329,22 @@ static void mul_mat_bf16_small_cols_sycl(const void * vx, const float * y, float
             }
         });
     });
+}
+
+// the work-group as wide as the row's bf16 pairs allow: few rows (24-32), so the work-groups are few and the walk
+// along the row is the latency; [2304, 24] x 4 columns: 128 threads 6.7 us, 512 3.6, 1024 3.2
+static void mul_mat_bf16_small_cols_sycl(const void * vx, const float * y, float * dst, int ncols, int nrows,
+                                         int n_out, int ldc, queue_ptr stream) {
+    const int pairs = ncols / 2;
+    if (pairs >= 768) {
+        mul_mat_bf16_small_cols_sycl_wg<1024>(vx, y, dst, ncols, nrows, n_out, ldc, stream);
+    } else if (pairs >= 384) {
+        mul_mat_bf16_small_cols_sycl_wg<512>(vx, y, dst, ncols, nrows, n_out, ldc, stream);
+    } else if (pairs >= 192) {
+        mul_mat_bf16_small_cols_sycl_wg<256>(vx, y, dst, ncols, nrows, n_out, ldc, stream);
+    } else {
+        mul_mat_bf16_small_cols_sycl_wg<128>(vx, y, dst, ncols, nrows, n_out, ldc, stream);
+    }
 }
 
 // Direct F32 GEMV / small-N GEMM for small projections on BMG G31, avoiding oneMKL SGEMM

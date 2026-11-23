@@ -15718,6 +15718,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Inkling's small bf16 projections (attention sink [2304, 24], conv taps [2304, 32]) in a 4-token verify batch
+    for (int64_t m : { 24, 32 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, 4, 2304, {1, 1}, {1, 1}));
+    }
     // Inkling 2 Mini experts (NVFP4, 128 x 8): gate_up shares the input, down reads one row per expert; 1 token and
     // the DSpark verify batch
     for (int n : { 1, 4 }) {
