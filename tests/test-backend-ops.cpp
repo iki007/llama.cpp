@@ -14028,6 +14028,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the KV cache's layout (permute {0, 2, 1, 3}: heads interleaved in a token row) at head 128: the SYCL XMX prompt
+    // kernel reads a q8_0 cache of this layout in place; 75 rows leave threads of a work-group without rows
+    for (int nb : { 32, 75, }) {
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+        }
+    }
+
     // KV-head counts that do not divide the device count
     for (int hs : { 128, 256, 512, }) {
         for (int nh : { 1, 2, 6, }) {
