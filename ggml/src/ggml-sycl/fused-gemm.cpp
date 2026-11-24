@@ -383,23 +383,29 @@ static __dpct_inline__ void fg_stage_a(const block_q5_1 * __restrict__ xrow, con
 // UE4M3 scale; a sub-block keeps values 0..7 in the low nibbles of its 8 bytes and 8..15 in the high ones.
 // The codes are decoded four at a time by get_int_from_mxfp4 instead of one table lookup per value
 // (the 36-byte block keeps qs 4-byte aligned).
+// the two sub-blocks of k step kb: the block's 32 code bytes qs and 4 scales d (AoS or the reordered streams)
 template <typename E>
-static __dpct_inline__ void fg_stage_a(const block_nvfp4 * __restrict__ xrow, const int kb, typename E::pair * a) {
-    const block_nvfp4 * blk = xrow + kb / 2;
+static __dpct_inline__ void fg_decode_nvfp4(const uint8_t * qs, const uint8_t * d, const int kb, typename E::pair * a) {
 #pragma unroll
     for (int t = 0; t < 2; ++t) {
-        const int        s = 2 * (kb % 2) + t;
-        const float      d = ggml_sycl_ue4m3_to_fp32(blk->d[s]);
-        const uint32_t * q = (const uint32_t *) (blk->qs + (QK_NVFP4_SUB / 2) * s);
+        const int        s  = 2 * (kb % 2) + t;
+        const float      ds = ggml_sycl_ue4m3_to_fp32(d[s]);
+        const uint32_t * q  = (const uint32_t *) (qs + (QK_NVFP4_SUB / 2) * s);
 #pragma unroll
         for (int w = 0; w < 2; ++w) {
             const sycl::int2 v = get_int_from_mxfp4((int) q[w]); // x: values 4w..4w+3, y: values 8+4w..8+4w+3
-            a[8 * t + 2 * w]         = E::make(d * (int8_t) (v.x()),       d * (int8_t) (v.x() >> 8));
-            a[8 * t + 2 * w + 1]     = E::make(d * (int8_t) (v.x() >> 16), d * (int8_t) (v.x() >> 24));
-            a[8 * t + 4 + 2 * w]     = E::make(d * (int8_t) (v.y()),       d * (int8_t) (v.y() >> 8));
-            a[8 * t + 4 + 2 * w + 1] = E::make(d * (int8_t) (v.y() >> 16), d * (int8_t) (v.y() >> 24));
+            a[8 * t + 2 * w]         = E::make(ds * (int8_t) (v.x()),       ds * (int8_t) (v.x() >> 8));
+            a[8 * t + 2 * w + 1]     = E::make(ds * (int8_t) (v.x() >> 16), ds * (int8_t) (v.x() >> 24));
+            a[8 * t + 4 + 2 * w]     = E::make(ds * (int8_t) (v.y()),       ds * (int8_t) (v.y() >> 8));
+            a[8 * t + 4 + 2 * w + 1] = E::make(ds * (int8_t) (v.y() >> 16), ds * (int8_t) (v.y() >> 24));
         }
     }
+}
+
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_nvfp4 * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_nvfp4 * blk = xrow + kb / 2;
+    fg_decode_nvfp4<E>(blk->qs, blk->d, kb, a);
 }
 
 // iq3_s: k step kb is sub-block kb % 8 of superblock kb / 8. The superblock is 110 bytes, so read
@@ -787,6 +793,17 @@ template <> struct fg_soa<block_q8_0> {
                                       typename E::pair * a) {
         const float d = (float) ((const sycl::half *) (x + nblocks * QK8_0))[ib];
         fg_decode_q8_0<E>((const int8_t *) x + ib * QK8_0, d, a);
+    }
+};
+
+template <> struct fg_soa<block_nvfp4> {
+    static constexpr bool supported = true;
+    // [qs 32 a block][d 4 a block] (reorder_qw_nvfp4_moe)
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
+                                      typename E::pair * a) {
+        fg_decode_nvfp4<E>(x + ib * (QK_NVFP4 / 2), x + nblocks * (QK_NVFP4 / 2) + ib * (QK_NVFP4 / QK_NVFP4_SUB), kb,
+                           a);
     }
 };
 

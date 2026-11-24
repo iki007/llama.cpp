@@ -426,7 +426,8 @@ template <int MR> struct grouped_gemm_esimd_a<block_q5_1, MR> {
 
 // [d 4][qs 32] per 64 values, two k steps a block: k step j takes sub-blocks 2j and 2j + 1 as its two k halves,
 // each with its own UE4M3 scale. A sub-block keeps values 0..7 in the low nibbles of its 8 bytes and 8..15 in the
-// high ones. The canonical layout only: nvfp4 has no reorder.
+// high ones. Either layout: AoS 36-byte blocks, or the reordered streams [qs 32 a block][d 4 a block]
+// (reorder_qw_nvfp4_moe).
 template <int MR> struct grouped_gemm_esimd_a<block_nvfp4, MR> {
     static constexpr bool supported = true;
     static constexpr int  qk        = QK_NVFP4;
@@ -442,8 +443,8 @@ template <int MR> struct grouped_gemm_esimd_a<block_nvfp4, MR> {
         grouped_gemm_esimd::simd<sycl::half, MR> d[4];
     };
 
-    static constexpr grouped_gemm_esimd::field D = { 0, 4, 0 }, QS = { 4, QK_NVFP4 / 2, 4 };
-    static bool ok(const int K, const bool aos) { return aos && K % qk == 0; }
+    static constexpr grouped_gemm_esimd::field QS = { 0, QK_NVFP4 / 2, 4 }, D = { QK_NVFP4 / 2, 4, 0 };
+    static bool ok(const int K, const bool) { return K % qk == 0; }
 
     // ggml_sycl_ue4m3_to_fp32 over the lanes, with its 0.5 for the doubled E2M1 codebook
     static ESIMD_INLINE grouped_gemm_esimd::simd<float, MR> ue4m3(grouped_gemm_esimd::simd<uint32_t, MR> x) {
@@ -506,7 +507,7 @@ template <int MR> struct grouped_gemm_esimd_a<block_nvfp4, MR> {
     template <typename Sl>
     static ESIMD_INLINE void load_kperm(raw & r, sb_t & sb, const Sl & s, const int kb, const int j) {
         using namespace grouped_gemm_esimd;
-        // the qs field starts on a dword in every block (ok(): AoS only, 36-byte blocks)
+        // the qs field starts on a dword in every block: AoS 36-byte blocks, or the 32-byte runs of the reordered stream
         simd<uint32_t, MR * 4> g = gather<uint32_t, MR * 4, 4>((const uint32_t *) s.x, s.at(QS, kb / 2, 16 * j));
         r.q.template select<MR, 2>(0)          = g.template select<MR, 1>(0);
         r.q.template select<MR, 2>(1)          = g.template select<MR, 1>(MR);

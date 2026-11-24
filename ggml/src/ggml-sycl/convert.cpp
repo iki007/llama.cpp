@@ -559,6 +559,17 @@ static void dequantize_row_nvfp4_sycl(const void * vx, dst_t * y, const int64_t 
         });
 }
 
+template <typename dst_t>
+static void dequantize_row_nvfp4_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK_NVFP4 == 0);
+    const int nb = k / QK_NVFP4;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
+        [=](sycl::nd_item<3> /*item_ct1*/) {
+            dequantize_block_nvfp4_reorder(vx, y, k);
+        });
+}
+
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_nc(const void * __restrict__ vx, dst_t * __restrict__ y,
@@ -770,6 +781,9 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
             }
             return dequantize_row_mxfp4_sycl;
         case GGML_TYPE_NVFP4:
+            if (is_reordered_src0(dst)) {
+                return dequantize_row_nvfp4_sycl_reorder;
+            }
             return dequantize_row_nvfp4_sycl;
         case GGML_TYPE_F32:
             if constexpr (std::is_same_v<dst_t, sycl::half>) {

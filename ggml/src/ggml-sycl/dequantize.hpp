@@ -1897,4 +1897,35 @@ static void dequantize_block_nvfp4(
 }
 
 
+// the reordered layout of reorder_qw_nvfp4_moe: [qs 32 a block][d 4 a block] over the ne / 64 blocks of the matrix
+template <typename dst_t>
+static void dequantize_block_nvfp4_reorder(
+        const void * __restrict__ vx,
+        dst_t * __restrict__ yy,
+        const int64_t ne) {
+    auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i        = item_ct1.get_group(2);
+    const int     tid      = item_ct1.get_local_id(2);
+
+    const int64_t base = i * QK_NVFP4;
+    if (base >= ne) {
+        return;
+    }
+
+    const uint8_t * qs = (const uint8_t *) vx + i * (QK_NVFP4 / 2);
+    const uint8_t * dd = (const uint8_t *) vx + (ne / QK_NVFP4) * (QK_NVFP4 / 2) + i * (QK_NVFP4 / QK_NVFP4_SUB);
+
+    const int sub = tid / (QK_NVFP4_SUB / 2);
+    const int j = tid % (QK_NVFP4_SUB / 2);
+
+    const float d = ggml_sycl_ue4m3_to_fp32(dd[sub]);
+    const uint8_t q = qs[sub * (QK_NVFP4_SUB / 2) + j];
+
+    const int64_t y0 = base + sub * QK_NVFP4_SUB + j;
+    const int64_t y1 = y0 + QK_NVFP4_SUB / 2;
+
+    yy[y0] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
+    yy[y1] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
+}
+
 #endif // GGML_SYCL_DEQUANTIZE_HPP

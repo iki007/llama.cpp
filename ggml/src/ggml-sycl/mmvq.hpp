@@ -58,7 +58,8 @@ bool ggml_sycl_mul_mat_vec_q_id_dedup(enum ggml_type src0_type, const void * vx_
                                       const int32_t * ids_dev, float * dst_base, int ncols, int nrows,
                                       int n_experts_used, size_t expert_weight_stride, size_t dst_row_stride,
                                       size_t src1_row_stride, dpct::queue_ptr stream, int n_tokens,
-                                      size_t ids_row_stride, size_t dst_tok_stride, size_t src1_tok_stride);
+                                      size_t ids_row_stride, size_t dst_tok_stride, size_t src1_tok_stride,
+                                      bool reordered = false);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
