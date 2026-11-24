@@ -372,6 +372,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Rcur, "Rcur", il);
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        // in the graph before the table: the table's mat-mul and the sink subtraction are then adjacent (the SYCL
+        // backend computes them as one kernel)
+        ggml_build_forward_expand(gf, sinks);
 
         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 

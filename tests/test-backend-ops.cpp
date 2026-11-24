@@ -4412,6 +4412,40 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT + GGML_OP_SUB of a per-(output, batch) value (fused on SYCL): Inkling 2's relative-bias table
+// [bins, heads, tokens] = rel_bias [n_rel, bins] x r [n_rel, heads, tokens], minus the per-query sink logit
+struct test_mul_mat_sub : public test_case {
+    const int64_t n_rel, bins, heads, tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SUB";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_rel, bins, heads, tokens);
+    }
+
+    test_mul_mat_sub(int64_t n_rel = 16, int64_t bins = 1025, int64_t heads = 24, int64_t tokens = 4)
+        : n_rel(n_rel), bins(bins), heads(heads), tokens(tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, bins);
+        ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, heads, tokens);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, heads, tokens);
+        ggml_set_name(w, "w");
+        ggml_set_name(r, "r");
+        ggml_set_name(s, "s");
+        ggml_tensor * table = ggml_mul_mat(ctx, w, r);
+        ggml_set_name(table, "table");
+        ggml_tensor * out = ggml_sub(ctx, table, ggml_reshape_3d(ctx, s, 1, heads, tokens));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (fused operation)
 struct test_add_rms_norm_mul : public test_case {
     const std::array<int64_t, 4> ne;
@@ -12548,6 +12582,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+    // the decode verify batch, a prompt ubatch, and a shape the fused kernel's few-batch branch takes
+    for (int64_t tokens : { 1, 4, 1024 }) {
+        test_cases.emplace_back(new test_mul_mat_sub(16, 1025, 24, tokens));
+    }
+    test_cases.emplace_back(new test_mul_mat_sub(32, 300, 9, 3));
     test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { 1025, 2, 3, 2 }, 1e-5f, false, true));
     test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { 8192, 1, 1, 1 }, 1e-5f, false, true));
     for (uint32_t n : { 768, 1024, 1280 }) {

@@ -3681,10 +3681,13 @@ static bool can_use_mul_mat_vec_f32_small_batched(const ggml_tensor * src0, cons
     return n_batch * nrows <= 8 * 1024 * 1024;
 }
 
+// sub (optional, ncols <= 32 and n_out > 8 only): sub[c * sub_c + b * sub_b] is subtracted from output (batch b,
+// output c), as a following GGML_OP_SUB of a [1, n_out, n_batch] tensor would (ggml_sycl_try_mm_sub_fusion)
 static void mul_mat_vec_f32_small_batched_sycl(ggml_backend_sycl_context & ctx,
                                                const ggml_tensor * src0,
                                                const ggml_tensor * src1,
-                                               ggml_tensor * dst) {
+                                               ggml_tensor * dst,
+                                               const float * sub = nullptr, int64_t sub_c = 0, int64_t sub_b = 0) {
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     queue_ptr stream = ctx.stream();
 
@@ -3768,6 +3771,9 @@ static void mul_mat_vec_f32_small_batched_sycl(ggml_backend_sycl_context & ctx,
                     for (int col = 0; col < ncols; ++col) {
                         sum = sycl::fma(x_row[col], yc[col], sum);
                     }
+                    if (sub) {
+                        sum -= sub[(size_t) c * sub_c + (size_t) b * sub_b];
+                    }
                     d[(size_t) b * d_b_stride + (size_t) c * (size_t) nrows + row] = sum;
                 });
         } else {
@@ -3791,6 +3797,9 @@ static void mul_mat_vec_f32_small_batched_sycl(ggml_backend_sycl_context & ctx,
                         float sum = 0.0f;
                         for (int col = 0; col < ncols; ++col) {
                             sum = sycl::fma(xv[col], yc[col], sum);
+                        }
+                        if (sub) {
+                            sum -= sub[(size_t) c * sub_c + (size_t) b * sub_b];
                         }
                         d_b[(size_t) c * (size_t) nrows + row] = sum;
                     }
@@ -7518,6 +7527,57 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// MUL_MAT on the f32 small-batched kernel (ncols <= 32, 8 < n_out <= 32) whose one consumer, the next node past views,
+// is SUB(mm, b) with b f32 [1, n_out, n_batch]: the kernel subtracts b as it stores, into the SUB's output. Inkling 2's
+// relative-bias table minus the per-query sink logit: one pass over the table instead of three. Only adjacent nodes:
+// computing the MUL_MAT later, at its SUB, would read its inputs after the allocator has given their memory to the
+// nodes in between. Returns the nodes to skip, 0 if it does not apply. GGML_SYCL_MM_SUB_FUSION=0 disables.
+static int ggml_sycl_try_mm_sub_fusion(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_MM_SUB_FUSION", 1) != 0;
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (!enabled || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_node_get_use_count(cgraph, i) != 1) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (!is_bmg_g31_arch(ctx.device) || ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+        ggml_backend_buffer_is_sycl_split(src0->buffer) || ggml_backend_buffer_is_sycl_split(src1->buffer) ||
+        ggml_backend_buffer_is_sycl_split(mm->buffer) || !can_use_mul_mat_vec_f32_small_batched(src0, src1, mm) ||
+        src0->ne[0] > 32 || src1->ne[1] <= 8 || src1->ne[1] > 32) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j == cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor *       sub = cgraph->nodes[j];
+    const ggml_tensor * b   = sub->src[1];
+    if (sub->op != GGML_OP_SUB || sub->src[0] != mm || b == mm || sub->type != GGML_TYPE_F32 || !ggml_is_contiguous(sub) ||
+        !ggml_are_same_shape(sub, mm) || ggml_backend_buffer_is_sycl_split(sub->buffer) ||
+        (sub->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || b->type != GGML_TYPE_F32 || b->ne[0] != 1 ||
+        b->ne[1] != mm->ne[1] || b->ne[2] != mm->ne[2] || b->ne[3] != 1 || mm->ne[3] != 1 ||
+        b->nb[1] % sizeof(float) != 0 || b->nb[2] % sizeof(float) != 0) {
+        return 0;
+    }
+    // the SUB's output is written while the MUL_MAT's inputs and b are read: the allocator may have placed it over
+    // memory they held, once the MUL_MAT (their last reader in its schedule) was done
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * t) {
+        const uintptr_t as = (uintptr_t) a->data, ae = as + ggml_nbytes(a);
+        const uintptr_t ts = (uintptr_t) t->data, te = ts + ggml_nbytes(t);
+        return as < te && ts < ae;
+    };
+    if (overlaps(sub, src0) || overlaps(sub, src1) || overlaps(sub, b)) {
+        return 0;
+    }
+    mul_mat_vec_f32_small_batched_sycl(ctx, src0, src1, sub, (const float *) b->data, (int64_t) (b->nb[1] / sizeof(float)),
+                                       (int64_t) (b->nb[2] / sizeof(float)));
+    return j - i;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -7540,6 +7600,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
             continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT) {
+            const int mm_sub_skip = ggml_sycl_try_mm_sub_fusion(*sycl_ctx, cgraph, i);
+            if (mm_sub_skip > 0) {
+                i += mm_sub_skip;
+                continue;
+            }
         }
 #ifndef NDEBUG
         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
