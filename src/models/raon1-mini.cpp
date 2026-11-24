@@ -2,9 +2,14 @@
 
 #include "llama-impl.h"
 
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_raon1_mini::load_arch_hparams(llama_model_loader & ml) {
+#include <algorithm>
+#include <cstring>
+
+void llama_model_raon1::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
@@ -458,6 +463,26 @@ llama_model_raon1_mini::graph::graph(const llama_model & model, const llm_graph_
         ggml_tensor * cur = build_hc_pre(inp, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
+        const auto dev = model.dev_layer(il);
+        const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        // Only the cache write is needed for prompt chunks that have no outputs.
+        if (il == n_layer - 1 && !hparams.is_recr(il) && n_outputs == 0 && n_tokens > 1 &&
+                reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+                cparams.causal_attn && !cparams.embeddings && !cparams.embeddings_nextn && !cparams.training &&
+                !cparams.pipeline_parallel && !cparams.cb_eval && params.samplers.empty() &&
+                std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; })) {
+            const int64_t nr = hparams.n_rot();
+            const int64_t rank = hparams.n_lora_kv;
+            ggml_tensor * kv = build_lora_mm(layer.wkv_a_mqa, cur);
+            ggml_tensor * latent = ggml_view_2d(ctx0, kv, rank, n_tokens, kv->nb[1], 0);
+            latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, hparams.f_norm_rms_eps_latent), layer.attn_kv_a_norm);
+            ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
+            ggml_tensor * k_cur = ggml_concat(ctx0, ggml_reshape_3d(ctx0, latent, rank, 1, n_tokens), extra, 0);
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, k_cur, inp_attn->get_k_idxs(), il));
+            // keep the (empty) output-index input reachable for set_inputs and graph reuse
+            res->t_embd = ggml_get_rows(ctx0, cur, out_ids);
+            return;
+        }
         if (hparams.is_recr(il)) {
             cur = build_rda_layer(cur, layer, inp_rs, il);
         } else {
