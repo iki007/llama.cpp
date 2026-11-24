@@ -14332,6 +14332,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, k));
         }
     }
+    // Q5_1 experts (Inkling 2 Mini down projections in mixed quantizations): verify batches and prompt ubatches
+    for (int n : {1, 4, 17, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
+    }
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
     // and 1024 at the LLAMA_MAX_EXPERTS limit
     for (int n : {1, 5, 64, 300}) {
