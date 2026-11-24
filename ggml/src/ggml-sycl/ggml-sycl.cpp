@@ -3776,6 +3776,43 @@ static void mul_mat_vec_f32_small_batched_sycl(ggml_backend_sycl_context & ctx,
                     }
                     d[(size_t) b * d_b_stride + (size_t) c * (size_t) nrows + row] = sum;
                 });
+        } else if (vec4_ok) {
+            // the same per row, with x and y read as float4 (y is the same address across the sub-group: one load
+            // message per 4 values instead of per value, the scalar version was bound by them). The FMAs run in the
+            // same order, so the result is the same.
+            const int ncols4 = ncols / 4;
+            stream->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, global_rows), sycl::range<2>(1, 128)),
+                [=](sycl::nd_item<2> it) {
+                    const int b   = (int) it.get_group(0);
+                    const int row = (int) it.get_global_id(1);
+                    if (row >= nrows) {
+                        return;
+                    }
+                    const sycl::float4 * x_row = reinterpret_cast<const sycl::float4 *>(
+                        x + (size_t) (b / i02_divisor) * x_b_stride + (size_t) row * (size_t) ncols);
+                    const sycl::float4 * y_b = reinterpret_cast<const sycl::float4 *>(y + (size_t) b * y_b_stride);
+                    float *              d_b = d + (size_t) b * d_b_stride;
+                    sycl::float4 xv[8];
+                    for (int q = 0; q < ncols4; ++q) {
+                        xv[q] = x_row[q];
+                    }
+                    for (int c = 0; c < n_out; ++c) {
+                        const sycl::float4 * yc = y_b + (size_t) c * (size_t) ncols4;
+                        float sum = 0.0f;
+                        for (int q = 0; q < ncols4; ++q) {
+                            const sycl::float4 yv = yc[q];
+                            sum = sycl::fma(xv[q].x(), yv.x(), sum);
+                            sum = sycl::fma(xv[q].y(), yv.y(), sum);
+                            sum = sycl::fma(xv[q].z(), yv.z(), sum);
+                            sum = sycl::fma(xv[q].w(), yv.w(), sum);
+                        }
+                        if (sub) {
+                            sum -= sub[(size_t) c * sub_c + (size_t) b * sub_b];
+                        }
+                        d_b[(size_t) c * (size_t) nrows + row] = sum;
+                    }
+                });
         } else {
             stream->parallel_for(
                 sycl::nd_range<2>(sycl::range<2>((size_t) n_batch, global_rows), sycl::range<2>(1, 128)),
