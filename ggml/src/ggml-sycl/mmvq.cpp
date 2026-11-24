@@ -2759,7 +2759,7 @@ static constexpr int MOE_DEDUP_MAX_SLOTS = 8 * WARP_SIZE;
 // each weight int once for all the tokens of its group. A sub-group computes R consecutive rows together, so the
 // grouping is paid once for R rows (one row is only ~5 loop steps) and the loads of R rows are in flight at once.
 // x / n_used is taken as a float product: exact for the slot counts allowed (< 256).
-template <int R>
+template <int R, bool SOA>
 static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
                                         float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
                                         const int n_tokens, const int ncols, const int nrows,
@@ -2838,12 +2838,17 @@ static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const
     const int blocks_per_row = ncols / QK_NVFP4;
     const int iqs            = 4 * (lane % 2);
     // the R rows in one loop, so the loads of all of them are in flight together; rows past nrows read row0
+    // AoS: 36-byte blocks [d 4][qs 32]. SOA (reorder_qw_nvfp4_moe): per expert [qs 32 a block][d 4 a block], so a
+    // lane's 16 code bytes (ints iqs .. iqs + 3) are one aligned 16-byte load and its two scales one 2-byte load.
+    const char *        xe = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+    const size_t        d_stream = (size_t) nrows * blocks_per_row * (QK_NVFP4 / 2);
     const block_nvfp4 * xr[R];
+    size_t              rb[R]; // SOA: the row's first block index
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int row = row0 + r < nrows ? row0 + r : row0;
-        xr[r] = (const block_nvfp4 *) ((const char *) vx_base + (size_t) i02 * expert_weight_stride) +
-                (size_t) row * blocks_per_row;
+        xr[r] = (const block_nvfp4 *) xe + (size_t) row * blocks_per_row;
+        rb[r] = (size_t) row * blocks_per_row;
     }
     float tmp[R][M];
 #pragma unroll
@@ -2854,6 +2859,15 @@ static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const
         }
     }
     for (int ib = lane / 2; ib < blocks_per_row; ib += WARP_SIZE / 2) {
+        sycl::int4 q4[R];
+        uint32_t   d2[R];
+        if constexpr (SOA) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                q4[r] = *(const sycl::int4 *) (xe + (rb[r] + ib) * (QK_NVFP4 / 2) + iqs * sizeof(int));
+                d2[r] = *(const uint16_t *) (xe + d_stream + (rb[r] + ib) * (QK_NVFP4 / QK_NVFP4_SUB) + iqs / 2);
+            }
+        }
 #pragma unroll
         for (int h = 0; h < VDR_NVFP4_Q8_1_MMVQ / 2; ++h) {
             const int iqs0 = iqs + 2 * h;
@@ -2865,10 +2879,16 @@ static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const
             float      dw[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                const block_nvfp4 * bx = xr[r] + ib;
-                v0[r] = get_int_from_mxfp4(get_int_b4(bx->qs, iqs0));
-                v1[r] = get_int_from_mxfp4(get_int_b4(bx->qs, iqs0 + 1));
-                dw[r] = ggml_sycl_ue4m3_to_fp32(bx->d[is]);
+                if constexpr (SOA) {
+                    v0[r] = get_int_from_mxfp4(h == 0 ? q4[r].x() : q4[r].z());
+                    v1[r] = get_int_from_mxfp4(h == 0 ? q4[r].y() : q4[r].w());
+                    dw[r] = ggml_sycl_ue4m3_to_fp32((uint8_t) (d2[r] >> (8 * h)));
+                } else {
+                    const block_nvfp4 * bx = xr[r] + ib;
+                    v0[r] = get_int_from_mxfp4(get_int_b4(bx->qs, iqs0));
+                    v1[r] = get_int_from_mxfp4(get_int_b4(bx->qs, iqs0 + 1));
+                    dw[r] = ggml_sycl_ue4m3_to_fp32(bx->d[is]);
+                }
             }
 #pragma unroll
             for (int j = 0; j < M; ++j) {
@@ -2912,7 +2932,7 @@ static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const
     }
 }
 
-template <int R>
+template <int R, bool SOA>
 static void launch_mul_mat_vec_nvfp4_moe_dedup(const void * vx_base, const void * vy, const int32_t * ids_dev,
                                                float * dst_base, int ncols, int nrows, int n_used,
                                                size_t expert_weight_stride, size_t dst_row_stride,
@@ -2927,7 +2947,7 @@ static void launch_mul_mat_vec_nvfp4_moe_dedup(const void * vx_base, const void 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_nvfp4_moe_dedup<R>(vx_base, vy, dst_base, ids_dev, n_tokens, ncols, nrows,
+                             mul_mat_vec_nvfp4_moe_dedup<R, SOA>(vx_base, vy, dst_base, ids_dev, n_tokens, ncols, nrows,
                                                             n_used, expert_weight_stride, dst_row_stride,
                                                             src1_row_stride, ids_row_stride, dst_tok_stride,
                                                             src1_tok_stride, item);
@@ -2943,14 +2963,23 @@ bool ggml_sycl_mul_mat_vec_q_id_dedup(enum ggml_type src0_type, const void * vx_
                                       const int32_t * ids_dev, float * dst_base, int ncols, int nrows,
                                       int n_experts_used, size_t expert_weight_stride, size_t dst_row_stride,
                                       size_t src1_row_stride, dpct::queue_ptr stream, int n_tokens,
-                                      size_t ids_row_stride, size_t dst_tok_stride, size_t src1_tok_stride) {
-    if (!ggml_sycl_mul_mat_vec_q_id_dedup_supported(src0_type, n_tokens, n_experts_used)) {
+                                      size_t ids_row_stride, size_t dst_tok_stride, size_t src1_tok_stride,
+                                      bool reordered) {
+    // reordered (SoA) NVFP4 experts take this kernel for one token too: the plain MoE kernels read the AoS blocks
+    if (reordered ? !(src0_type == GGML_TYPE_NVFP4 && n_tokens >= 1 && n_tokens * n_experts_used <= MOE_DEDUP_MAX_SLOTS) :
+                    !ggml_sycl_mul_mat_vec_q_id_dedup_supported(src0_type, n_tokens, n_experts_used)) {
         return false;
     }
     // 4 rows a sub-group: 2 and 8 were slower (fewer loads in flight; registers)
-    launch_mul_mat_vec_nvfp4_moe_dedup<4>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
-                                          expert_weight_stride, dst_row_stride, src1_row_stride, stream, n_tokens,
-                                          ids_row_stride, dst_tok_stride, src1_tok_stride);
+    if (reordered) {
+        launch_mul_mat_vec_nvfp4_moe_dedup<4, true>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                                                    expert_weight_stride, dst_row_stride, src1_row_stride, stream,
+                                                    n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride);
+    } else {
+        launch_mul_mat_vec_nvfp4_moe_dedup<4, false>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                                                     expert_weight_stride, dst_row_stride, src1_row_stride, stream,
+                                                     n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride);
+    }
     return true;
 }
 
