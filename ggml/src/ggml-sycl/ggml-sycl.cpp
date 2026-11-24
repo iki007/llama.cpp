@@ -5860,8 +5860,12 @@ static bool reorder_qw_nvfp4_moe(uint8_t * data_device, size_t expert_bytes, int
             uint8_t * qs_ptr = base;
             uint8_t * d_ptr  = qs_ptr + (QK_NVFP4 / 2) * (size_t) blocks_per_expert;
 
+            // -0 (code 8) is stored as +0: the same value, and the verify kernel's decode then needs no zero test
             for (int j = 0; j < QK_NVFP4 / 2; ++j) {
-                qs_ptr[(size_t) ib * (QK_NVFP4 / 2) + j] = x[ib].qs[j];
+                const uint8_t q  = x[ib].qs[j];
+                const uint8_t lo = (q & 0x0f) == 0x08 ? 0 : (q & 0x0f);
+                const uint8_t hi = (q >> 4) == 0x08 ? 0 : (q >> 4);
+                qs_ptr[(size_t) ib * (QK_NVFP4 / 2) + j] = (uint8_t) (lo | (hi << 4));
             }
             for (int j = 0; j < QK_NVFP4 / QK_NVFP4_SUB; ++j) {
                 d_ptr[(size_t) ib * (QK_NVFP4 / QK_NVFP4_SUB) + j] = x[ib].d[j];

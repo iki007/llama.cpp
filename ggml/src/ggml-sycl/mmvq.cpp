@@ -2755,6 +2755,23 @@ static void launch_mul_mat_vec_q_moe(
 static constexpr int MOE_DEDUP_MAXM      = 4;
 static constexpr int MOE_DEDUP_MAX_SLOTS = 8 * WARP_SIZE;
 
+// mxfp4_codes_to_int8 for the reordered NVFP4 experts, which hold no -0 code (reorder_qw_nvfp4_moe stores code 8 as 0):
+// a negative magnitude is never 0, so the two's-complement +1 cannot carry and needs no zero test; for m >= 4 the
+// magnitude 4, 6, 8, 12 is m + t + 2 [t == 3], t = m & 3. Equal to mxfp4_codes_to_int8 on every code without 8
+// (checked on all of them), 17 ops instead of 23.
+static __dpct_inline__ int mxfp4_codes_to_int8_nz(const uint32_t x) {
+    const uint32_t m   = x & 0x07070707u;
+    const uint32_t t   = m & (((m >> 2) & 0x01010101u) * 3u);
+    const uint32_t mag = m + t + (((t >> 1) & t & 0x01010101u) << 1);
+    const uint32_t neg = (x >> 3) & 0x01010101u;
+    return (int) ((mag ^ (neg * 0xffu)) + neg);
+}
+
+static __dpct_inline__ sycl::int2 get_int_from_mxfp4_nz(const int q4) {
+    return sycl::int2(mxfp4_codes_to_int8_nz((uint32_t) q4 & 0x0f0f0f0fu),
+                      mxfp4_codes_to_int8_nz(((uint32_t) q4 >> 4) & 0x0f0f0f0fu));
+}
+
 // NVFP4: lane l takes ints 4 (l % 2) .. +3 of every 8th block from l / 2, as vec_dot_nvfp4_q8_1 does, and decodes
 // each weight int once for all the tokens of its group. A sub-group computes R consecutive rows together, so the
 // grouping is paid once for R rows (one row is only ~5 loop steps) and the loads of R rows are in flight at once.
@@ -2880,8 +2897,8 @@ static void mul_mat_vec_nvfp4_moe_dedup(const void * __restrict__ vx_base, const
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 if constexpr (SOA) {
-                    v0[r] = get_int_from_mxfp4(h == 0 ? q4[r].x() : q4[r].z());
-                    v1[r] = get_int_from_mxfp4(h == 0 ? q4[r].y() : q4[r].w());
+                    v0[r] = get_int_from_mxfp4_nz(h == 0 ? q4[r].x() : q4[r].z());
+                    v1[r] = get_int_from_mxfp4_nz(h == 0 ? q4[r].y() : q4[r].w());
                     dw[r] = ggml_sycl_ue4m3_to_fp32((uint8_t) (d2[r] >> (8 * h)));
                 } else {
                     const block_nvfp4 * bx = xr[r] + ib;
