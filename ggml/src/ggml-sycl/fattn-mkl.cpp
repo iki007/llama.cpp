@@ -542,9 +542,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     // --- Allocate intermediates from pool ---
     ggml_sycl_pool & pool = ctx.pool();
 
-    // the pool is a stack: the transposed bias table, allocated first, is declared first so that it is freed last
-    ggml_sycl_pool_alloc<float>      bias_table_t(pool); // [n_bins x n_head x n_queries], an indexed bias only
-    const fattn_indexed_bias bias = dst->src[6] ? ggml_sycl_fattn_indexed_bias(stream, dst, bias_table_t) : fattn_indexed_bias{};
+    const fattn_indexed_bias bias = dst->src[6] ? ggml_sycl_fattn_indexed_bias(dst) : fattn_indexed_bias{};
     const float * sinks_data = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
     ggml_sycl_pool_alloc<float>      KQ_f32(pool);      // [q_tile_rows x chunk]
     ggml_sycl_pool_alloc<sycl::half> S_f16(pool);       // [q_tile_rows x chunk]

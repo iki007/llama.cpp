@@ -593,11 +593,9 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
 
     dpct::queue_ptr stream = ctx.stream();
     ggml_sycl_pool & pool  = ctx.pool();
-    // the pool is a stack: the bias table, allocated first, is declared first
-    ggml_sycl_pool_alloc<float> bias_table_t(pool);
     fattn_indexed_bias          bias = {};
     if (dst->src[6]) {
-        bias = ggml_sycl_fattn_indexed_bias(stream, dst, bias_table_t);
+        bias = ggml_sycl_fattn_indexed_bias(dst);
     }
 
     float scale = 1.0f;

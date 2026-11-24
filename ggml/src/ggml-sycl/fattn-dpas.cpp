@@ -626,8 +626,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     p.nsplit   = nsplit;
 
     // the pool is a stack: the bias table, allocated before parts / meta, is declared first so that it is freed last
-    ggml_sycl_pool_alloc<float>        bias_table_t(ctx.pool());
-    p.bias = dst->src[6] ? ggml_sycl_fattn_indexed_bias(ctx.stream(), dst, bias_table_t) : fattn_indexed_bias{};
+    p.bias = dst->src[6] ? ggml_sycl_fattn_indexed_bias(dst) : fattn_indexed_bias{};
     ggml_sycl_pool_alloc<float>        parts(ctx.pool());
     ggml_sycl_pool_alloc<sycl::float2> meta(ctx.pool());
     if (nsplit > 1) {

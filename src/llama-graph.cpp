@@ -3211,7 +3211,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     auto dense_bias_mask = [&]() {
         ggml_tensor * bins = dense_bins();
-        ggml_tensor * bias = ggml_get_rows(ctx0, bias_table, bins);
+        // the table is [n_bins, n_head, n_q]: gather the bins' head rows
+        ggml_tensor * bias = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, bias_table, 1, 0, 2, 3)), bins);
         bias = ggml_reshape_4d(ctx0, bias, q->ne[2], bins->ne[0], q->ne[1], n_stream);
         bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 2, 0, 1, 3));
         cb(bias, "kq_b", il);

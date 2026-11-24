@@ -320,50 +320,6 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-thread_local ggml_sycl_fattn_bias_direct g_ggml_sycl_fattn_bias_direct;
-
-bool ggml_sycl_try_skip_bias_table_cont(const ggml_cgraph * cgraph, const int i) {
-    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FA_BIAS_DIRECT", 1) != 0;
-    const ggml_tensor * ct = cgraph->nodes[i];
-    if (!enabled || ct->op != GGML_OP_CONT || (ct->flags & GGML_TENSOR_FLAG_OUTPUT) || ct->type != GGML_TYPE_F32) {
-        return false;
-    }
-    const ggml_tensor * pm = ct->src[0];
-    const ggml_tensor * x  = pm ? pm->src[0] : nullptr;
-    // x [n_bins, n_head, n_q] contiguous f32, pm its (1, 0, 2, 3) permute, ct = pm made contiguous [n_head, n_bins, n_q]
-    if (!x || pm->op != GGML_OP_PERMUTE || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[3] != 1 ||
-        pm->ne[0] != x->ne[1] || pm->ne[1] != x->ne[0] || pm->ne[2] != x->ne[2] || pm->nb[0] != x->nb[1] ||
-        pm->nb[1] != x->nb[0] || pm->nb[2] != x->nb[2] || pm->data != x->data || ggml_node_get_use_count(cgraph, i) != 1) {
-        return false;
-    }
-    // its one consumer: a flash attention that takes it as the indexed bias table
-    int j = i + 1;
-    while (j < cgraph->n_nodes && !(cgraph->nodes[j]->op == GGML_OP_FLASH_ATTN_EXT && cgraph->nodes[j]->src[6] == ct)) {
-        ++j;
-    }
-    if (j == cgraph->n_nodes) {
-        return false;
-    }
-    // x must still hold the table there: once the CONT (its last reader) has run, the allocator may give x's block
-    // to a later node, so no node in between, nor the flash attention itself, may be placed over it. Each node is
-    // taken at its allocation size, not ggml_nbytes: the flash attention reserves scratch past its output for the
-    // F16 copies of a quantized cache (ggml_sycl_flash_attn_ext_get_alloc_size), and that scratch landed on x with
-    // a q8_0 cache (KLD 0.26 at 16K context).
-    const uintptr_t xs = (uintptr_t) x->data;
-    const uintptr_t xe = xs + ggml_nbytes(x);
-    for (int k = i + 1; k <= j; ++k) {
-        const ggml_tensor * n  = cgraph->nodes[k];
-        const size_t        sz = n->buffer ? ggml_backend_buffer_get_alloc_size(n->buffer, n) : ggml_nbytes(n);
-        const uintptr_t     ns = (uintptr_t) n->data;
-        const uintptr_t     ne = ns + sz;
-        if (ns < xe && xs < ne) {
-            return false;
-        }
-    }
-    g_ggml_sycl_fattn_bias_direct = { cgraph->nodes[j], (const float *) x->data };
-    return true;
-}
-
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
 
