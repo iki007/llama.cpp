@@ -357,6 +357,28 @@ static __dpct_inline__ void fg_stage_a(const block_iq4_nl * __restrict__ xrow, c
     }
 }
 
+// q5_1: value = d * (nibble | high bit << 4) + m; byte j holds k = j in its low and k = 16 + j in its high nibble,
+// qh bit j the high bit of k = j (as dequantize_q5_1)
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_q5_1 * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_q5_1 & blk = xrow[kb];
+    const float        d   = (float) blk.dm[0];
+    const float        m   = (float) blk.dm[1];
+    uint32_t           qh;
+    memcpy(&qh, blk.qh, sizeof(qh));
+#pragma unroll
+    for (int j = 0; j < QK5_1 / 2; j += 2) {
+        const int q0 = blk.qs[j];
+        const int q1 = blk.qs[j + 1];
+        const int l0 = (q0 & 0xf) | (((qh >> j) & 1) << 4);
+        const int l1 = (q1 & 0xf) | (((qh >> (j + 1)) & 1) << 4);
+        const int h0 = (q0 >> 4) | (((qh >> (j + 16)) & 1) << 4);
+        const int h1 = (q1 >> 4) | (((qh >> (j + 17)) & 1) << 4);
+        a[j / 2]     = E::make(d * l0 + m, d * l1 + m);
+        a[j / 2 + 8] = E::make(d * h0 + m, d * h1 + m);
+    }
+}
+
 // nvfp4: a 64-value block is two k steps. Each step covers two 16-value sub-blocks with their own
 // UE4M3 scale; a sub-block keeps values 0..7 in the low nibbles of its 8 bytes and 8..15 in the high ones.
 // The codes are decoded four at a time by get_int_from_mxfp4 instead of one table lookup per value
@@ -423,6 +445,7 @@ template <> struct fg_block_traits<block_iq2_s>   { static constexpr int qk = QK
 template <> struct fg_block_traits<block_iq1_s>   { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_iq1_m>   { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q8_0>    { static constexpr int qk = QK8_0; };
+template <> struct fg_block_traits<block_q5_1>    { static constexpr int qk = QK5_1; };
 template <> struct fg_block_traits<block_q2_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q3_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q4_K>    { static constexpr int qk = QK_K; };
@@ -1163,7 +1186,7 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
 template <typename T> static constexpr bool fg_plain_ok() {
     return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q2_K> && !std::is_same_v<T, block_q3_K> &&
            !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
-           !std::is_same_v<T, block_q6_K> && !std::is_same_v<T, block_nvfp4>;
+           !std::is_same_v<T, block_q6_K> && !std::is_same_v<T, block_nvfp4> && !std::is_same_v<T, block_q5_1>;
 }
 
 template <typename T, bool R> struct fg_tag {
@@ -1202,6 +1225,7 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
         case GGML_TYPE_Q5_K:    return fg_visit_layout<block_q5_K>(reordered, f);
         case GGML_TYPE_Q6_K:    return fg_visit_layout<block_q6_K>(reordered, f);
         case GGML_TYPE_NVFP4:   return fg_visit_layout<block_nvfp4>(reordered, f);
+        case GGML_TYPE_Q5_1:    return fg_visit_layout<block_q5_1>(reordered, f);
         default:                return false;
     }
 }

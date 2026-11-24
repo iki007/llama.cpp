@@ -371,6 +371,59 @@ template <int MR> struct grouped_gemm_esimd_a<block_iq4_nl, MR> {
     }
 };
 
+// [d][m][qh 4][qs 16], one block a k step: value = d * (nibble | high bit << 4) + m, byte j holding k = j (low
+// nibble, qh bit j) and k = 16 + j (high nibble, qh bit 16 + j). The canonical layout only: q5_1 has no reorder.
+// The product and sum are taken in f32 and rounded to half once, as the joint_matrix stage does.
+template <int MR> struct grouped_gemm_esimd_a<block_q5_1, MR> {
+    static constexpr bool supported = true;
+    static constexpr int  qk        = QK5_1;
+    static constexpr bool whole     = false;
+    static constexpr int  slm_bytes = 0;
+    static ESIMD_INLINE void init_slm() {}
+    struct raw {
+        grouped_gemm_esimd::simd<uint32_t, MR * 4> q;
+        grouped_gemm_esimd::simd<uint32_t, MR>     qh;
+        grouped_gemm_esimd::simd<float, MR>        d, m;
+    };
+
+    static constexpr grouped_gemm_esimd::field DM = { 0, 4, 0 }, QH = { 4, 4, 4 }, QS = { 8, QK5_1 / 2, 8 };
+    static bool ok(const int K, const bool aos) { return aos && K % qk == 0; }
+    struct sb_t {};
+    template <typename Sl> static ESIMD_INLINE void load_sb(sb_t &, const Sl &, const int) {}
+    template <typename Sl> static ESIMD_INLINE void load(raw & r, sb_t &, const Sl & s, const int kb, const int) {
+        using namespace grouped_gemm_esimd;
+        r.q                      = s.template rows<4>(QS, kb, 0);
+        r.qh                     = s.u32(QH, kb, 0);
+        simd<uint32_t, MR>   dm  = s.u32(DM, kb, 0);
+        simd<uint16_t, MR>   d16 = dm & 0xFFFFu;
+        simd<uint16_t, MR>   m16 = dm >> 16;
+        simd<sycl::half, MR> dh  = d16.template bit_cast_view<sycl::half>();
+        simd<sycl::half, MR> mh  = m16.template bit_cast_view<sycl::half>();
+        r.d                      = dh;
+        r.m                      = mh;
+    }
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode(raw & r) {
+        using namespace grouped_gemm_esimd;
+        constexpr int                     RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 4>            qg = r.q.template select<RC * 4, 1>(g * RC * 4);
+        simd<uint32_t, RC * 16>           b  = qg.template bit_cast_view<uint8_t>();
+        simd<uint32_t, RC>                hg = r.qh.template select<RC, 1>(g * RC);
+        simd<uint32_t, RC * 16>           hb = hg.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        simd<uint32_t, RC * 16>           k(0, 1);
+        k &= 15;
+        simd<float, RC * 16> lo = (b & 15u) | (((hb >> k) & 1u) << 4);
+        simd<float, RC * 16> hi = (b >> 4) | (((hb >> (k + 16)) & 1u) << 4);
+        simd<float, RC>      dg = r.d.template select<RC, 1>(g * RC);
+        simd<float, RC>      mg = r.m.template select<RC, 1>(g * RC);
+        simd<float, RC * 16> dr = dg.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        simd<float, RC * 16> mr = mg.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        a_halves             v;
+        v.template select<RC * 16, 1>(0)       = lo * dr + mr;
+        v.template select<RC * 16, 1>(RC * 16) = hi * dr + mr;
+        return v;
+    }
+};
+
 // [d 4][qs 32] per 64 values, two k steps a block: k step j takes sub-blocks 2j and 2j + 1 as its two k halves,
 // each with its own UE4M3 scale. A sub-block keeps values 0..7 in the low nibbles of its 8 bytes and 8..15 in the
 // high ones. The canonical layout only: nvfp4 has no reorder.
@@ -1372,6 +1425,7 @@ bool ggml_sycl_grouped_gemm_esimd(const char *                        src0_dd,
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 8)
 GROUPED_GEMM_ESIMD_INSTANCE(block_q8_0)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq4_nl)
+GROUPED_GEMM_ESIMD_INSTANCE(block_q5_1)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq4_xs)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq3_s)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq3_xxs)
