@@ -96,6 +96,83 @@ static void cumsum_f32_kernel(
     }
 }
 
+// A few long rows (the Inkling2 DSpark drafter's draws scan its 200K vocabulary three times a draft step): one
+// work-group a row walked it in ~200 steps with three barriers each (~0.14 ms a call). Chunks of CUMSUM_CHUNK values
+// take a work-group each: the chunk sums, their exclusive scan per row (at most CUMSUM_WG chunks), then every chunk's
+// scan from its offset. The sums of integer-valued rows (the drafter's radix parts) come out the same in any order.
+static constexpr int CUMSUM_CHUNK = 4096;
+static constexpr int CUMSUM_WG    = 256;  // CUMSUM_CHUNK / CUMSUM_WG values a work-item
+
+static bool cumsum_chunked(ggml_backend_sycl_context & ctx, const float * src, float * dst, int64_t ne00, int64_t ne01,
+                           int64_t ne02, int64_t ne03, int64_t s01, int64_t s02, int64_t s03, int64_t d1, int64_t d2,
+                           int64_t d3) {
+    const int64_t nrows   = ne01 * ne02 * ne03;
+    const int64_t nchunks = (ne00 + CUMSUM_CHUNK - 1) / CUMSUM_CHUNK;
+    if (ne00 < 4 * CUMSUM_CHUNK || nrows >= 64 || nchunks > CUMSUM_WG) {
+        return false;
+    }
+    constexpr int VPT = CUMSUM_CHUNK / CUMSUM_WG;
+    dpct::queue_ptr stream = ctx.stream();
+    ggml_sycl_pool_alloc<float> part(ctx.pool(), (size_t) nrows * nchunks);
+    float * p = part.get();
+    auto row_ptr = [=](int64_t r, const float * base, int64_t a, int64_t b, int64_t c) {
+        const int64_t i1 = r % ne01;
+        const int64_t i2 = (r / ne01) % ne02;
+        const int64_t i3 = r / (ne01 * ne02);
+        return base + i1 * a + i2 * b + i3 * c;
+    };
+    // 1. the chunk sums
+    stream->parallel_for(sycl::nd_range<2>(sycl::range<2>(nrows, nchunks * CUMSUM_WG), sycl::range<2>(1, CUMSUM_WG)),
+                         [=](sycl::nd_item<2> it) {
+                             const int64_t r  = it.get_group(0);
+                             const int64_t c  = it.get_group(1);
+                             const float * x  = row_ptr(r, src, s01, s02, s03);
+                             const int64_t i0 = c * CUMSUM_CHUNK + (int64_t) it.get_local_id(1) * VPT;
+                             float         s  = 0.0f;
+                             for (int j = 0; j < VPT; ++j) {
+                                 s += i0 + j < ne00 ? x[i0 + j] : 0.0f;
+                             }
+                             s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+                             if (it.get_local_id(1) == 0) {
+                                 p[r * nchunks + c] = s;
+                             }
+                         });
+    // 2. their exclusive scan per row, in place
+    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(nrows * CUMSUM_WG), sycl::range<1>(CUMSUM_WG)),
+                         [=](sycl::nd_item<1> it) {
+                             const int64_t r = it.get_group(0);
+                             const int64_t c = it.get_local_id(0);
+                             const float   v = c < nchunks ? p[r * nchunks + c] : 0.0f;
+                             const float   e = sycl::exclusive_scan_over_group(it.get_group(), v, sycl::plus<float>());
+                             if (c < nchunks) {
+                                 p[r * nchunks + c] = e;
+                             }
+                         });
+    // 3. every chunk's scan from its offset
+    stream->parallel_for(sycl::nd_range<2>(sycl::range<2>(nrows, nchunks * CUMSUM_WG), sycl::range<2>(1, CUMSUM_WG)),
+                         [=](sycl::nd_item<2> it) {
+                             const int64_t r  = it.get_group(0);
+                             const int64_t c  = it.get_group(1);
+                             const float * x  = row_ptr(r, src, s01, s02, s03);
+                             float *       y  = const_cast<float *>(row_ptr(r, dst, d1, d2, d3));
+                             const int64_t i0 = c * CUMSUM_CHUNK + (int64_t) it.get_local_id(1) * VPT;
+                             float         v[VPT];
+                             float         run = 0.0f;
+                             for (int j = 0; j < VPT; ++j) {
+                                 run += i0 + j < ne00 ? x[i0 + j] : 0.0f;
+                                 v[j] = run;
+                             }
+                             const float before =
+                                 sycl::exclusive_scan_over_group(it.get_group(), run, sycl::plus<float>()) + p[r * nchunks + c];
+                             for (int j = 0; j < VPT; ++j) {
+                                 if (i0 + j < ne00) {
+                                     y[i0 + j] = v[j] + before;
+                                 }
+                             }
+                         });
+    return true;
+}
+
 inline void ggml_sycl_op_cumsum(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
@@ -120,6 +197,10 @@ inline void ggml_sycl_op_cumsum(ggml_backend_sycl_context & ctx, ggml_tensor * d
     const int64_t d1  = dst->nb[1] / ts;
     const int64_t d2  = dst->nb[2] / ts;
     const int64_t d3  = dst->nb[3] / ts;
+
+    if (cumsum_chunked(ctx, src_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, d1, d2, d3)) {
+        return;
+    }
 
     const int num_warps = (ne00 + WARP_SIZE - 1) / WARP_SIZE;
     int block_size = num_warps * WARP_SIZE;
