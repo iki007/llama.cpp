@@ -21,15 +21,15 @@ struct moe_situ_args {
     float           s1, s3, u1, u3;
 };
 
+// one work-item an element, as a (token, slot, feature) range: the flat index split with 64-bit divisions by the
+// runtime F and K cost about half the kernel's time (moe_situ 0.38 ms at 1024 tokens, ~300 GB/s)
 static void moe_situ_launch(const moe_situ_args & a, float * out, dpct::queue_ptr stream) {
-    const size_t        total = (size_t) a.F * a.K * a.T;
-    const moe_situ_args k     = a;
-    stream->parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
-        const size_t i  = idx[0];
-        const int    f  = (int) (i % k.F);
-        const size_t kt = i / k.F;
-        const int    s  = (int) (kt % k.K);
-        const int    t  = (int) (kt / k.K);
+    const moe_situ_args k = a;
+    stream->parallel_for(sycl::range<3>((size_t) a.T, (size_t) a.K, (size_t) a.F), [=](sycl::id<3> idx) {
+        const int    t  = (int) idx[0];
+        const int    s  = (int) idx[1];
+        const int    f  = (int) idx[2];
+        const size_t i  = ((size_t) t * k.K + s) * k.F + f;
         const float  sc = k.scale ? k.scale[k.ids[(size_t) t * k.ids_tok + s]] : 1.0f;
         const float * xr = k.x + (size_t) t * k.x_tok + (size_t) s * k.x_slot;
         const float g   = xr[f] * sc;
@@ -53,13 +53,13 @@ struct moe_combine_args {
     int             E, K, T;
 };
 
+// one work-item an output element, as a (token, element) range: no 64-bit division of a flat index
 static void moe_combine_launch(const moe_combine_args & a, float * out, dpct::queue_ptr stream) {
-    const size_t           total = (size_t) a.E * a.T;
-    const moe_combine_args k     = a;
-    stream->parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
-        const size_t i = idx[0];
-        const int    e = (int) (i % k.E);
-        const int    t = (int) (i / k.E);
+    const moe_combine_args k = a;
+    stream->parallel_for(sycl::range<2>((size_t) a.T, (size_t) a.E), [=](sycl::id<2> idx) {
+        const int    t = (int) idx[0];
+        const int    e = (int) idx[1];
+        const size_t i = (size_t) t * k.E + e;
         float        acc = 0.0f;
         for (int s = 0; s < k.K; ++s) {
             const float sc = k.scale ? k.scale[k.ids[(size_t) t * k.ids_tok + s]] : 1.0f;

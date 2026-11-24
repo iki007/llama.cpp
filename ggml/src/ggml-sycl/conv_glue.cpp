@@ -20,9 +20,10 @@ struct conv_glue_args {
 
 template <int DC> static void conv_glue_launch(const conv_glue_args & a, float * out, dpct::queue_ptr stream) {
     const conv_glue_args k = a;
-    stream->parallel_for(sycl::range<1>((size_t) a.C * a.T), [=](sycl::id<1> idx) {
-        const int     c  = (int) (idx[0] % k.C);
-        const int     t  = (int) (idx[0] / k.C);
+    // a (token, channel) range: no 64-bit division of a flat index
+    stream->parallel_for(sycl::range<2>((size_t) a.T, (size_t) a.C), [=](sycl::id<2> idx) {
+        const int     t  = (int) idx[0];
+        const int     c  = (int) idx[1];
         const float * xs = k.x + (size_t) c * k.x_ch + t;
         const float * wc = k.w + (size_t) c * (DC > 0 ? DC : k.d_conv);
         float         sumf = 0.0f;
@@ -167,13 +168,15 @@ struct conv_store_args {
 static void conv_store_launch(const conv_store_args & a, dpct::queue_ptr stream) {
     const conv_store_args k = a;
     const int             W = a.n_cols + a.T;
-    stream->parallel_for(sycl::range<1>((size_t) W * a.C * a.S), [=](sycl::id<1> idx) {
-        const int tau = (int) (idx[0] % W);
-        const int c   = (int) ((idx[0] / W) % k.C);
-        const int s   = (int) (idx[0] / ((size_t) W * k.C));
+    // a (sequence, channel, column) range: no 64-bit division of a flat index
+    stream->parallel_for(sycl::range<3>((size_t) a.S, (size_t) a.C, (size_t) W), [=](sycl::id<3> id3) {
+        const int    s   = (int) id3[0];
+        const int    c   = (int) id3[1];
+        const int    tau = (int) id3[2];
+        const size_t idx = ((size_t) s * k.C + c) * W + tau;
         const float v = tau < k.n_cols ? *(const float *) (k.past + tau * k.p0 + c * k.p1 + s * k.p2)
                                        : *(const float *) (k.xt + (tau - k.n_cols) * k.x0 + c * k.x1 + s * k.x2);
-        k.xcat[idx[0]] = v;
+        k.xcat[idx] = v;
         if (k.slot == nullptr) {
             const int j = tau - k.T; // the last n_cols columns, in the CPY's element order (j fastest, then c)
             if (j >= 0) {
