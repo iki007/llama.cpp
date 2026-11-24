@@ -20,10 +20,10 @@
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
-// ggml_flash_attn_ext_add_indexed_bias: table[head, indices[key, query], query] added to the mask before its F16 rounding
+// ggml_flash_attn_ext_add_indexed_bias: table[indices[key, query], head, query] added to the mask before its F16 rounding
 // (indices outside [0, n_bins) add nothing). Queries of all streams are flattened in stream order.
 struct fattn_indexed_bias {
-    const float *   table;    // [n_bins, n_head, n_queries]: launch_fattn's transposed copy of the op's table
+    const float *   table;    // [n_bins, n_head, n_queries], the op's table
     const int32_t * indices;  // [n_kv, n_queries], or null when the bins come from positions
     int64_t         n_bins;
     int64_t         n_head;
@@ -954,26 +954,20 @@ static void lauch_kernel(
     });
 }
 
-// An indexed bias table comes as [n_head, n_bins, n_queries], the head innermost. The kernels that apply it (tile:
-// one head a work-group; MKL softmax: one query row a work-group) take consecutive keys on consecutive work-items,
-// i.e. consecutive bins: read that way the table is one cache line a work-item. So it is transposed once to
-// [n_bins, n_head, n_queries], bins innermost, into buf, through local memory, 32 bins of one query a work-group
-// (the reads are the bins' contiguous head rows, the writes each head's 32 bins).
-static fattn_indexed_bias ggml_sycl_fattn_indexed_bias(dpct::queue_ptr stream, const ggml_tensor * dst,
-                                                       ggml_sycl_pool_alloc<float> & buf) {
+// The indexed bias of a flash attention: its table [n_bins, n_head, n_queries] (bins innermost, so consecutive keys on
+// consecutive work-items read one cache line) and the bins, from indices or from positions.
+static fattn_indexed_bias ggml_sycl_fattn_indexed_bias(const ggml_tensor * dst) {
     const ggml_tensor * table   = dst->src[6];
     const ggml_tensor * indices = dst->src[7];
     GGML_ASSERT(table && indices);
     const int32_t extent = ggml_flash_attn_ext_rel_pos_extent(dst);
     GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) &&
                 indices->type == (extent > 0 ? GGML_TYPE_F32 : GGML_TYPE_I32));
-    const int n_head = (int) table->ne[0];
-    const int n_bins = (int) table->ne[1];
-    const int n_q    = (int) table->ne[2];
-    GGML_ASSERT((int64_t) n_head * n_bins * n_q <= INT32_MAX);
+    GGML_ASSERT(ggml_nelements(table) <= INT32_MAX);
     fattn_indexed_bias b = {};
-    b.n_bins = n_bins;
-    b.n_head = n_head;
+    b.table  = (const float *) table->data;
+    b.n_bins = table->ne[0];
+    b.n_head = table->ne[1];
     if (extent > 0) {
         // positions [n_kv + n_q of a stream, n_streams]
         b.pos     = (const float *) indices->data;
@@ -985,41 +979,6 @@ static fattn_indexed_bias ggml_sycl_fattn_indexed_bias(dpct::queue_ptr stream, c
         b.indices = (const int32_t *) indices->data;
         b.stride  = (int64_t) (indices->nb[1] / sizeof(int32_t));
     }
-    // the graph loop skipped the table's CONT and handed on its bins-innermost source (ggml_sycl_try_skip_bias_table_cont)
-    if (g_ggml_sycl_fattn_bias_direct.fa == dst) {
-        b.table = g_ggml_sycl_fattn_bias_direct.table_t;
-        g_ggml_sycl_fattn_bias_direct = {};
-        return b;
-    }
-    constexpr int TB = 32;
-    constexpr int WG = 256;
-    buf.alloc(ggml_nelements(table));
-    const float * src  = (const float *) table->data;
-    float *       tdst = buf.get();
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<float, 1> tile(sycl::range<1>((size_t) TB * n_head), cgh);
-        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) n_q, (size_t) ((n_bins + TB - 1) / TB) * WG),
-                                           sycl::range<2>(1, WG)),
-                         [=](sycl::nd_item<2> it) {
-                             const int     q   = (int) it.get_group(0);
-                             const int     b0  = (int) it.get_group(1) * TB;
-                             const int     tid = (int) it.get_local_id(1);
-                             const int     nb  = sycl::min(TB, n_bins - b0);
-                             const float * in  = src + ((size_t) q * n_bins + b0) * n_head;
-                             for (int i = tid; i < nb * n_head; i += WG) {
-                                 tile[i] = in[i];
-                             }
-                             sycl::group_barrier(it.get_group());
-                             for (int i = tid; i < n_head * TB; i += WG) {
-                                 const int h = i / TB;
-                                 const int b = i % TB;
-                                 if (b < nb) {
-                                     tdst[((size_t) q * n_head + h) * n_bins + b0 + b] = tile[b * n_head + h];
-                                 }
-                             }
-                         });
-    });
-    b.table = tdst;
     return b;
 }
 
@@ -1057,15 +1016,13 @@ void launch_fattn(
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
     const ggml_sycl_fattn_extra  extra = ggml_sycl_fattn_get_extra(dst, ctx.device);
-    // the pool is a stack: the bias table, allocated before the others, is declared first so that it is freed last
-    ggml_sycl_pool_alloc<float>  bias_table_t(pool);
     ggml_sycl_pool_alloc<int>    KV_max(pool);
     ggml_sycl_pool_alloc<float>  dst_tmp(pool);
     ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);
 
     fattn_indexed_bias bias = {};
     if (dst->src[6]) {
-        bias = ggml_sycl_fattn_indexed_bias(main_stream, dst, bias_table_t);
+        bias = ggml_sycl_fattn_indexed_bias(dst);
     }
 
     const char * K_data = (const char *) K->data;

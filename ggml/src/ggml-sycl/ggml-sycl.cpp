@@ -7579,9 +7579,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += 2;
             continue;
         }
-        if (node->op == GGML_OP_CONT && ggml_sycl_try_skip_bias_table_cont(cgraph, i)) {
-            continue;
-        }
         if (node->op == GGML_OP_RMS_NORM) {
             const int ctrl_nodes_to_skip = ggml_sycl_try_loop_ctrl_fusion(*sycl_ctx, cgraph, i);
             if (ctrl_nodes_to_skip != 0) {

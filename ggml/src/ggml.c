@@ -5602,7 +5602,7 @@ void ggml_flash_attn_ext_add_rel_pos_bias(
         struct ggml_tensor * positions,
         int32_t              extent) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(table && positions && extent > 0 && extent < table->ne[1]);
+    GGML_ASSERT(table && positions && extent > 0 && extent < table->ne[0]);
     a->src[6] = table;
     a->src[7] = positions;
     ggml_set_op_params_i32(a, 5, 1);
@@ -5613,7 +5613,7 @@ void ggml_flash_attn_ext_add_rel_pos_bias(
     GGML_ASSERT(mask && mask->ne[0] == (a->src[5] ? a->src[5]->ne[0] : a->src[1]->ne[1]) && mask->ne[1] == q->ne[1]);
     GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
     GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
-    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[1] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
+    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[0] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
     GGML_ASSERT(positions->type == GGML_TYPE_F32 && ggml_is_contiguous(positions) && ggml_is_matrix(positions));
     GGML_ASSERT(positions->ne[0] == mask->ne[0] + q->ne[1] && positions->ne[1] == q->ne[3]);
 }
