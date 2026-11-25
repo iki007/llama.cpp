@@ -3362,6 +3362,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            // several KV streams (parallel sequences without a unified cache): the tokens of stream s follow those of
+            // stream s - 1 at the same token stride, so [n_embd_v, n_tokens, n_head, n_stream] is the view
+            // [n_embd_v, n_tokens*n_stream, n_head, 1]. v_mla has one batch in dim 3, and backends that do not
+            // broadcast it (SYCL) would hand the whole product to the CPU otherwise.
+            if (cur->ne[3] > 1 && v_mla->ne[3] == 1 && cur->nb[3] == cur->ne[1]*cur->nb[1]) {
+                cur = ggml_view_4d(ctx0, cur, cur->ne[0], cur->ne[1]*cur->ne[3], cur->ne[2], 1,
+                                   cur->nb[1], cur->nb[2], cur->nb[2]*cur->ne[2], 0);
+            }
             cur = ggml_mul_mat(ctx0, v_mla, cur);
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
