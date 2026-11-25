@@ -3292,6 +3292,8 @@ struct llama_model_raon1 : public llama_model_base {
         ggml_tensor * build_rda_conv(llm_graph_input_rs * inp_rs, ggml_tensor * conv_states_seq,
                                      ggml_tensor * x_proj, ggml_tensor * conv_w, int64_t qkv, int il);
 
+        ggml_tensor * build_rda_conv_out(ggml_tensor * conv_x, ggml_tensor * conv_w, int64_t n_seq_tokens, int64_t n_seqs);
+
         ggml_tensor * build_rda_gate(ggml_tensor * x, ggml_tensor * ssm_a);
 
         ggml_tensor * build_rda_layer(ggml_tensor * cur, const llama_layer & layer,
