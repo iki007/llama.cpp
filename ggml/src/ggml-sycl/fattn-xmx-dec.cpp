@@ -129,16 +129,22 @@ static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, R> fa_xmx_row_sum(
 // Q8: K and V are a q8_0 cache read in place (see the loads below); otherwise f16
 // D: the head size (256 or 128). T = D / 16 threads, each owning 16 dims of O and scoring 16 tokens of a block of
 // BK = 16 T tokens; KS = D / 16 k-steps of 16 dims per score.
-template <int D, int RG, bool SKIP, bool Q8>
+// DK = DV = 128 or 256, or the absorbed MLA shape DK = 576 (512 latent + 64), DV = 512 over an f16 cache whose V is the
+// first 512 dims of the K rows (Raon-1 mini, 40 heads on one latent head): DV / 16 = 32 threads, 512-token blocks, the
+// last block may be half full (the cache is padded to 256 tokens); its missing tokens score -inf
+template <int DK, int DV, int RG, bool SKIP, bool Q8>
 static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     namespace xmx     = sycl::ext::intel::esimd::xmx;
     namespace esimd_x = sycl::ext::intel::experimental::esimd;
     constexpr int R8 = RG * 8;  // rows padded to whole DPAS row groups
-    constexpr int T  = D / 16;
-    constexpr int BK = T * 16;
-    constexpr int KS = D / 16;
-    static_assert(D == 256 || D == 128, "XMX flash attention: head 256 or 128");
+    constexpr int  D   = DV;  // O dims, per-thread slices
+    constexpr int  T   = DV / 16;
+    constexpr int  BK  = T * 16;
+    constexpr int  KS  = DK / 16;
+    constexpr bool MLA = DK != DV;
+    static_assert((DK == DV && (DK == 256 || DK == 128)) || (DK == 576 && DV == 512 && !Q8 && !SKIP),
+                  "XMX flash attention: head 256 or 128, or MLA 576/512 over f16");
     // SLM: Q as [KS k-steps][R8 rows][16 dims] f16, P as [T token-steps][R8 rows][16 tokens] f16, then the
     // per-thread row maxima and sums [T][R8] f32. Each 8x16 DPAS A operand is 256 contiguous bytes.
     constexpr uint32_t SLM_Q   = 0;
@@ -163,18 +169,18 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
 
     // 1. Q rows r = j g + c (query j, head c of this KV head) to SLM, scaled, f16; padding rows are 0
     for (int r = t; r < R8; r += T) {
-        simd<float, D> q = 0.0f;
+        simd<float, DK> q = 0.0f;
         if (r < M) {
             const int     j  = r / a.g;
             const int     c  = r - j * a.g;
             const float * qp = (const float *) (Qs + j * a.q_nb1 + (size_t) (kvh * a.g + c) * a.q_nb2);
 #pragma unroll
-            for (int i = 0; i < D / 64; ++i) {
+            for (int i = 0; i < DK / 64; ++i) {
                 q.template select<64, 1>(64 * i) = block_load<float, 64>(qp + 64 * i, a16);
             }
             q *= a.qscale;
         }
-        simd<sycl::half, D> qh = convert<sycl::half>(q);
+        simd<sycl::half, DK> qh = convert<sycl::half>(q);
 #pragma unroll
         for (int ks = 0; ks < KS; ++ks) {
             slm_block_store<sycl::half, 16>(SLM_Q + (ks * R8 + r) * 32, qh.template select<16, 1>(16 * ks));
@@ -190,11 +196,12 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
     // head slices of the caches: D f16 per row at the row pitch
     const uint32_t * Kh = (const uint32_t *) (a.K + (size_t) str * a.k_nb3 + (size_t) kvh * (Q8 ? a.k_hb : a.k_nb2));
     const sycl::half * Vh = (const sycl::half *) (a.V + (size_t) str * a.v_nb3 + (size_t) kvh * (Q8 ? a.v_hb : a.v_nb2));
-    const unsigned surf_w = D * sizeof(sycl::half) - 1;
-    const unsigned surf_h = (unsigned) a.n_kv - 1;
-    esimd_x::config_2d_mem_access<uint32_t, 8, 16, 1>    k_desc(Kh, Q8 ? (unsigned) a.k_nb1 - 1 : surf_w, surf_h,
+    const unsigned surf_wk = DK * sizeof(sycl::half) - 1;
+    const unsigned surf_wv = DV * sizeof(sycl::half) - 1;
+    const unsigned surf_h  = (unsigned) a.n_kv - 1;
+    esimd_x::config_2d_mem_access<uint32_t, 8, 16, 1>    k_desc(Kh, Q8 ? (unsigned) a.k_nb1 - 1 : surf_wk, surf_h,
                                                                 (unsigned) a.k_nb1 - 1, 0, 0);
-    esimd_x::config_2d_mem_access<sycl::half, 16, 16, 1> v_desc(Vh, surf_w, surf_h, (unsigned) a.v_nb1 - 1, t * 16, 0);
+    esimd_x::config_2d_mem_access<sycl::half, 16, 16, 1> v_desc(Vh, surf_wv, surf_h, (unsigned) a.v_nb1 - 1, t * 16, 0);
 
     // q8_0 in place: a head row is 8 blocks of 34 bytes (a 2-byte f16 scale, 32 int8), loaded as dwords at
     // dword-aligned offsets and dequantized in f16 (int8 converts exactly, the product is rounded once), the same
@@ -210,7 +217,7 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
                                                                (unsigned) a.v_nb1 - 1, kvh * a.v_hx + 34 * (t >> 1) / 4, 0);
 
     const int blk0 = split * a.bps;
-    const int nblk = a.n_kv / BK;
+    const int nblk = (a.n_kv + BK - 1) / BK;
     const int blk1 = blk0 + a.bps < nblk ? blk0 + a.bps : nblk;
     for (int blk = blk0; blk < blk1; ++blk) {
         const int tok0   = blk * BK;
@@ -287,10 +294,14 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
             score();
         }
 
-        // 3. mask (log2 domain), per query row j; an indexed bias joins the mask before its f16 rounding
+        // 3. mask (log2 domain), per query row j; an indexed bias joins the mask before its f16 rounding. MLA: the
+        // tokens past the cache (2D loads read them as 0) of a half-full last block score -inf
+        const bool past = MLA && my_tok >= a.n_kv;
 #pragma unroll
         for (int r = 0; r < R8; ++r) {
-            if (r < M) {
+            if (past) {
+                s.template select<16, 1>(16 * r) = -FLT_MAX;
+            } else if (r < M) {
                 const int          jq = r / a.g;
                 const sycl::half * mp = (const sycl::half *) (Ms + jq * a.m_nb1) + my_tok;
                 simd<float, 16>    mk = convert<float>(block_load<sycl::half, 16>(mp, a16));
@@ -442,11 +453,11 @@ static ESIMD_INLINE void fa_xmx_kernel(const fa_xmx_args a, const sycl::nd_item<
     }
 }
 
-template <int D, int RG, bool SKIP, bool Q8>
+template <int DK, int DV, int RG, bool SKIP, bool Q8>
 static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
-    constexpr int           T = D / 16;
+    constexpr int           T = DV / 16;
     const sycl::nd_range<1> range(sycl::range<1>((size_t) a.n_str * n_kvh * a.nsplit * T), sycl::range<1>(T));
-    auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<D, RG, SKIP, Q8>(a, it); };
+    auto kern = [=](sycl::nd_item<1> it) SYCL_ESIMD_FUNCTION { fa_xmx_kernel<DK, DV, RG, SKIP, Q8>(a, it); };
     if constexpr (RG <= 3) {
         if (grf128) {
             stream->parallel_for(range, fa_xmx_grf128<decltype(kern)>{ kern });
@@ -459,21 +470,29 @@ static void fa_xmx_launch(const fa_xmx_args & a, int n_kvh, bool grf128, dpct::q
 template <int D, bool SKIP, bool Q8>
 static void fa_xmx_launch_rg_d(int RG, const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
     switch (RG) {
-        case 1: fa_xmx_launch<D, 1, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 2: fa_xmx_launch<D, 2, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 3: fa_xmx_launch<D, 3, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 4: fa_xmx_launch<D, 4, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 5: fa_xmx_launch<D, 5, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 6: fa_xmx_launch<D, 6, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 7: fa_xmx_launch<D, 7, SKIP, Q8>(a, n_kvh, grf128, stream); break;
-        case 8: fa_xmx_launch<D, 8, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 1: fa_xmx_launch<D, D, 1, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 2: fa_xmx_launch<D, D, 2, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 3: fa_xmx_launch<D, D, 3, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 4: fa_xmx_launch<D, D, 4, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 5: fa_xmx_launch<D, D, 5, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 6: fa_xmx_launch<D, D, 6, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 7: fa_xmx_launch<D, D, 7, SKIP, Q8>(a, n_kvh, grf128, stream); break;
+        case 8: fa_xmx_launch<D, D, 8, SKIP, Q8>(a, n_kvh, grf128, stream); break;
         default: GGML_ABORT("XMX flash attention: %d row groups", RG);
     }
 }
 
 template <bool SKIP, bool Q8 = false>
 static void fa_xmx_launch_rg(int D, int RG, const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
-    if (D == 128) {
+    if (D == 576) {
+        // MLA (40 heads on one latent head, one token): 5 row groups only (ggml_sycl_flash_attn_ext_xmx_dec_supported)
+        if constexpr (!SKIP && !Q8) {
+            GGML_ASSERT(RG == 5);
+            fa_xmx_launch<576, 512, 5, false, false>(a, n_kvh, grf128, stream);
+            return;
+        }
+        GGML_ABORT("XMX flash attention: MLA over a q8_0 cache or with span skipping");
+    } else if (D == 128) {
         fa_xmx_launch_rg_d<128, SKIP, Q8>(RG, a, n_kvh, grf128, stream);
     } else {
         fa_xmx_launch_rg_d<256, SKIP, Q8>(RG, a, n_kvh, grf128, stream);
@@ -542,9 +561,16 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_supported(int device, const ggml_tensor * 
         softcap != 0.0f || dst->src[5] || ggml_get_op_params_i32(dst, 4) > 0) {
         return false;
     }
-    const int64_t D = K->ne[0];
-    if ((D != FA_XMX_D && D != 128) || V->ne[0] != D || Q->ne[0] != D || K->nb[0] != ggml_type_size(K->type) ||
-        V->nb[0] != ggml_type_size(V->type)) {
+    const int64_t D   = K->ne[0];
+    // absorbed MLA: f16 latent cache, V = the first 512 dims of the K rows, >= 32 heads on one latent head and one
+    // token (5 DPAS row groups); GGML_SYCL_FA_XMX_DEC_MLA=0 leaves it to the MKL / tile kernels
+    static const int mla_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_DEC_MLA", 1);
+    const bool    mla = mla_env && D == 576 && V->ne[0] == 512 && Q->ne[0] == 576 && f16 && K->ne[2] == 1 &&
+                     (Q->ne[2] * Q->ne[1] + 7) / 8 == 5 && Q->ne[2] >= 32 && K->ne[1] % 256 == 0;
+    if (!mla && ((D != FA_XMX_D && D != 128) || V->ne[0] != D || Q->ne[0] != D)) {
+        return false;
+    }
+    if (K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
         return false;
     }
     const int64_t ns = Q->ne[3];
@@ -554,7 +580,7 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_supported(int device, const ggml_tensor * 
     }
     const int64_t g  = Q->ne[2] / K->ne[2];
     const int64_t nq = Q->ne[1];
-    if (nq > max_q || g > 64 || K->ne[1] % D != 0 || mask->ne[0] < K->ne[1] || mask->ne[1] < nq) {
+    if (nq > max_q || g > 64 || (!mla && K->ne[1] % D != 0) || mask->ne[0] < K->ne[1] || mask->ne[1] < nq) {
         return false;
     }
     if (!fa_xmx_kv_layout(K) || !fa_xmx_kv_layout(V)) {
@@ -563,7 +589,7 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_supported(int device, const ggml_tensor * 
     // an f16 V that is a view of K (MLA-style caches) keeps the other kernels: the fallback of the dispatch (DPAS)
     // reads only a q8_0 cache that way
     const ggml_tensor * k_src = K->view_src ? K->view_src : K;
-    if (f16 && V->view_src == k_src && V->view_offs == (K->view_src ? K->view_offs : 0)) {
+    if (!mla && f16 && V->view_src == k_src && V->view_offs == (K->view_src ? K->view_offs : 0)) {
         return false;
     }
     if (ns > 1 && (Q->nb[3] % 16 != 0 || (mask->ne[3] > 1 && mask->nb[3] % 16 != 0) || K->nb[3] % 64 != 0 || V->nb[3] % 64 != 0)) {
@@ -580,7 +606,7 @@ bool ggml_sycl_flash_attn_ext_xmx_dec_data_ok(const ggml_tensor * dst) {
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
-    return (uintptr_t) Q->data % 16 == 0 && (uintptr_t) mask->data % 16 == 0 && K->data != V->data &&
+    return (uintptr_t) Q->data % 16 == 0 && (uintptr_t) mask->data % 16 == 0 && (K->data != V->data || K->ne[0] == 576) &&
            fa_xmx_kv_layout(K) && fa_xmx_kv_layout(V);
 }
 
@@ -605,8 +631,9 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
     const int g     = (int) (Q->ne[2] / K->ne[2]);
     const int nq    = (int) Q->ne[1];
     const int n_kv  = (int) K->ne[1];
-    const int D     = (int) K->ne[0];
-    const int nblk  = n_kv / D;
+    const int D     = (int) K->ne[0];   // K dims (576 for MLA)
+    const int DV    = (int) V->ne[0];   // O dims, also the KV block (512 for MLA)
+    const int nblk  = (n_kv + DV - 1) / DV;
     const int n_str = (int) Q->ne[3];
     const int m_str = (int) mask->ne[3];
 
@@ -632,12 +659,12 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
     const int        RG_max     = R8_max / 8;
     const bool       grf128     = grf128_env && (RG_max <= 2 || (RG_max == 3 && n_str > 1));
     const int        n_hs       = n_str * n_kvh;
-    const int        n_wgs      = (grf128 ? 2 * target_wgs : target_wgs) * (FA_XMX_D / D);
+    const int        n_wgs      = (grf128 ? 2 * target_wgs : target_wgs) * FA_XMX_D / DV;
     int              nsplit     = std::max(1, std::min(nblk, (n_wgs + n_hs - 1) / n_hs));
     const int        bps        = (nblk + nsplit - 1) / nsplit;
     nsplit                      = (nblk + bps - 1) / bps;
 
-    ggml_sycl_pool_alloc<float> part_o(pool, (size_t) n_hs * nsplit * R8_max * D);
+    ggml_sycl_pool_alloc<float> part_o(pool, (size_t) n_hs * nsplit * R8_max * DV);
     ggml_sycl_pool_alloc<float> part_ml(pool, (size_t) n_hs * nsplit * R8_max * 2);
 
     const size_t o_nb1 = dst->nb[1] / sizeof(float);
@@ -704,7 +731,7 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
         // merge the slices: dst[j][kvh g + c][d] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp2(m_s - max_s m_s); an
         // attention sink (a logit with no value row, natural log units: times log2(e) here) joins the max and the sum
         float * out = (float *) dst->data + j0 * o_nb2;
-        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) n_hs * M * D), sycl::range<1>(D)),
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) n_hs * M * DV), sycl::range<1>(DV)),
                              [=](sycl::nd_item<1> it) {
                                  const int row = it.get_group(0);
                                  const int hs  = row / M;
@@ -724,7 +751,7 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
                                  for (int s = 0; s < nsplit; ++s) {
                                      const size_t i = ((size_t) hs * nsplit + s) * R8 + r;
                                      const float  w = sycl::exp2(pml[i * 2] - mx);
-                                     num += w * po[i * D + d];
+                                     num += w * po[i * DV + d];
                                      den += w * pml[i * 2 + 1];
                                  }
                                  out[st * o_nb3 + j * o_nb2 + (size_t) (kvh * g + c) * o_nb1 + d] = num / den;

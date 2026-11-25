@@ -15467,7 +15467,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     // Raon-1 absorbed MLA: 40 query heads on one latent head (decode, verify batches, prompt chunks)
     for (int nb : { 1, 8, 64, 512 }) {
-        for (int kv : { 1024, 8192 }) {
+        for (int kv : { 1024, 1280, 8192 }) {
             for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {40, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true));
             }
