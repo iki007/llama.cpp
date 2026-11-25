@@ -48,33 +48,32 @@ static void mkl_fa_pack_q_fp16(
     float q_scale, int64_t q_row_stride, int64_t q_head_stride,
     int64_t wg_size) {
 
-    for (int iqg = 0; iqg < gqa_ratio; iqg++) {
-        int     iqh       = kvh_base_head + iqg;
-        sycl::half * dst_g = dst + (int64_t)iqg * n_queries * DKQ;
+    // one launch for all gqa_ratio heads (a launch a head cost 40 launches a layer on Raon-1 mini decode)
+    const int64_t n_elem_g = (int64_t)n_queries * DKQ;
+    const int64_t n_elem   = n_elem_g * gqa_ratio;
+    const int64_t wg = ((n_elem + wg_size - 1) / wg_size) * wg_size;
 
-        const int64_t n_elem = (int64_t)n_queries * DKQ;
-        const int64_t wg = ((n_elem + wg_size - 1) / wg_size) * wg_size;
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(wg, wg_size),
+            [=](sycl::nd_item<1> item) {
+                int64_t e = item.get_global_id(0);
+                if (e >= n_elem) return;
 
-        stream->submit([&](sycl::handler & cgh) {
-            cgh.parallel_for(sycl::nd_range<1>(wg, wg_size),
-                [=](sycl::nd_item<1> item) {
-                    int64_t e = item.get_global_id(0);
-                    if (e >= n_elem) return;
+                const int64_t iqg = e / n_elem_g;
+                const int64_t eg  = e - iqg * n_elem_g;
+                const int64_t q   = eg / DKQ;
+                const int64_t d   = eg - q * DKQ;
 
-                    int64_t q = e / DKQ;
-                    int64_t d = e - q * DKQ;
+                // Stride-aware source offset: handles permuted,
+                // sliced, or contiguous Q tensor layouts.
+                int64_t src_off = d
+                    + q * q_row_stride
+                    + (kvh_base_head + iqg) * q_head_stride;
 
-                    // Stride-aware source offset: handles permuted,
-                    // sliced, or contiguous Q tensor layouts.
-                    int64_t src_off = d
-                        + q * q_row_stride
-                        + (int64_t)iqh * q_head_stride;
-
-                    dst_g[e] = sycl::half(
-                        q_src[src_off] * q_scale);
-                });
-        });
-    }
+                dst[e] = sycl::half(
+                    q_src[src_off] * q_scale);
+            });
+    });
 }
 
 // Zero-initialize the online softmax state arrays.
