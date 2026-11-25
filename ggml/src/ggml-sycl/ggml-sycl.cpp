@@ -6069,13 +6069,16 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
 // once in order (identity ids): a gather of the src1 rows when they are strided, one q8_1 quantization, one launch.
 static bool ggml_sycl_can_mul_mat_stack_mmvq(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const bool enabled = ggml_sycl_get_env("GGML_SYCL_MUL_MAT_STACK_MMVQ", 1) != 0;
+    // GGML_SYCL_MUL_MAT_STACK_MAX_TOK: the most tokens taken (each reads every matrix once; the per-matrix loop above
+    // that: 16 parallel decode sessions on Raon-1 ran ~500 launches a step there)
+    static const int max_tok = ggml_sycl_get_env("GGML_SYCL_MUL_MAT_STACK_MAX_TOK", 32);
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     return enabled && ggml_is_quantized(src0->type) && ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type) &&
            !(extra && extra->optimized_feature.reorder) && ggml_is_contiguous(src0) &&
            src0->ne[2] > 1 && src0->ne[2] <= 256 && src0->ne[3] == 1 &&
-           src1->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src1->ne[2] == src0->ne[2] && src1->ne[3] == 1 &&
-           src1->nb[0] == sizeof(float) && src1->nb[2] % sizeof(float) == 0 &&
-           dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst);
+           src1->type == GGML_TYPE_F32 && src1->ne[1] >= 1 && src1->ne[1] <= max_tok && src1->ne[2] == src0->ne[2] &&
+           src1->ne[3] == 1 && src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
+           src1->nb[2] % sizeof(float) == 0 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst);
 }
 
 static void ggml_sycl_mul_mat_stack_mmvq(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
@@ -6083,19 +6086,24 @@ static void ggml_sycl_mul_mat_stack_mmvq(ggml_backend_sycl_context & ctx, const 
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2, " : stack of matrices, one row each");
     const queue_ptr stream = ctx.stream();
     const int       ne10   = (int) src1->ne[0];
+    const int       n_tok  = (int) src1->ne[1];
     const int       n_mat  = (int) src0->ne[2];
     const int       nrows  = (int) src0->ne[1];
     const int       padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t   s11    = src1->nb[1] / sizeof(float);
     const int64_t   s12    = src1->nb[2] / sizeof(float);
 
+    // rows as [token][matrix][ne10]: slot m of token t is matrix m
     const float *               src1_f = (const float *) src1->data;
     ggml_sycl_pool_alloc<float> src1_rows(ctx.pool());
-    if (s12 != ne10) {
-        float *       rows = src1_rows.alloc((size_t) n_mat * ne10);
+    if (!(n_tok == 1 ? s12 == ne10 : (s12 == ne10 && s11 == (int64_t) n_mat * ne10))) {
+        float *       rows = src1_rows.alloc((size_t) n_tok * n_mat * ne10);
         const float * x    = src1_f;
-        stream->parallel_for(sycl::range<1>((size_t) n_mat * ne10), [=](sycl::id<1> i) {
-            const int64_t m = (int64_t) i[0] / ne10;
-            rows[i[0]]      = x[m * s12 + ((int64_t) i[0] - m * ne10)];
+        stream->parallel_for(sycl::range<1>((size_t) n_tok * n_mat * ne10), [=](sycl::id<1> i) {
+            const int64_t r = (int64_t) i[0] / ne10;
+            const int64_t t = r / n_mat;
+            const int64_t m = r - t * n_mat;
+            rows[i[0]]      = x[m * s12 + t * s11 + ((int64_t) i[0] - r * ne10)];
         });
         src1_f = rows;
     }
@@ -6105,14 +6113,15 @@ static void ggml_sycl_mul_mat_stack_mmvq(ggml_backend_sycl_context & ctx, const 
     stream->parallel_for(sycl::range<1>(n_mat), [=](sycl::id<1> i) { ids_d[i[0]] = (int32_t) i[0]; });
 
     const size_t               bytes_per_qrow = (size_t) padded * sizeof(block_q8_1) / QK8_1;
-    ggml_sycl_pool_alloc<char> src1_q8(ctx.pool(), (size_t) n_mat * bytes_per_qrow);
-    quantize_row_q8_1_sycl<quantize_q8_1>(src1_f, src1_q8.get(), ne10, n_mat, padded, stream);
+    ggml_sycl_pool_alloc<char> src1_q8(ctx.pool(), (size_t) n_tok * n_mat * bytes_per_qrow);
+    quantize_row_q8_1_sycl<quantize_q8_1>(src1_f, src1_q8.get(), ne10, n_tok * n_mat, padded, stream);
 
     const bool ok = ggml_sycl_mul_mat_vec_q_id(src0->type, src0->data, src1_q8.get(), ids_d, (float *) dst->data, ne10,
                                                nrows, n_mat, /*expert_weight_stride=*/ src0->nb[2],
                                                /*dst_row_stride=*/ dst->nb[2], /*src1_row_stride=*/ bytes_per_qrow,
-                                               stream, /*n_tokens=*/ 1, /*ids_row_stride=*/ 0, /*dst_tok_stride=*/ 0,
-                                               /*src1_tok_stride=*/ 0);
+                                               stream, /*n_tokens=*/ n_tok, /*ids_row_stride=*/ 0,
+                                               /*dst_tok_stride=*/ dst->nb[1],
+                                               /*src1_tok_stride=*/ (size_t) n_mat * bytes_per_qrow);
     GGML_ASSERT(ok);
 }
 
