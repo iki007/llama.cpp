@@ -5195,6 +5195,37 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// Raon-1 mHC mixing weights (pre, post, Helmert-chart comb) from the flat streams and their selector projection
+struct test_raon_hc_mix : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RAON_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_tokens);
+    }
+
+    test_raon_hc_mix(int64_t n = 10240, int64_t n_tokens = 5) : n(n), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * mm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 17, n_tokens);
+        ggml_set_name(mm, "mm");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 17);
+        ggml_set_name(base, "base");
+        ggml_tensor * out = ggml_raon_hc_mix(ctx, x, mm, scale, base, 1e-6f, 2.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_hc;
@@ -11570,6 +11601,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    test_cases.emplace_back(new test_raon_hc_mix(10240, 1));
+    test_cases.emplace_back(new test_raon_hc_mix(10240, 7));
+    test_cases.emplace_back(new test_raon_hc_mix(333, 64));
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));

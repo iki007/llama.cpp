@@ -380,31 +380,43 @@ ggml_tensor * llama_model_raon1::graph::build_hc_pre(
     const int64_t nm = hc - 1;
     const int64_t nt = x->ne[2];
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, n_embd*hc, nt);
-    ggml_tensor * rms = ggml_sqrt(ctx0, ggml_scale_bias(ctx0, ggml_mean(ctx0, ggml_sqr(ctx0, flat)), 1.0f, hparams.dsv4_hc_eps));
-    ggml_tensor * mixes = ggml_div(ctx0, build_lora_mm(fn, flat), rms);
-    cb(mixes, "hc_mixes", il);
+    ggml_tensor * pre = nullptr;
+    if (cparams.fused_dsv4_hc_comb) {
+        // one op for the RMS, the affine gates and the Helmert-chart combination (gated by the HC comb probe: it is
+        // this model's stream combination); the graph below is its reference
+        ggml_tensor * mix = ggml_raon_hc_mix(ctx0, flat, build_lora_mm(fn, flat), scale, base, hparams.dsv4_hc_eps,
+                                             hparams.hc_magnitude);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, mix, il});
+        pre   = ggml_view_2d(ctx0, mix, hc, nt, mix->nb[1], 0);
+        *post = ggml_view_2d(ctx0, mix, hc, nt, mix->nb[1], hc*mix->nb[0]);
+        *comb = ggml_view_3d(ctx0, mix, hc, hc, nt, hc*mix->nb[0], mix->nb[1], 2*hc*mix->nb[0]);
+    } else {
+        ggml_tensor * rms = ggml_sqrt(ctx0, ggml_scale_bias(ctx0, ggml_mean(ctx0, ggml_sqr(ctx0, flat)), 1.0f, hparams.dsv4_hc_eps));
+        ggml_tensor * mixes = ggml_div(ctx0, build_lora_mm(fn, flat), rms);
+        cb(mixes, "hc_mixes", il);
 
-    auto affine = [&](int64_t offset, int64_t width, int64_t si) {
-        ggml_tensor * z = ggml_view_2d(ctx0, mixes, width, nt, mixes->nb[1], offset*mixes->nb[0]);
-        ggml_tensor * a = ggml_view_1d(ctx0, scale, 1, si*scale->nb[0]);
-        ggml_tensor * b = ggml_view_1d(ctx0, base, width, offset*base->nb[0]);
-        return ggml_add(ctx0, ggml_mul(ctx0, z, a), b);
-    };
-    ggml_tensor * pre = ggml_sigmoid(ctx0, affine(0, hc, 0));
-    *post = ggml_scale(ctx0, ggml_sigmoid(ctx0, affine(hc, hc, 1)), hparams.hc_magnitude);
-    // combination: z ((hc-1)^2 Helmert coordinates) -> e = H z H^T, rho = 1 + max(0, max(-e / chart_base)),
-    // phi = chart_base + e / rho (doubly stochastic), comb = I + sigmoid(eta) * (phi - I)
-    ggml_tensor * z = ggml_cont_3d(ctx0, affine(2*hc, nm*nm, 2), nm, nm, nt);
-    ggml_tensor * e = ggml_mul_mat(ctx0, helmert, z);
-    e = ggml_mul_mat(ctx0, helmert, ggml_cont(ctx0, ggml_transpose(ctx0, e)));
-    ggml_tensor * ratio = ggml_neg(ctx0, ggml_div(ctx0, e, chart_base));
-    ratio = ggml_reshape_2d(ctx0, ratio, hc*hc, nt);
-    ggml_tensor * rho = ggml_pool_1d(ctx0, ratio, GGML_OP_POOL_MAX, hc*hc, hc*hc, 0);
-    rho = ggml_scale_bias(ctx0, ggml_clamp(ctx0, rho, 0.0f, INFINITY), 1.0f, 1.0f);
-    rho = ggml_reshape_3d(ctx0, rho, 1, 1, nt);
-    ggml_tensor * phi = ggml_add(ctx0, ggml_div(ctx0, e, rho), chart_base);
-    ggml_tensor * gamma = ggml_sigmoid(ctx0, ggml_view_1d(ctx0, scale, 1, 3*scale->nb[0]));
-    *comb = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, phi, identity), gamma), identity);
+        auto affine = [&](int64_t offset, int64_t width, int64_t si) {
+            ggml_tensor * z = ggml_view_2d(ctx0, mixes, width, nt, mixes->nb[1], offset*mixes->nb[0]);
+            ggml_tensor * a = ggml_view_1d(ctx0, scale, 1, si*scale->nb[0]);
+            ggml_tensor * b = ggml_view_1d(ctx0, base, width, offset*base->nb[0]);
+            return ggml_add(ctx0, ggml_mul(ctx0, z, a), b);
+        };
+        pre = ggml_sigmoid(ctx0, affine(0, hc, 0));
+        *post = ggml_scale(ctx0, ggml_sigmoid(ctx0, affine(hc, hc, 1)), hparams.hc_magnitude);
+        // combination: z ((hc-1)^2 Helmert coordinates) -> e = H z H^T, rho = 1 + max(0, max(-e / chart_base)),
+        // phi = chart_base + e / rho (doubly stochastic), comb = I + sigmoid(eta) * (phi - I)
+        ggml_tensor * z = ggml_cont_3d(ctx0, affine(2*hc, nm*nm, 2), nm, nm, nt);
+        ggml_tensor * e = ggml_mul_mat(ctx0, helmert, z);
+        e = ggml_mul_mat(ctx0, helmert, ggml_cont(ctx0, ggml_transpose(ctx0, e)));
+        ggml_tensor * ratio = ggml_neg(ctx0, ggml_div(ctx0, e, chart_base));
+        ratio = ggml_reshape_2d(ctx0, ratio, hc*hc, nt);
+        ggml_tensor * rho = ggml_pool_1d(ctx0, ratio, GGML_OP_POOL_MAX, hc*hc, hc*hc, 0);
+        rho = ggml_scale_bias(ctx0, ggml_clamp(ctx0, rho, 0.0f, INFINITY), 1.0f, 1.0f);
+        rho = ggml_reshape_3d(ctx0, rho, 1, 1, nt);
+        ggml_tensor * phi = ggml_add(ctx0, ggml_div(ctx0, e, rho), chart_base);
+        ggml_tensor * gamma = ggml_sigmoid(ctx0, ggml_view_1d(ctx0, scale, 1, 3*scale->nb[0]));
+        *comb = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, phi, identity), gamma), identity);
+    }
     cb(*comb, "hc_comb", il);
     cb(pre, "hc_pre", il);
     cb(*post, "hc_post", il);

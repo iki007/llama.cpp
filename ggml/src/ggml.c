@@ -1098,6 +1098,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "RAON_HC_MIX",
     "TOP_K_MASK",
 
     "UNARY",
@@ -1120,7 +1121,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SIGMOID_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1215,6 +1216,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "raon_hc_mix(x, mm, scale, base)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
 
     "unary(x)",
@@ -1237,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sigmoid_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6653,6 +6655,39 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_raon_hc_mix
+
+struct ggml_tensor * ggml_raon_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * mm,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        float                 magnitude) {
+    const int64_t hc = 4;
+    const int64_t mix_dim = 2*hc + (hc - 1)*(hc - 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(mm->ne[0] == mix_dim && ggml_nrows(mm) == mm->ne[1]);
+    GGML_ASSERT(ggml_nrows(x) == x->ne[1] && x->ne[1] == mm->ne[1]);
+    GGML_ASSERT(ggml_nelements(scale) >= 4 && ggml_is_contiguous(scale));
+    GGML_ASSERT(ggml_nelements(base) == mix_dim && ggml_is_contiguous(base));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*hc + hc*hc, mm->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_f32(result, 1, magnitude);
+
+    result->op     = GGML_OP_RAON_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = mm;
+    result->src[2] = scale;
+    result->src[3] = base;
+
+    return result;
 }
 
 // ggml_dsv4_hc_post
