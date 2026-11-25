@@ -7753,8 +7753,78 @@ static int ggml_sycl_try_mm_sub_fusion(ggml_backend_sycl_context & ctx, const gg
     return j - i;
 }
 
+// A GET_ROWS of recurrent states read only by a GATED_DELTA_NET (as its state, through views): skip the copy, the GDN
+// kernel reads the cache rows through the indices (gated_delta_net.cpp). Raon-1 decode: 18 copies of 2.6 MB a token.
+// The kernel reads the indices and the cache LATER than the graph says, so nothing computed from the GET_ROWS up to
+// the GDN (inclusive) may overlap them (the allocator may reuse the index tensor's memory after its last reader).
+static bool ggml_sycl_try_gdn_gather_fold(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_GDN_GATHER_FOLD", 1) != 0;
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (!enabled || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * rows = gr->src[0];
+    const ggml_tensor * ids  = gr->src[1];
+    if (rows->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || ids->ne[2] != 1 ||
+        ids->nb[0] != sizeof(int32_t) || rows->nb[0] != sizeof(float) || rows->nb[1] % sizeof(float) != 0 ||
+        gr->ne[2] != 1 || gr->ne[3] != 1 || !ggml_is_contiguous(gr)) {
+        return false;
+    }
+    const auto refs = [&](const ggml_tensor * t) {
+        return t == gr || (t != nullptr && t->view_src == gr);
+    };
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * as = (const char *) a->data;
+        const char * bs = (const char *) b->data;
+        return as < bs + ggml_nbytes(b) && bs < as + ggml_nbytes(a);
+    };
+    // walk to the GDN: every reference to the copy or its views up to it must account for all their uses (graph use
+    // counts), so nothing after the GDN reads them
+    int gdn  = -1;
+    int refs_seen = 0;
+    int uses = ggml_node_get_use_count(cgraph, i);
+    for (int j = i + 1; j < cgraph->n_nodes && gdn == -1 && j < i + 512; ++j) {
+        const ggml_tensor * n    = cgraph->nodes[j];
+        const bool          view = ggml_sycl_is_view_or_noop(n);
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (!refs(n->src[k])) {
+                continue;
+            }
+            ++refs_seen;
+            if (view && n->view_src == gr && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                uses += ggml_node_get_use_count(cgraph, j);
+                continue;
+            }
+            // an empty node reads nothing (build_rs copies the rows past n_seqs: none on decode)
+            if (ggml_is_empty(n)) {
+                continue;
+            }
+            if (n->op != GGML_OP_GATED_DELTA_NET || k != 5 || n->src[5]->view_offs != 0 ||
+                n->src[5]->ne[0] * n->src[5]->ne[1] * n->src[5]->ne[2] != gr->ne[0]) {
+                GGML_SYCL_DEBUG("[SYCL] GDN fold reader %s op %s k %d view %d\n", n->name, ggml_op_name(n->op), k, (int) view);
+                return false;
+            }
+            gdn = j;
+        }
+        // nothing written before the GDN reads them may overlap the indices or the rows; the GDN not the indices
+        if (!view && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            (overlaps(n, ids) || (gdn == -1 && overlaps(n, rows)))) {
+            GGML_SYCL_DEBUG("[SYCL] GDN fold overlap %s op %s ids %d\n", n->name, ggml_op_name(n->op), (int) overlaps(n, ids));
+            return false;
+        }
+    }
+    if (gdn == -1 || refs_seen != uses) {
+        GGML_SYCL_DEBUG("[SYCL] GDN state gather not folded: %s gdn %d refs %d uses %d\n", gr->name, gdn, refs_seen, uses);
+        return false;
+    }
+    ctx.gdn_folded_gathers.push_back(gr);
+    GGML_SYCL_DEBUG("[SYCL] GDN state gather folded: %s -> %s\n", gr->name, cgraph->nodes[gdn]->name);
+    return true;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_conv_window_match conv_window;
+    sycl_ctx->gdn_folded_gathers.clear();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -7786,6 +7856,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        if (node->op == GGML_OP_GET_ROWS && ggml_sycl_try_gdn_gather_fold(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
