@@ -889,7 +889,14 @@ class DFlashModel(Qwen3Model):
         if target_cls is not type(self):
             if target_arch == "NemotronHForCausalLM":
                 setattr(self, "is_moe", "num_experts_per_tok" in target_hparams)
-            target_cls.set_vocab(self)  # ty: ignore[missing-attribute]
+            # the target's vocab code reads the target's config (Inkling: eos_token_id, unpadded_vocab_size), which
+            # the draft's config lacks: the target's text config on top of the draft's while it runs
+            draft_hparams = self.hparams
+            self.hparams = {**draft_hparams, **target_hparams, **target_hparams.get("text_config", {})}
+            try:
+                target_cls.set_vocab(self)  # ty: ignore[missing-attribute]
+            finally:
+                self.hparams = draft_hparams
         else:
             super().set_vocab()
 
@@ -941,9 +948,21 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
         target_layer_ids = dflash_config.get("target_layer_ids", self.hparams.get("target_layer_ids", []))
+        target_text = {}
+        if self.target_model_dir is not None:
+            th = ModelBase.load_hparams(self.target_model_dir, False)
+            target_text = {**th, **th.get("text_config", {})}
+        inkling_target = str(target_text.get("model_type", "")).startswith("inkling2")
         if target_layer_ids:
-            extract_layer_ids = [i + 1 for i in target_layer_ids]
+            # Inkling drafts read the post-residual output of a layer visit, and the id equal to the number of visits is
+            # the final-norm state: the ids the target captures as they are, as its DSpark head's
+            extract_layer_ids = list(target_layer_ids) if inkling_target else [i + 1 for i in target_layer_ids]
             self.gguf_writer.add_target_layers(extract_layer_ids)
+        if dflash_config.get("selector_softcap_mode") == "after_correction":
+            self.gguf_writer.add_selector_softcap_after(True)
+        valid_vocab = dflash_config.get("valid_vocab_size") or target_text.get("unpadded_vocab_size")
+        if valid_vocab and int(valid_vocab) < int(self.hparams.get("vocab_size", 0)):
+            self.gguf_writer.add_valid_vocab_size(int(valid_vocab))
 
         use_sliding_window = self.hparams.get("use_sliding_window", False) or dflash_config.get("use_swa", False)
         sliding_window = dflash_config.get("swa_window_size") or self.hparams.get("sliding_window")

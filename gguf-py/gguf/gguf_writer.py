@@ -1104,6 +1104,12 @@ class GGUFWriter:
     def add_selector_top_k(self, value: int) -> None:
         self.add_uint32(Keys.LLM.SELECTOR_TOP_K.format(arch=self.arch), value)
 
+    def add_selector_softcap_after(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.SELECTOR_SOFTCAP_AFTER.format(arch=self.arch), value)
+
+    def add_valid_vocab_size(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.VALID_VOCAB_SIZE.format(arch=self.arch), value)
+
     def add_sample_from_anchor(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SAMPLE_FROM_ANCHOR.format(arch=self.arch), value)
 

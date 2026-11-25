@@ -305,6 +305,10 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    // DFlash2: softcap the selector score after adding the pairwise correction (else the logits before it)
+    bool     dflash_selector_softcap_after = false;
+    // DFlash2: candidates only from the first valid_vocab_size rows (the rest of the head is padding); 0 = all
+    uint32_t dflash_valid_vocab_size = 0;
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
     uint32_t lilicorr_num_heads      = 0;
