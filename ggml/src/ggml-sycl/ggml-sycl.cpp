@@ -6890,17 +6890,19 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne12 = src1->ne[2];
 
     // small batches (speculative verify, parallel sessions): NVFP4 up to 16 tokens; the reorder (SoA) types up to
-    // GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK (default 16; 0 = one token only, the grouped GEMM above that). With 16 tokens
+    // GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK (default 32; 0 = one token only, the grouped GEMM above that). With 16 tokens
     // x 6 of 128 experts the grouped GEMM's tiles are mostly empty: Raon-1 mini, 16 decode sessions 16.1 -> 18.0 t/s each
-    static const int reorder_max_tok = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK", 16);
+    static const int reorder_max_tok = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK", 32);
     // the other types up to GGML_SYCL_MOE_MMVQ_PLAIN_MAX_TOK tokens (default 16) on the plain fused kernel, which takes
     // the tokens of the batch in one launch: without a grouped GEMM layout the alternative is the per-expert loop, and
     // for Q5_1 the grouped GEMM is slower at a 4-token verify batch (Inkling 2 Mini: 1.80 vs 1.69 ms a round). The
     // other grouped types stay on the grouped GEMM: there the plain kernel is slower (IQ4_NL 4.64 vs 4.04 ms a round).
     static const int plain_max_tok = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_PLAIN_MAX_TOK", 16);
     const bool       plain = src0->type == GGML_TYPE_Q5_1 || !ggml_sycl_xmx_gather_type_enabled(src0->type);
+    // Q5_0 runs in place on the reordered kernel (its token dedup), so it follows the reordered types' limit
     const int64_t max_tok = src0->type == GGML_TYPE_NVFP4 ? 16 :
                             ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) ? reorder_max_tok :
+                            src0->type == GGML_TYPE_Q5_0 ? reorder_max_tok :
                             plain ? plain_max_tok : 1;
     const bool multi_tok = (ne12 > 1 && ne12 <= max_tok &&
                             ids->ne[1] == ne12 && dst->ne[2] == ne12 &&

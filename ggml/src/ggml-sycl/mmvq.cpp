@@ -3298,8 +3298,10 @@ static void mul_mat_vec_q_moe_reorder(
 // weight block once for all members; the others call the type's vec_dot once a member. Every member's sum is
 // accumulated in the order of mul_mat_vec_q_moe_reorder, so the results are the same bits.
 static constexpr int MOE_REORDER_DEDUP_R = 4;
+// the reordered dedup kernel groups up to 256 slots (42 tokens x 6 experts: 32 parallel sessions), the NVFP4 one 128
+static constexpr int MOE_REORDER_DEDUP_MAX_SLOTS = 16 * WARP_SIZE;
 
-template <typename reorder_vec_dot_q_sycl>
+template <typename reorder_vec_dot_q_sycl, int MAX_SLOTS>
 static void mul_mat_vec_q_moe_reorder_dedup(
     const void * __restrict__ vx_base, const void * __restrict__ vy_base,
     float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
@@ -3341,7 +3343,7 @@ static void mul_mat_vec_q_moe_reorder_dedup(
         }
         return;
     }
-    constexpr int Q = MOE_DEDUP_MAX_SLOTS / WARP_SIZE;
+    constexpr int Q = MAX_SLOTS / WARP_SIZE;
     int           idv[Q];
     int           before = 0;
 #pragma unroll
@@ -3480,20 +3482,29 @@ static void launch_mul_mat_vec_q_moe_reorder(
     const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
     static const bool    dedup   = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP_REORDER", 1) != 0;
-    if (dedup && n_tokens > 1 && n_tokens * n_experts_used <= MOE_DEDUP_MAX_SLOTS) {
+    if (dedup && n_tokens > 1 && n_tokens * n_experts_used <= MOE_REORDER_DEDUP_MAX_SLOTS) {
         const int            rows_per_wg = GGML_SYCL_MMV_Y * MOE_REORDER_DEDUP_R;
         const sycl::range<3> block_nums(1, (unsigned) (n_tokens * n_experts_used),
                                         (unsigned) ((nrows + rows_per_wg - 1) / rows_per_wg));
-        stream->submit([&](sycl::handler & cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    mul_mat_vec_q_moe_reorder_dedup<reorder_vec_dot_q_sycl>(
-                        vx_base, vy, dst_base, ids_dev, ncols, nrows, n_experts_used, n_tokens,
-                        expert_weight_stride, dst_row_stride, src1_row_stride,
-                        ids_row_stride, dst_tok_stride, src1_tok_stride, item);
-                });
-        });
+        // the slot ids sit in registers, 8 or 16 a lane: up to 128 slots keep the shorter scan
+        const auto launch = [&](auto slots_c) {
+            constexpr int MS = decltype(slots_c)::value;
+            stream->submit([&](sycl::handler & cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q_moe_reorder_dedup<reorder_vec_dot_q_sycl, MS>(
+                            vx_base, vy, dst_base, ids_dev, ncols, nrows, n_experts_used, n_tokens,
+                            expert_weight_stride, dst_row_stride, src1_row_stride,
+                            ids_row_stride, dst_tok_stride, src1_tok_stride, item);
+                    });
+            });
+        };
+        if (n_tokens * n_experts_used <= 8 * WARP_SIZE) {
+            launch(std::integral_constant<int, 8 * WARP_SIZE>{});
+        } else {
+            launch(std::integral_constant<int, MOE_REORDER_DEDUP_MAX_SLOTS>{});
+        }
         return;
     }
     const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
