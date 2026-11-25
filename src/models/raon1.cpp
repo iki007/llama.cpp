@@ -334,11 +334,13 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
     beta = ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs);
     ggml_tensor * delta = build_lora_mm(layer.ssm_rda, cur);
     delta = ggml_reshape_4d(ctx0, delta, 1, n_head, n_seq_tokens, n_seqs);
-    ggml_tensor * erase = ggml_softplus(ctx0, ggml_neg(ctx0, beta));
-    ggml_tensor * write = ggml_softplus(ctx0, ggml_neg(ctx0, ggml_add(ctx0, beta, delta)));
-    Vcur = ggml_mul(ctx0, Vcur, ggml_exp(ctx0, ggml_sub(ctx0, erase, write)));
+    // exp(softplus(-b) - softplus(-(b + delta))) = sigmoid(b + delta) / sigmoid(b): 6 ops instead of 9. The erase gate
+    // reads b clamped at -60 (sigmoid 8.7e-27, never 0 in f32), so the ratio has no 0/0; the write gate, the product
+    // of the two, stays sigmoid(b + delta) exactly.
+    ggml_tensor * write = ggml_sigmoid(ctx0, ggml_add(ctx0, beta, delta));
+    beta = ggml_sigmoid(ctx0, ggml_clamp(ctx0, beta, -60.0f, INFINITY));
+    Vcur = ggml_mul(ctx0, Vcur, ggml_div(ctx0, write, beta));
     cb(Vcur, "rda_v_scaled", il);
-    beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "rda_beta", il);
 
     // same as HF F.normalize(eps=1e-6): x / max(||x||, eps)
@@ -354,7 +356,9 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
-    output = ggml_cont(ctx0, output);
+    if (!ggml_is_contiguous(output)) {
+        output = ggml_cont(ctx0, output);
+    }
     cb(output, "rda_scan_out", il);
 
     // output gate, then RMSNorm(o) * sigmoid(g2)
@@ -366,7 +370,7 @@ ggml_tensor * llama_model_raon1::graph::build_rda_layer(
     cb(normed, "rda_normed", il);
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
+    gated = ggml_is_contiguous(gated) ? ggml_reshape_2d(ctx0, gated, d_inner, n_tokens) : ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
     cur   = build_lora_mm(layer.wo, gated);
     cb(cur, "rda_out", il);
 

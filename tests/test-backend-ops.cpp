@@ -5195,6 +5195,52 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// SiTU gate x up as llm_graph_context::build_situ builds it (backends may fuse the nine nodes)
+struct test_situ : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float beta, lb;
+    const bool split;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, beta, lb, split);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_situ(std::array<int64_t, 4> ne = {1088, 6, 1, 1}, float beta = 4.0f, float lb = 25.0f, bool split = false)
+        : ne(ne), beta(beta), lb(lb), split(split) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(up, "up");
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
+        if (split) {
+            // up produced after the gate chain (the routed experts' order)
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
+            ggml_set_name(w, "w");
+            up = ggml_mul_mat(ctx, w, up);
+        }
+        ggml_tensor * u = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, u);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, std::string(ggml_get_name(t)) == "w" ? -0.1f : -30.0f, std::string(ggml_get_name(t)) == "w" ? 0.1f : 30.0f);
+        }
+    }
+};
+
 // Raon-1 mHC mixing weights (pre, post, Helmert-chart comb) from the flat streams and their selector projection
 struct test_raon_hc_mix : public test_case {
     const int64_t n;
@@ -11601,6 +11647,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    test_cases.emplace_back(new test_situ({1088, 6, 1, 1}));
+    test_cases.emplace_back(new test_situ({1088, 1, 1, 1}));
+    test_cases.emplace_back(new test_situ({12032, 3, 1, 1}));
+    test_cases.emplace_back(new test_situ({256, 6, 1, 1}, 4.0f, 25.0f, true));
     test_cases.emplace_back(new test_raon_hc_mix(10240, 1));
     test_cases.emplace_back(new test_raon_hc_mix(10240, 7));
     test_cases.emplace_back(new test_raon_hc_mix(333, 64));

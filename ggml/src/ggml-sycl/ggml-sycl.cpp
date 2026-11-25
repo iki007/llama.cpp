@@ -6110,6 +6110,220 @@ static void ggml_sycl_mul_mat_stack_mmvq(ggml_backend_sycl_context & ctx, const 
     GGML_ASSERT(ok);
 }
 
+// SiTU (Raon-1, Kimi-K3; llm_graph_context::build_situ) in one kernel: the nine nodes
+//   b*tanh(a*g) * sigmoid(g) * d*tanh(c*u)  (scale, tanh, scale, sigmoid, mul, scale, tanh, scale, mul)
+// were six launches after the pairwise fusions, twice a layer (routed and shared experts).
+// The routed experts compute up after the gate chain: [gate chain (5)] [up producer] [up chain (4)]. The producer does
+// not read the chain, so it runs first and the fused kernel after it.
+static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
+static int ggml_sycl_try_situ_fusion(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FUSE_SITU", 1) != 0;
+    if (!enabled || i + 9 > cgraph->n_nodes) {
+        return 0;
+    }
+    // split: the node after the gate chain produces up
+    const bool split = i + 10 <= cgraph->n_nodes && cgraph->nodes[i + 5]->op != GGML_OP_SCALE &&
+                       cgraph->nodes[i + 6]->op == GGML_OP_SCALE && cgraph->nodes[i + 6]->src[0] == cgraph->nodes[i + 5];
+    ggml_tensor * nn[9];
+    for (int k = 0, j = 0; k < 10 && j < 9; ++k) {
+        if (split && k == 5) {
+            continue;
+        }
+        if (i + k >= cgraph->n_nodes) {
+            return 0;
+        }
+        nn[j++] = cgraph->nodes[i + k];
+    }
+    ggml_tensor ** n = nn;
+    if (split) {
+        const ggml_op ops[10] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                  cgraph->nodes[i + 5]->op, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+        const int outs[2] = { i + 5, i + 9 };
+        if (!ggml_can_fuse_subgraph(cgraph, i, 10, ops, outs, 2)) {
+            return 0;
+        }
+    } else if (!ggml_can_fuse_subgraph(cgraph, i,
+                                       { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SCALE,
+                                         GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL },
+                                       { i + 8 })) {
+        return 0;
+    }
+    // the up producer must not read the gate chain
+    if (split) {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = cgraph->nodes[i + 5]->src[k];
+            for (int j = 0; j < 5; ++j) {
+                if (src == cgraph->nodes[i + j]) {
+                    return 0;
+                }
+            }
+        }
+    }
+    if (ggml_get_unary_op(n[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(n[6]) != GGML_UNARY_OP_TANH) {
+        return 0;
+    }
+    const ggml_tensor * g = n[0]->src[0];
+    const ggml_tensor * u = n[5]->src[0];
+    const auto pair = [](const ggml_tensor * m, const ggml_tensor * x, const ggml_tensor * y) {
+        return (m->src[0] == x && m->src[1] == y) || (m->src[0] == y && m->src[1] == x);
+    };
+    if (n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[3]->src[0] != g || !pair(n[4], n[2], n[3]) ||
+        n[6]->src[0] != n[5] || n[7]->src[0] != n[6] || !pair(n[8], n[4], n[7])) {
+        return 0;
+    }
+    ggml_tensor * dst = n[8];
+    for (const ggml_tensor * t : { g, u, (const ggml_tensor *) dst }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, dst)) {
+            return 0;
+        }
+    }
+    float sc[4], bias = 0.0f;
+    const ggml_tensor * scales[4] = { n[0], n[2], n[5], n[7] };
+    for (int k = 0; k < 4; ++k) {
+        memcpy(&sc[k], (const float *) scales[k]->op_params + 0, sizeof(float));
+        float b;
+        memcpy(&b, (const float *) scales[k]->op_params + 1, sizeof(float));
+        bias = sycl::fmax(bias, sycl::fabs(b));
+    }
+    if (bias != 0.0f) {
+        return 0;
+    }
+    // the fused kernels read the gate after the graph considers it dead: an output the allocator placed over it at
+    // another offset would be overwritten across work-items (the same base is fine, element by element)
+    const auto shifted = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * xs = (const char *) x->data;
+        const char * ys = (const char *) y->data;
+        return xs != ys && xs < ys + ggml_nbytes(y) && ys < xs + ggml_nbytes(x);
+    };
+    if (shifted(dst, g) || shifted(dst, u) || (split && (shifted(n[4], g) || shifted(n[4], u)))) {
+        return 0;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2, " : SiTU fused (9 nodes)");
+    const float   a = sc[0], b = sc[1], c = sc[2], d = sc[3];
+    const float * gd = (const float *) g->data;
+    const float * ud = (const float *) u->data;
+    float *       dd = (float *) dst->data;
+    const int64_t ne = ggml_nelements(dst);
+    if (split) {
+        // the allocator may give the up producer the memory of the gate (dead after the gate chain in graph order):
+        // the gate activation goes to the chain's MUL output first (live until the last MUL), then up, then the product
+        if (n[4]->type != GGML_TYPE_F32 || !ggml_is_contiguous(n[4]) || !ggml_are_same_shape(n[4], dst)) {
+            GGML_ABORT("SiTU fusion: unexpected gate product layout");
+        }
+        float * act = (float *) n[4]->data;
+        ctx.stream()->parallel_for(sycl::range<1>(ne), [=](sycl::id<1> id) {
+            const float gv = gd[id];
+            act[id] = b * sycl::tanh(a * gv) / (1.0f + sycl::native::exp(-gv));
+        });
+        if (!ggml_sycl_compute_forward(ctx, cgraph->nodes[i + 5])) {
+            GGML_ABORT("SiTU fusion: the up producer failed");
+        }
+        ctx.stream()->parallel_for(sycl::range<1>(ne), [=](sycl::id<1> id) {
+            dd[id] = act[id] * (d * sycl::tanh(c * ud[id]));
+        });
+        return 9;
+    }
+    ctx.stream()->parallel_for(sycl::range<1>(ne), [=](sycl::id<1> id) {
+        const float gv = gd[id];
+        const float uv = ud[id];
+        dd[id] = b * sycl::tanh(a * gv) / (1.0f + sycl::native::exp(-gv)) * (d * sycl::tanh(c * uv));
+    });
+    return 8;
+}
+
+// Raon-1 / KDA decay gate with a lower bound (llama_model_raon1::graph::build_rda_gate):
+//   g = s2 * sigmoid(s1 * ((x + bias) * A[head]))   as ADD, (views), MUL, SCALE, SIGMOID, SCALE
+// x [D * H, T] contiguous, bias [D * H], A [1, H] (a per-head scalar); one kernel instead of five.
+static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t);
+static int ggml_sycl_try_kda_gate_fusion(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FUSE_KDA_GATE", 1) != 0;
+    ggml_tensor * add = cgraph->nodes[i];
+    if (!enabled || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    // the next four computed nodes, skipping views
+    int idx[4];
+    int found = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 12 && found < 4; ++j) {
+        if (ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+            continue;
+        }
+        idx[found++] = j;
+    }
+    if (found < 4) {
+        return 0;
+    }
+    ggml_tensor * mul = cgraph->nodes[idx[0]];
+    ggml_tensor * sc1 = cgraph->nodes[idx[1]];
+    ggml_tensor * sig = cgraph->nodes[idx[2]];
+    ggml_tensor * sc2 = cgraph->nodes[idx[3]];
+    if (mul->op != GGML_OP_MUL || sc1->op != GGML_OP_SCALE || sig->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sc2->op != GGML_OP_SCALE) {
+        return 0;
+    }
+    const auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    // wiring: mul(view of add, view of A), then a straight chain
+    const ggml_tensor * xa = mul->src[0];
+    const ggml_tensor * A  = mul->src[1];
+    if (base(xa) != add || xa->view_offs != 0 || sc1->src[0] != mul || sig->src[0] != sc1 || sc2->src[0] != sig) {
+        return 0;
+    }
+    // every intermediate read only by the next step (the add through its one view)
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, idx[0]) != 1 ||
+        ggml_node_get_use_count(cgraph, idx[1]) != 1 || ggml_node_get_use_count(cgraph, idx[2]) != 1 ||
+        (add->flags & GGML_TENSOR_FLAG_OUTPUT) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        (sc1->flags & GGML_TENSOR_FLAG_OUTPUT) || (sig->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    for (int j = i + 1; j < idx[0]; ++j) {
+        const ggml_tensor * v = cgraph->nodes[j];
+        if (v == xa && ggml_node_get_use_count(cgraph, j) != 1) {
+            return 0;
+        }
+    }
+    const ggml_tensor * x    = add->src[0];
+    const ggml_tensor * bias = add->src[1];
+    const int64_t       DH   = ggml_nelements(bias);
+    const int64_t       H    = ggml_nelements(A);
+    const int64_t       n    = ggml_nelements(add);
+    if (add->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || A->type != GGML_TYPE_F32 ||
+        sc2->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(bias) || !ggml_is_contiguous(A) ||
+        !ggml_is_contiguous(sc2) || ggml_nelements(sc2) != n || x->ne[0] != DH || n % DH != 0 || DH % H != 0 ||
+        mul->ne[1] != H || A->ne[0] != 1 || A->ne[1] != H) {
+        return 0;
+    }
+    float s1, b1, s2, b2;
+    memcpy(&s1, (const float *) sc1->op_params + 0, sizeof(float));
+    memcpy(&b1, (const float *) sc1->op_params + 1, sizeof(float));
+    memcpy(&s2, (const float *) sc2->op_params + 0, sizeof(float));
+    memcpy(&b2, (const float *) sc2->op_params + 1, sizeof(float));
+    if (b1 != 0.0f || b2 != 0.0f) {
+        return 0;
+    }
+    // the output is written while x is read, and the allocator sees x dead after the ADD: the same base is fine
+    // element by element, a shifted overlap is not
+    {
+        const char * os = (const char *) sc2->data;
+        const char * xs = (const char *) x->data;
+        if (os != xs && os < xs + ggml_nbytes(x) && xs < os + ggml_nbytes(sc2)) {
+            return 0;
+        }
+    }
+    scope_op_debug_print scope_dbg_print(__func__, sc2, /*num_src=*/2, " : KDA decay gate fused (5 nodes)");
+    const float * xd = (const float *) x->data;
+    const float * bd = (const float *) bias->data;
+    const float * ad = (const float *) A->data;
+    float *       dd = (float *) sc2->data;
+    const int64_t D  = DH / H;
+    ctx.stream()->parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+        const int64_t e = id[0] % DH;
+        const float   y = s1 * ((xd[id] + bd[e]) * ad[e / D]);
+        dd[id]          = s2 / (1.0f + sycl::native::exp(-y));
+    });
+    return idx[3] - i;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -7925,6 +8139,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                                        cgraph->nodes[i + 7]);
             i += 7;
             continue;
+        }
+        if (node->op == GGML_OP_ADD) {
+            const int gate_skip = ggml_sycl_try_kda_gate_fusion(*sycl_ctx, cgraph, i);
+            if (gate_skip > 0) {
+                i += gate_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_SCALE) {
+            const int situ_skip = ggml_sycl_try_situ_fusion(*sycl_ctx, cgraph, i);
+            if (situ_skip > 0) {
+                i += situ_skip;
+                continue;
+            }
         }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
