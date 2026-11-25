@@ -232,14 +232,19 @@ int ggml_sycl_try_conv_store_fusion(ggml_backend_sycl_context & ctx, const ggml_
     const ggml_tensor * dstt = st->op == GGML_OP_CPY ? st->src[1] : st->src[0] == win ? st : nullptr;
     if (st->op == GGML_OP_CPY) {
         // the last nc columns of every channel, element order (j, c) into a [nc * C, S] cell view
+        // the cell view as [nc * C, S], or as [nc, C, S] with contiguous channel rows (Raon-1's per-qkv thirds of
+        // the conv state row): the same element order
+        const bool flat = dstt != nullptr && dstt->ne[0] == nc * C && dstt->ne[1] == S;
+        const bool rows = dstt != nullptr && dstt->ne[0] == nc && dstt->ne[1] == C && dstt->ne[2] == S &&
+                          dstt->ne[3] == 1 && dstt->nb[1] == (size_t) nc * sizeof(float);
         if (dstt == nullptr || dstt->type != GGML_TYPE_F32 || win->ne[0] != nc || win->ne[1] != C || win->ne[2] != S ||
             win->view_offs != (size_t) T * sizeof(float) || win->nb[1] != cat->nb[1] || win->nb[2] != cat->nb[2] ||
-            dstt->ne[0] != nc * C || dstt->ne[1] != S || dstt->nb[0] != sizeof(float)) {
+            !(flat || rows) || dstt->nb[0] != sizeof(float)) {
             return 0;
         }
         a.dst  = (char *) dstt->data;
         a.d0   = dstt->nb[0];
-        a.d1   = dstt->nb[1];
+        a.d1   = flat ? dstt->nb[1] : dstt->nb[2];
         a.d2   = a.d3 = 0;
         a.slot = nullptr;
         a.Kw   = 0;
