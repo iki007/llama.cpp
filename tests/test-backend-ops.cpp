@@ -14147,6 +14147,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1, 128, {40, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, 1, 512, {40, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  64, 1, 256, { 8, 1}, {1, 1}));
+    // the same with several tokens (parallel decode sessions)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 16, 128, {40, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, 16, 512, {40, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128,  3, 512, {40, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  64, 32, 256, { 8, 1}, {1, 1}));
+    // Q5_0 experts (Raon-1 mini down projections) on the reordered MoE kernel in their own layout: 1 token, verify-size
+    // batches and 16 parallel sessions (token dedup)
+    for (int n : { 1, 3, 4, 16 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 6, false, 2560, n, 1088));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32,  16, 4, false,   64, n,  256));
+    }
     // permuted and broadcast src0/src1 for the 2 byte aligned types
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 64, 13, 2304, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     // attention without flash attention: K (f16 cache view) x Q, permuted, 8 K/V heads broadcast to 24 Q heads (Inkling 2)
@@ -15989,6 +16000,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Raon-1 mini routed experts on decode (128 x 6): q4_K gate / up 2560 -> 1088, q8_0 and q5_0 down 1088 -> 2560
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 6, false, 1088, 1, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 6, false, 2560, 1, 1088));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 6, false, 2560, 1, 1088));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 6, false, 2560, 16, 1088));
 
     // Raon-1 mini mHC site: mixing weights, the 17-row bf16 selector projection, hc_post
     test_cases.emplace_back(new test_raon_hc_mix(10240, 1));

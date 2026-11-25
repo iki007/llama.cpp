@@ -3504,6 +3504,21 @@ static void launch_mul_mat_vec_q_moe_reorder(
     });
 }
 
+// Q5_0 experts in their own AoS layout on the reordered MoE kernel (token dedup for small batches)
+bool ggml_sycl_mul_mat_vec_q_id_q5_0_aos(const void * vx_base, const void * vy, const int32_t * ids_dev, float * dst_base,
+                                         int ncols, int nrows, int n_experts_used, size_t expert_weight_stride,
+                                         size_t dst_row_stride, size_t src1_row_stride, dpct::queue_ptr stream,
+                                         int n_tokens, size_t ids_row_stride, size_t dst_tok_stride,
+                                         size_t src1_tok_stride) {
+    if (ncols % QK5_0 != 0) {
+        return false;
+    }
+    launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_0>>(
+        vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, expert_weight_stride, dst_row_stride,
+        src1_row_stride, stream, n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride);
+    return true;
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_reorder(
     enum ggml_type     src0_type,
     const void *       vx_base,
