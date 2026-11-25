@@ -2305,13 +2305,18 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q8_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    if (i == 0 && src1_ncols > 1) {
+                        // up to 8 columns a launch: 16 parallel decode sessions on a matrix the XMX kernel does not
+                        // take (K not a multiple of 256: Raon-1's shared-expert down, MLA q_b) ran 16 launches
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                        reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
+                        for (int c0 = 0; c0 < src1_ncols; c0 += 8) {
+                            const int nc = std::min(8, (int) src1_ncols - c0);
+                            reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
+                                src0_dd_i, src1_ddq_i + (size_t) c0 * stride_col_y_bytes, dst_dd_i + (size_t) c0 * stride_col_dst,
+                                ne00, row_diff, nc, stride_col_y_bytes, stride_col_dst, stream);
+                        }
                         return;
                     } else {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
