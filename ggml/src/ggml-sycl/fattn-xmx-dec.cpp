@@ -485,10 +485,14 @@ static void fa_xmx_launch_rg_d(int RG, const fa_xmx_args & a, int n_kvh, bool gr
 template <bool SKIP, bool Q8 = false>
 static void fa_xmx_launch_rg(int D, int RG, const fa_xmx_args & a, int n_kvh, bool grf128, dpct::queue_ptr stream) {
     if (D == 576) {
-        // MLA (40 heads on one latent head, one token): 5 row groups only (ggml_sycl_flash_attn_ext_xmx_dec_supported)
+        // MLA (40 heads on one latent head, one token): 5 row groups, or 1 when the heads are split in groups of 8
         if constexpr (!SKIP && !Q8) {
-            GGML_ASSERT(RG == 5);
-            fa_xmx_launch<576, 512, 5, false, false>(a, n_kvh, grf128, stream);
+            GGML_ASSERT(RG == 5 || RG == 1);
+            if (RG == 1) {
+                fa_xmx_launch<576, 512, 1, false, false>(a, n_kvh, grf128, stream);
+            } else {
+                fa_xmx_launch<576, 512, 5, false, false>(a, n_kvh, grf128, stream);
+            }
             return;
         }
         GGML_ABORT("XMX flash attention: MLA over a q8_0 cache or with span skipping");
@@ -627,13 +631,22 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    const int n_kvh = (int) K->ne[2];
-    const int g     = (int) (Q->ne[2] / K->ne[2]);
+    int       n_kvh = (int) K->ne[2];
+    int       g     = (int) (Q->ne[2] / K->ne[2]);
     const int nq    = (int) Q->ne[1];
     const int n_kv  = (int) K->ne[1];
     const int D     = (int) K->ne[0];   // K dims (576 for MLA)
     const int DV    = (int) V->ne[0];   // O dims, also the KV block (512 for MLA)
     const int nblk  = (n_kv + DV - 1) / DV;
+    // MLA over a short cache (few 512-token blocks, so few work-groups): the heads go in groups of 8 that read the same
+    // latent cache (head stride 0), 1 row group each, g / 8 times the work-groups (GGML_SYCL_FA_XMX_MLA_HSPLIT: the most
+    // blocks that still split)
+    static const int mla_hsplit = ggml_sycl_get_env("GGML_SYCL_FA_XMX_MLA_HSPLIT", 8);  // 2K 28 -> 14 us, 4K 29.5 -> 20.5, 16K 42 -> 69 (no)
+    const bool       hsplit     = D == 576 && n_kvh == 1 && nq == 1 && g % 8 == 0 && nblk <= mla_hsplit;
+    if (hsplit) {
+        n_kvh = g / 8;
+        g     = 8;
+    }
     const int n_str = (int) Q->ne[3];
     const int m_str = (int) mask->ne[3];
 
@@ -695,9 +708,9 @@ void ggml_sycl_flash_attn_ext_xmx_dec(ggml_backend_sycl_context & ctx, ggml_tens
     a.q_nb1     = Q->nb[1];
     a.q_nb2     = Q->nb[2];
     a.k_nb1     = K->nb[1];
-    a.k_nb2     = K->nb[2];
+    a.k_nb2     = hsplit ? 0 : K->nb[2];
     a.v_nb1     = V->nb[1];
-    a.v_nb2     = V->nb[2];
+    a.v_nb2     = hsplit ? 0 : V->nb[2];
     a.m_nb1     = mask->nb[1];
     a.qscale    = scale * 1.44269504088896341f;
     a.btab        = bias.table;
