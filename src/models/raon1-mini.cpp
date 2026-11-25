@@ -280,9 +280,9 @@ ggml_tensor * llama_model_raon1::graph::build_rda_conv_out(ggml_tensor * conv_x,
     const int64_t d_inner  = head_dim * n_head;
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, hparams.ssm_d_conv, d_inner);
-    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
+    // silu right after the conv (before the reshape), so backends can fuse the pair
+    ggml_tensor * Xcur = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, conv_weight));
     Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
-    Xcur = ggml_silu(ctx0, Xcur);
 
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
