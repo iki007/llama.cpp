@@ -336,3 +336,92 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
         launch(std::false_type{});
     }
 }
+
+// Raon-1 mHC mixing weights (ggml_raon_hc_mix): one work-group a token reduces the RMS of the flat streams, then one
+// work-item derives the 24 weights (pre, post, Helmert-chart comb) from the 17 selector values. Replaces ~28 tiny
+// launches a site (50 sites a token).
+void ggml_sycl_op_raon_hc_mix(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * mm    = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const ggml_tensor * base  = dst->src[3];
+
+    constexpr int hc = DSV4_HC;
+    constexpr int nm = hc - 1;
+    constexpr int WG = 256;
+
+    const float   eps       = ggml_get_op_params_f32(dst, 0);
+    const float   magnitude = ggml_get_op_params_f32(dst, 1);
+    const int64_t n         = x->ne[0];
+    const int64_t nt        = mm->ne[1];
+    const int64_t sx1       = x->nb[1] / sizeof(float);
+    const int64_t sm1       = mm->nb[1] / sizeof(float);
+    const int64_t sd1       = dst->nb[1] / sizeof(float);
+
+    const float * xd = (const float *) x->data;
+    const float * md = (const float *) mm->data;
+    const float * sd = (const float *) scale->data;
+    const float * bd = (const float *) base->data;
+    float *       dd = (float *) dst->data;
+
+    ctx.stream()->parallel_for(sycl::nd_range<1>(sycl::range<1>(nt * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const int64_t t  = it.get_group(0);
+        const int     l  = it.get_local_id(0);
+        const float * xr = xd + t * sx1;
+        float         ss = 0.0f;
+        for (int64_t i = l; i < n; i += WG) {
+            ss += xr[i] * xr[i];
+        }
+        ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+        if (l != 0) {
+            return;
+        }
+        const float   rms = sycl::sqrt(ss / n + eps);
+        const float * mr  = md + t * sm1;
+        float *       d   = dd + t * sd1;
+
+        float m[2 * hc + nm * nm];
+        for (int i = 0; i < 2 * hc + nm * nm; ++i) {
+            m[i] = mr[i] / rms;
+        }
+        for (int h = 0; h < hc; ++h) {
+            d[h]      = 1.0f / (1.0f + sycl::exp(-(m[h] * sd[0] + bd[h])));
+            d[hc + h] = magnitude / (1.0f + sycl::exp(-(m[hc + h] * sd[1] + bd[hc + h])));
+        }
+        float H[hc][nm];
+        for (int r = 0; r < hc; ++r) {
+            for (int c = 0; c < nm; ++c) {
+                H[r][c] = (r <= c ? 1.0f : r == c + 1 ? -(float) (c + 1) : 0.0f) / sycl::sqrt((float) ((c + 1) * (c + 2)));
+            }
+        }
+        float z[nm * nm];
+        for (int i = 0; i < nm * nm; ++i) {
+            z[i] = m[2 * hc + i] * sd[2] + bd[2 * hc + i];
+        }
+        float e[hc * hc];
+        float rho = 0.0f;
+        for (int i = 0; i < hc; ++i) {
+            for (int a = 0; a < hc; ++a) {
+                float v = 0.0f;
+                for (int j = 0; j < nm; ++j) {
+                    for (int k = 0; k < nm; ++k) {
+                        v += H[a][j] * H[i][k] * z[k + nm * j];
+                    }
+                }
+                e[a + hc * i] = v;
+                const float c = (a == i ? 0.5f : 0.0f) + 0.5f / hc;
+                rho = sycl::fmax(rho, -(v / c));
+            }
+        }
+        rho += 1.0f;
+        const float g = 1.0f / (1.0f + sycl::exp(-sd[3]));
+        for (int i = 0; i < hc; ++i) {
+            for (int a = 0; a < hc; ++a) {
+                const float c  = (a == i ? 0.5f : 0.0f) + 0.5f / hc;
+                const float id = a == i ? 1.0f : 0.0f;
+                d[2 * hc + a + hc * i] = (e[a + hc * i] / rho + c - id) * g + id;
+            }
+        }
+    });
+}

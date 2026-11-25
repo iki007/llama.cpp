@@ -414,6 +414,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_RAON_HC_MIX,
         GGML_OP_TOP_K_MASK,
 
         GGML_OP_UNARY,
@@ -2552,6 +2553,23 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Raon-1 mHC mixing weights of one site (hc = 4 streams, Helmert-chart combination):
+    //   x [n, n_tokens] (the flat streams, for the RMS), mm [2*hc + (hc-1)^2, n_tokens] (selector projection of x),
+    //   scale [4], base [2*hc + (hc-1)^2] -> [2*hc + hc*hc, n_tokens]: pre [hc], post [hc], comb [hc, hc] per token
+    //   m = mm / sqrt(mean(x^2) + eps)
+    //   pre[h]  = sigmoid(m[h]*scale[0] + base[h]),  post[h] = magnitude*sigmoid(m[hc+h]*scale[1] + base[hc+h])
+    //   z = m[2hc..]*scale[2] + base[2hc..] as [hc-1, hc-1], e = H z H^T (H [hc, hc-1] Helmert basis),
+    //   C = I/2 + 1/(2 hc), rho = 1 + max(0, max(-e/C)), comb = I + sigmoid(scale[3])*(e/rho + C - I)
+    //   comb[a + hc*i] = comb[a][i] (dst a, src i, as ggml_dsv4_hc_post reads it)
+    GGML_API struct ggml_tensor * ggml_raon_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * mm,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            float                 magnitude);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

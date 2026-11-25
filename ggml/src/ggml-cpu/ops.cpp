@@ -11843,6 +11843,85 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_raon_hc_mix
+
+void ggml_compute_forward_raon_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * mm    = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const ggml_tensor * base  = dst->src[3];
+
+    constexpr int hc = 4;
+    constexpr int nm = hc - 1;
+
+    const float eps       = ggml_get_op_params_f32(dst, 0);
+    const float magnitude = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n  = x->ne[0];
+    const int64_t nt = mm->ne[1];
+
+    const float * s = (const float *) scale->data;
+    const float * b = (const float *) base->data;
+
+    float H[hc][nm];
+    for (int r = 0; r < hc; ++r) {
+        for (int c = 0; c < nm; ++c) {
+            H[r][c] = (r <= c ? 1.0f : r == c + 1 ? -(float) (c + 1) : 0.0f)/sqrtf((float) ((c + 1)*(c + 2)));
+        }
+    }
+
+    for (int64_t t = params->ith; t < nt; t += params->nth) {
+        const float * xr = (const float *) ((const char *) x->data + t*x->nb[1]);
+        ggml_float ss = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            ss += (ggml_float) xr[i]*xr[i];
+        }
+        const float rms = sqrtf((float) (ss/n) + eps);
+
+        const float * mr = (const float *) ((const char *) mm->data + t*mm->nb[1]);
+        float       * d  = (float *) ((char *) dst->data + t*dst->nb[1]);
+
+        float m[2*hc + nm*nm];
+        for (int i = 0; i < 2*hc + nm*nm; ++i) {
+            m[i] = mr[i]/rms;
+        }
+        for (int h = 0; h < hc; ++h) {
+            d[h]      = 1.0f/(1.0f + expf(-(m[h]*s[0] + b[h])));
+            d[hc + h] = magnitude/(1.0f + expf(-(m[hc + h]*s[1] + b[hc + h])));
+        }
+        float z[nm*nm];
+        for (int i = 0; i < nm*nm; ++i) {
+            z[i] = m[2*hc + i]*s[2] + b[2*hc + i];
+        }
+        float e[hc*hc];
+        float rho = 0.0f;
+        for (int i = 0; i < hc; ++i) {
+            for (int a = 0; a < hc; ++a) {
+                float v = 0.0f;
+                for (int j = 0; j < nm; ++j) {
+                    for (int k = 0; k < nm; ++k) {
+                        v += H[a][j]*H[i][k]*z[k + nm*j];
+                    }
+                }
+                e[a + hc*i] = v;
+                const float c = (a == i ? 0.5f : 0.0f) + 0.5f/hc;
+                rho = fmaxf(rho, -(v/c));
+            }
+        }
+        rho += 1.0f;
+        const float g = 1.0f/(1.0f + expf(-s[3]));
+        for (int i = 0; i < hc; ++i) {
+            for (int a = 0; a < hc; ++a) {
+                const float c   = (a == i ? 0.5f : 0.0f) + 0.5f/hc;
+                const float id  = a == i ? 1.0f : 0.0f;
+                d[2*hc + a + hc*i] = (e[a + hc*i]/rho + c - id)*g + id;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(
