@@ -1645,6 +1645,8 @@ json oaicompat_chat_params_parse(
         const auto levels = caps.at("reasoning_effort_levels").get<std::vector<std::string>>();
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
+            // also override a server default such as --reasoning on, which the template reads from its kwargs
+            inputs.chat_template_kwargs["enable_thinking"] = "false";
             // Some models use reasoning_effort = none and some throw an exception, so check the model's list of effort levels first
             if (std::find(levels.begin(), levels.end(), reasoning_effort) != levels.end()) {
                 inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
@@ -1657,6 +1659,15 @@ json oaicompat_chat_params_parse(
                 throw std::invalid_argument("reasoning_effort \"" + reasoning_effort + "\" is not supported by the chat template, supported levels: " + string_join(levels, ", "));
             }
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+        }
+    }
+    // the effort the template sees (or "none") also selects the model's reasoning effort steering (server-context.cpp)
+    {
+        auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (it != inputs.chat_template_kwargs.end()) {
+            llama_params["reasoning_effort"] = json::parse(it->second);
+        } else {
+            llama_params["reasoning_effort"] = json_value(body, "reasoning_effort", std::string("")) == "none" ? json("none") : json();
         }
     }
 
