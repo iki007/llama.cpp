@@ -167,7 +167,7 @@ static void dsv4_hc_post_f32_sycl(
         int64_t sp0, int64_t sp1,
         int64_t sc0, int64_t sc1, int64_t sc2,
         int64_t sd0, int64_t sd1, int64_t sd2,
-        queue_ptr stream) {
+        queue_ptr stream, const float * x2 = nullptr) {
     // 4 streams with contiguous elements (every hyper-connection model so far): a work-item per (element, token) writes
     // all 4 destination streams from one read of the 4 residual streams, 32-bit indices
     if (hc == DSV4_HC && has_comb && sx0 == 1 && sr0 == 1 && sd0 == 1 && n_embd * n_tokens < INT32_MAX &&
@@ -184,7 +184,7 @@ static void dsv4_hc_post_f32_sycl(
                 const int     i0 = ir % ne;
                 const int     it = ir / ne;
                 const float * r  = residual + (int64_t) it * sr2 + i0;
-                const float   xv = x[(int64_t) it * sx1 + i0];
+                const float   xv = x[(int64_t) it * sx1 + i0] + (x2 ? x2[(int64_t) it * sx1 + i0] : 0.0f);
                 float         rv[DSV4_HC];
 #pragma unroll
                 for (int s = 0; s < DSV4_HC; ++s) {
@@ -205,6 +205,7 @@ static void dsv4_hc_post_f32_sycl(
             });
         return;
     }
+    GGML_ASSERT(x2 == nullptr);
 
     const int64_t nr = n_embd * hc * n_tokens;
     const int64_t block_size = dsv4_hc_post_block_size;
@@ -458,4 +459,50 @@ void ggml_sycl_op_raon_hc_mix(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             d[l] = (e / rho + c - id) * g + id;
         }
     });
+}
+
+// ADD(a, b) read only by DSV4_HC_POST as its branch x: the post kernel reads a + b itself (the shared-expert sum of an
+// MoE layer, Raon-1: 24 launches a token). Only the 4-stream contiguous form; false: not this shape.
+bool ggml_sycl_op_dsv4_hc_post_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * add) {
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+    const ggml_tensor * a        = add->src[0];
+    const ggml_tensor * b        = add->src[1];
+    if (comb == nullptr || dst->src[0] != add || residual->ne[1] != DSV4_HC || a->type != GGML_TYPE_F32 ||
+        b->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) ||
+        a->nb[1] != b->nb[1] || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || add->ne[2] != 1 ||
+        add->ne[3] != 1 || residual->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        post->type != GGML_TYPE_F32 || comb->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // a and b are read after the graph's ADD: the post output must not overlap them
+    const auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * xs = (const char *) x->data;
+        const char * ys = (const char *) y->data;
+        return xs < ys + ggml_nbytes(y) && ys < xs + ggml_nbytes(x);
+    };
+    // one token: an input lying exactly on one destination stream is fine (work-item i0 reads a[i0] / b[i0] before it
+    // writes i0 of every stream, and nothing else writes there); any other overlap is not
+    const auto on_stream = [&](const ggml_tensor * x) {
+        const ptrdiff_t off = (const char *) x->data - (const char *) dst->data;
+        const ptrdiff_t row = (ptrdiff_t) (dst->nb[1]);
+        return add->ne[1] == 1 && dst->nb[1] == (size_t) dst->ne[0] * sizeof(float) && off >= 0 && off % row == 0 &&
+               off / row < DSV4_HC;
+    };
+    if ((overlap(dst, a) && !on_stream(a)) || (overlap(dst, b) && !on_stream(b))) {
+        return false;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4, " : with the branch ADD");
+    const int64_t n_embd = a->ne[0], n_tokens = a->ne[1];
+    dsv4_hc_post_f32_sycl<true>(
+        (const float *) a->data, (const float *) residual->data, (const float *) post->data, (const float *) comb->data,
+        (float *) dst->data, n_embd, DSV4_HC, n_tokens,
+        1, a->nb[1] / sizeof(float),
+        1, residual->nb[1] / sizeof(float), residual->nb[2] / sizeof(float),
+        post->nb[0] / sizeof(float), post->nb[1] / sizeof(float),
+        comb->nb[0] / sizeof(float), comb->nb[1] / sizeof(float), comb->nb[2] / sizeof(float),
+        1, dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float),
+        ctx.stream(), (const float *) b->data);
+    return true;
 }
