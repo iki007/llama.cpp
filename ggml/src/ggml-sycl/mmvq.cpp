@@ -3301,7 +3301,7 @@ static constexpr int MOE_REORDER_DEDUP_R = 4;
 // the reordered dedup kernel groups up to 256 slots (42 tokens x 6 experts: 32 parallel sessions), the NVFP4 one 128
 static constexpr int MOE_REORDER_DEDUP_MAX_SLOTS = 16 * WARP_SIZE;
 
-template <typename reorder_vec_dot_q_sycl, int MAX_SLOTS>
+template <typename reorder_vec_dot_q_sycl, int MAX_SLOTS, int R = MOE_REORDER_DEDUP_R>
 static void mul_mat_vec_q_moe_reorder_dedup(
     const void * __restrict__ vx_base, const void * __restrict__ vy_base,
     float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
@@ -3312,7 +3312,6 @@ static void mul_mat_vec_q_moe_reorder_dedup(
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
     constexpr int       M     = MOE_DEDUP_MAXM;
-    constexpr int       R     = MOE_REORDER_DEDUP_R;
     constexpr ggml_type gtype = reorder_vec_dot_q_sycl::gtype;
 
     const int slot     = item_ct1.get_group(1);
@@ -3483,22 +3482,38 @@ static void launch_mul_mat_vec_q_moe_reorder(
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
     static const bool    dedup   = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP_REORDER", 1) != 0;
     if (dedup && n_tokens > 1 && n_tokens * n_experts_used <= MOE_REORDER_DEDUP_MAX_SLOTS) {
-        const int            rows_per_wg = GGML_SYCL_MMV_Y * MOE_REORDER_DEDUP_R;
+        // rows a sub-group: the grouping prologue is paid once for them. Raon-1 mini (t/s, 16 / 32 parallel sessions):
+        // R 4 -> 417 / 486, R 8 -> 427 / 508, R 16 -> 422 / 519: 8 up to 128 slots, 16 above.
+        // GGML_SYCL_MOE_DEDUP_R (1, 2, 4, 8, 16) overrides
+        static const int     r_env       = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP_R", 0);
+        const int            r_rows      = r_env == 1 || r_env == 2 || r_env == 4 || r_env == 8 || r_env == 16 ? r_env :
+                                           n_tokens * n_experts_used <= 8 * WARP_SIZE ? 8 : 16;
+        const int            rows_per_wg = GGML_SYCL_MMV_Y * r_rows;
         const sycl::range<3> block_nums(1, (unsigned) (n_tokens * n_experts_used),
                                         (unsigned) ((nrows + rows_per_wg - 1) / rows_per_wg));
         // the slot ids sit in registers, 8 or 16 a lane: up to 128 slots keep the shorter scan
-        const auto launch = [&](auto slots_c) {
+        const auto launch_r = [&](auto slots_c, auto r_c) {
             constexpr int MS = decltype(slots_c)::value;
+            constexpr int RR = decltype(r_c)::value;
             stream->submit([&](sycl::handler & cgh) {
                 cgh.parallel_for(
                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
                     [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q_moe_reorder_dedup<reorder_vec_dot_q_sycl, MS>(
+                        mul_mat_vec_q_moe_reorder_dedup<reorder_vec_dot_q_sycl, MS, RR>(
                             vx_base, vy, dst_base, ids_dev, ncols, nrows, n_experts_used, n_tokens,
                             expert_weight_stride, dst_row_stride, src1_row_stride,
                             ids_row_stride, dst_tok_stride, src1_tok_stride, item);
                     });
             });
+        };
+        const auto launch = [&](auto slots_c) {
+            switch (r_rows) {
+                case 1:  launch_r(slots_c, std::integral_constant<int, 1>{}); break;
+                case 2:  launch_r(slots_c, std::integral_constant<int, 2>{}); break;
+                case 4:  launch_r(slots_c, std::integral_constant<int, 4>{}); break;
+                case 8:  launch_r(slots_c, std::integral_constant<int, 8>{}); break;
+                default: launch_r(slots_c, std::integral_constant<int, 16>{}); break;
+            }
         };
         if (n_tokens * n_experts_used <= 8 * WARP_SIZE) {
             launch(std::integral_constant<int, 8 * WARP_SIZE>{});
