@@ -15425,6 +15425,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    // Raon-1 absorbed MLA: 40 query heads on one latent head (decode, verify batches, prompt chunks)
+    for (int nb : { 1, 8, 64, 512 }) {
+        for (int kv : { 1024, 8192 }) {
+            for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {40, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true));
+            }
+        }
+    }
 
     // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -15819,6 +15827,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Raon-1 mini MLA decode (576/512, 40 heads on 1 KV head), 512 to 64K keys: 1 token and a 4-row batch
+    for (int kv : { 512, 1024, 2048, 4096, 16384, 65536 })
+    for (int nb : { 1, 4 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {40, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    }
 
     // Inkling's small bf16 projections (attention sink [2304, 24], conv taps [2304, 32]) in a 4-token verify batch
     for (int64_t m : { 24, 32 }) {

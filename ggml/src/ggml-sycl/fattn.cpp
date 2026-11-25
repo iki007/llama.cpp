@@ -179,12 +179,19 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // GLM-4.7 Flash's MLA shape is already expressible by the MKL pipeline:
     // KQ GEMM uses DKQ=576 while VKQ and output use DV=512. Keep this narrow
     // until other mismatched K/V shapes have independent correctness data.
+    // gqa 20: GLM-4.7 Flash, gqa 40: Raon-1 mini (test-backend-ops covers both)
     const bool glm_mla_shape = Q->ne[0] == 576 && K->ne[0] == 576 &&
-        V->ne[0] == 512 && gqa_ratio == 20 &&
+        V->ne[0] == 512 && (gqa_ratio == 20 || gqa_ratio == 40) &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
     // GGML_SYCL_MKL_FA_MIN_KV: the fewest K/V cells the MKL path takes (default 1024)
     static const int mkl_fa_min_kv = ggml_sycl_get_env("GGML_SYCL_MKL_FA_MIN_KV", 1024);
+    // MLA decode / verify batches with >= 32 heads on one KV head (Raon-1 mini: 40) go to MKL as one GEMM of the heads
+    // once keys x tokens reach GGML_SYCL_MKL_FA_MLA_MIN_WORK (default 8192): the tile kernel re-reads the latent cache
+    // once per 8 heads (64K keys, 1 token: 1.84 -> 0.68 ms), but MKL costs ~145 us at any size (crossover ~5K keys at
+    // 1 token, ~2K at 4). GLM-4.7 Flash (gqa 20) keeps the tile kernel below 32 query rows.
+    static const int64_t mkl_fa_mla_min_work = ggml_sycl_get_env("GGML_SYCL_MKL_FA_MLA_MIN_WORK", 8192);
+    const bool mla_decode_mkl = glm_mla_shape && gqa_ratio >= 32 && K->ne[1] * Q->ne[1] >= mkl_fa_mla_min_work;
     // an indexed bias and its sinks are applied by the MKL softmax / normalization (fattn-mkl.cpp); sinks without an
     // indexed bias stay on the kernels below as before
     // the MKL path converts a non-F16 cache with ggml_get_to_fp16(_nc)_sycl (fattn-mkl.cpp, mkl_fa_dequant_chunk): a type
@@ -195,7 +202,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !per_head_mask && (!sinks || indexed_bias) && gqa_ratio >= 2 &&
         mkl_kv_ok(K) && mkl_kv_ok(V) &&
         (standard_shape || glm_mla_shape) &&
-        Q->ne[1] >= 32 && K->ne[1] >= mkl_fa_min_kv &&
+        (Q->ne[1] >= 32 || mla_decode_mkl) && K->ne[1] >= mkl_fa_min_kv &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
         (Q->ne[3] == K->ne[3] || K->ne[3] == 1)) {
         // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
