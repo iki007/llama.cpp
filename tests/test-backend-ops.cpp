@@ -13174,6 +13174,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  64, 32, 256, { 8, 1}, {1, 1}));
     // Q5_0 experts (Raon-1 mini down projections) on the reordered MoE kernel in their own layout: 1 token, verify-size
     // batches and 16 parallel sessions (token dedup)
+    // 32 parallel sessions: the reordered dedup kernel takes up to 256 slots
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 6, false, 1088, 32, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 6, false, 2560, 32, 1088));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 6, false, 2560, 32, 1088));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 6, false, 1088, 24, 2560));
     for (int n : { 1, 3, 4, 16 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 6, false, 2560, n, 1088));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32,  16, 4, false,   64, n,  256));
