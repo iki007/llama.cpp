@@ -1,6 +1,7 @@
 #include "ggml-impl.h"
 #include "dsv4-hc.hpp"
 
+#include <cfloat>
 #include <cmath>
 #include <type_traits>
 
@@ -167,6 +168,44 @@ static void dsv4_hc_post_f32_sycl(
         int64_t sc0, int64_t sc1, int64_t sc2,
         int64_t sd0, int64_t sd1, int64_t sd2,
         queue_ptr stream) {
+    // 4 streams with contiguous elements (every hyper-connection model so far): a work-item per (element, token) writes
+    // all 4 destination streams from one read of the 4 residual streams, 32-bit indices
+    if (hc == DSV4_HC && has_comb && sx0 == 1 && sr0 == 1 && sd0 == 1 && n_embd * n_tokens < INT32_MAX &&
+        sr2 * n_tokens < INT32_MAX && sd2 * n_tokens < INT32_MAX) {
+        const int ne = (int) n_embd;
+        const int n  = (int) (n_embd * n_tokens);
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) (n + 255) / 256 * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> item) {
+                const int ir = (int) item.get_global_id(0);
+                if (ir >= n) {
+                    return;
+                }
+                const int     i0 = ir % ne;
+                const int     it = ir / ne;
+                const float * r  = residual + (int64_t) it * sr2 + i0;
+                const float   xv = x[(int64_t) it * sx1 + i0];
+                float         rv[DSV4_HC];
+#pragma unroll
+                for (int s = 0; s < DSV4_HC; ++s) {
+                    rv[s] = r[s * sr1];
+                }
+                const float * pp = post + (int64_t) it * sp1;
+                const float * cp = comb + (int64_t) it * sc2;
+                float *       dp = dst + (int64_t) it * sd2 + i0;
+#pragma unroll
+                for (int dd = 0; dd < DSV4_HC; ++dd) {
+                    float sum = xv * pp[dd * sp0];
+#pragma unroll
+                    for (int s = 0; s < DSV4_HC; ++s) {
+                        sum += rv[s] * cp[dd * sc0 + s * sc1];
+                    }
+                    dp[dd * sd1] = sum;
+                }
+            });
+        return;
+    }
+
     const int64_t nr = n_embd * hc * n_tokens;
     const int64_t block_size = dsv4_hc_post_block_size;
     const int64_t num_blocks = (nr + block_size - 1) / block_size;
@@ -349,7 +388,7 @@ void ggml_sycl_op_raon_hc_mix(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
     constexpr int hc = DSV4_HC;
     constexpr int nm = hc - 1;
-    constexpr int WG = 256;
+    constexpr int WG = 512;
 
     const float   eps       = ggml_get_op_params_f32(dst, 0);
     const float   magnitude = ggml_get_op_params_f32(dst, 1);
@@ -364,64 +403,59 @@ void ggml_sycl_op_raon_hc_mix(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     const float * sd = (const float *) scale->data;
     const float * bd = (const float *) base->data;
     float *       dd = (float *) dst->data;
+    const bool    vec4 = n % 4 == 0 && sx1 % 4 == 0 && (uintptr_t) xd % 16 == 0;
 
     ctx.stream()->parallel_for(sycl::nd_range<1>(sycl::range<1>(nt * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
         const int64_t t  = it.get_group(0);
         const int     l  = it.get_local_id(0);
         const float * xr = xd + t * sx1;
         float         ss = 0.0f;
-        for (int64_t i = l; i < n; i += WG) {
-            ss += xr[i] * xr[i];
+        if (vec4) {
+            const sycl::float4 * x4 = (const sycl::float4 *) xr;
+            for (int64_t i = l; i < n / 4; i += WG) {
+                const sycl::float4 v = x4[i];
+                ss += sycl::dot(v, v);
+            }
+        } else {
+            for (int64_t i = l; i < n; i += WG) {
+                ss += xr[i] * xr[i];
+            }
         }
         ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
-        if (l != 0) {
-            return;
-        }
-        const float   rms = sycl::sqrt(ss / n + eps);
-        const float * mr  = md + t * sm1;
-        float *       d   = dd + t * sd1;
+        const float   rinv = 1.0f / sycl::sqrt(ss / n + eps);
+        const float * mr   = md + t * sm1;
+        float *       d    = dd + t * sd1;
 
-        float m[2 * hc + nm * nm];
-        for (int i = 0; i < 2 * hc + nm * nm; ++i) {
-            m[i] = mr[i] / rms;
-        }
-        for (int h = 0; h < hc; ++h) {
-            d[h]      = 1.0f / (1.0f + sycl::exp(-(m[h] * sd[0] + bd[h])));
-            d[hc + h] = magnitude / (1.0f + sycl::exp(-(m[hc + h] * sd[1] + bd[hc + h])));
-        }
-        float H[hc][nm];
-        for (int r = 0; r < hc; ++r) {
-            for (int c = 0; c < nm; ++c) {
-                H[r][c] = (r <= c ? 1.0f : r == c + 1 ? -(float) (c + 1) : 0.0f) / sycl::sqrt((float) ((c + 1) * (c + 2)));
-            }
-        }
-        float z[nm * nm];
-        for (int i = 0; i < nm * nm; ++i) {
-            z[i] = m[2 * hc + i] * sd[2] + bd[2 * hc + i];
-        }
-        float e[hc * hc];
-        float rho = 0.0f;
-        for (int i = 0; i < hc; ++i) {
-            for (int a = 0; a < hc; ++a) {
-                float v = 0.0f;
-                for (int j = 0; j < nm; ++j) {
-                    for (int k = 0; k < nm; ++k) {
-                        v += H[a][j] * H[i][k] * z[k + nm * j];
-                    }
+        // work-items 0..7: pre and post; 8..23: one comb entry (a, i) each, rho is their group max
+        float e = 0.0f;
+        float c = 1.0f;
+        int   a = 0, i = 0;
+        float ratio = -FLT_MAX;
+        if (l >= 2 * hc && l < 2 * hc + hc * hc) {
+            a = (l - 2 * hc) % hc;
+            i = (l - 2 * hc) / hc;
+            const auto H = [](int r, int cc) {
+                return (r <= cc ? 1.0f : r == cc + 1 ? -(float) (cc + 1) : 0.0f) / sycl::sqrt((float) ((cc + 1) * (cc + 2)));
+            };
+            for (int j = 0; j < nm; ++j) {
+                const float haj = H(a, j);
+                for (int k = 0; k < nm; ++k) {
+                    const float z = mr[2 * hc + k + nm * j] * rinv * sd[2] + bd[2 * hc + k + nm * j];
+                    e += haj * H(i, k) * z;
                 }
-                e[a + hc * i] = v;
-                const float c = (a == i ? 0.5f : 0.0f) + 0.5f / hc;
-                rho = sycl::fmax(rho, -(v / c));
             }
+            c     = (a == i ? 0.5f : 0.0f) + 0.5f / hc;
+            ratio = -(e / c);
         }
-        rho += 1.0f;
-        const float g = 1.0f / (1.0f + sycl::exp(-sd[3]));
-        for (int i = 0; i < hc; ++i) {
-            for (int a = 0; a < hc; ++a) {
-                const float c  = (a == i ? 0.5f : 0.0f) + 0.5f / hc;
-                const float id = a == i ? 1.0f : 0.0f;
-                d[2 * hc + a + hc * i] = (e[a + hc * i] / rho + c - id) * g + id;
-            }
+        const float rho = 1.0f + sycl::fmax(0.0f, sycl::reduce_over_group(it.get_group(), ratio, sycl::maximum<float>()));
+        if (l < hc) {
+            d[l] = 1.0f / (1.0f + sycl::exp(-(mr[l] * rinv * sd[0] + bd[l])));
+        } else if (l < 2 * hc) {
+            d[l] = magnitude / (1.0f + sycl::exp(-(mr[l] * rinv * sd[1] + bd[l])));
+        } else if (l < 2 * hc + hc * hc) {
+            const float g  = 1.0f / (1.0f + sycl::exp(-sd[3]));
+            const float id = a == i ? 1.0f : 0.0f;
+            d[l] = (e / rho + c - id) * g + id;
         }
     });
 }

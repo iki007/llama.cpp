@@ -12516,6 +12516,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 3));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
@@ -15871,6 +15873,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Raon-1 mini mHC site: mixing weights, the 17-row bf16 selector projection, hc_post
+    test_cases.emplace_back(new test_raon_hc_mix(10240, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 17, 1, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 128, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 5120, 1, 128, {1, 1}, {1, 1}));
+
+    // Raon-1 mini decode mat-vecs: RDA q/k/v/g (q6_K 2560 -> 5120), output (q8_0 5120 -> 2560), shared expert (q6_K
+    // 2560 -> 1088, q8_0 1088 -> 2560), output head (q6_K 2560 -> 259840)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 20480, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1088, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 1, 1088, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 259840, 1, 2560, {1, 1}, {1, 1}));
 
     // Raon-1 mini MLA decode (576/512, 40 heads on 1 KV head), 512 to 64K keys: 1 token and a 4-row batch
     for (int kv : { 512, 1024, 2048, 4096, 16384, 65536 })
