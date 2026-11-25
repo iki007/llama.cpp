@@ -3570,7 +3570,10 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 // Appends to a draft the tokens that followed the longest earlier occurrence of the tail of prompt + id_last + draft
 // (at least n_min tokens), up to n_max draft tokens in total. Where the output repeats the context (edits, quotes,
 // tool calls) this fills the verify batch beyond the drafter's own length.
-static void common_speculative_lookup_extend(const llama_tokens & prompt, llama_token id_last, llama_tokens & draft, int n_min, int n_max) {
+// With probabilistic drafts (draft_q set) each appended token gets a one-hot q: the verifier then accepts it with the
+// target's probability of it and samples a rejection from the target minus that token, so the output stays exact.
+static void common_speculative_lookup_extend(const llama_tokens & prompt, llama_token id_last, llama_tokens & draft, int n_min, int n_max,
+                                             std::vector<std::vector<llama_token_data>> * draft_q) {
     const int64_t n_prompt = (int64_t) prompt.size();
     const int64_t n        = n_prompt + 1 + (int64_t) draft.size();
     const int     n_ext    = n_max - (int) draft.size();
@@ -3613,6 +3616,9 @@ static void common_speculative_lookup_extend(const llama_tokens & prompt, llama_
     for (int64_t i = best; i < n && (int) (i - best) < n_ext; ++i) {
         const llama_token t = at(i);
         draft.push_back(t);
+        if (draft_q && !draft_q->empty()) {
+            draft_q->push_back({ { t, 0.0f, 1.0f } });
+        }
     }
 }
 
@@ -3679,7 +3685,7 @@ void common_speculative_draft(common_speculative * spec) {
                             impl.get()->n_call_draft, result.size());
 
                     if (dp.lookup_n_min > 0) {
-                        common_speculative_lookup_extend(*dp.prompt, dp.id_last, result, dp.lookup_n_min, dp.lookup_n_max);
+                        common_speculative_lookup_extend(*dp.prompt, dp.id_last, result, dp.lookup_n_min, dp.lookup_n_max, dp.result_q);
                     }
 
                     // remember which implementation was used
