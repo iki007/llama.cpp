@@ -6883,9 +6883,10 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    // small batches (speculative verify): NVFP4 up to 16 tokens; the reorder (SoA) types up to
-    // GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK (default 8; 0 = one token only, the grouped GEMM above that)
-    static const int reorder_max_tok = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK", 8);
+    // small batches (speculative verify, parallel sessions): NVFP4 up to 16 tokens; the reorder (SoA) types up to
+    // GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK (default 16; 0 = one token only, the grouped GEMM above that). With 16 tokens
+    // x 6 of 128 experts the grouped GEMM's tiles are mostly empty: Raon-1 mini, 16 decode sessions 16.1 -> 18.0 t/s each
+    static const int reorder_max_tok = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_REORDER_MAX_TOK", 16);
     // the other types up to GGML_SYCL_MOE_MMVQ_PLAIN_MAX_TOK tokens (default 16) on the plain fused kernel, which takes
     // the tokens of the batch in one launch: without a grouped GEMM layout the alternative is the per-expert loop, and
     // for Q5_1 the grouped GEMM is slower at a 4-token verify batch (Inkling 2 Mini: 1.80 vs 1.69 ms a round). The
@@ -6950,7 +6951,10 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     static const bool dedup     = ggml_sycl_get_env("GGML_SYCL_MOE_DEDUP", 1) != 0;
     const bool        use_dedup = !use_reorder && dedup &&
                                   ggml_sycl_mul_mat_vec_q_id_dedup_supported(src0->type, n_tokens, n_experts_used);
-    if (use_reorder || use_dedup) {
+    // Q5_0 experts (no reordered layout) read in place by the reordered kernel: its token dedup for small batches
+    static const bool q5_0_aos_env = ggml_sycl_get_env("GGML_SYCL_MOE_Q5_0_AOS", 1) != 0;
+    const bool        q5_0_aos     = !use_reorder && src0->type == GGML_TYPE_Q5_0 && q5_0_aos_env;
+    if (use_reorder || use_dedup || q5_0_aos) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
             (const float *) src1->data, src1_ddq, (int) ne10, (int) n_src1_rows,
             src1_padded_cols, stream);
@@ -6965,6 +6969,12 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const size_t src1_tok_stride = (size_t) ne11 * bytes_per_qrow;
     const size_t ids_row_stride  = ids->nb[1] / sizeof(int32_t);
 
+    if (q5_0_aos && ggml_sycl_mul_mat_vec_q_id_q5_0_aos(
+                        src0->data, src1_ddq, (const int32_t *) ids->data, (float *) dst->data, (int) ne10, nrows,
+                        n_experts_used, /*expert_weight_stride=*/ src0->nb[2], /*dst_row_stride=*/ dst->nb[1],
+                        src1_row_stride, stream, n_tokens, ids_row_stride, dst->nb[2], src1_tok_stride)) {
+        return true;
+    }
     if (use_reorder && src0->type == GGML_TYPE_NVFP4) {
         return ggml_sycl_mul_mat_vec_q_id_dedup(
             src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,

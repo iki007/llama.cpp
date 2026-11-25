@@ -32,6 +32,12 @@ void ggml_sycl_op_mul_mat_vec_q(
 
 // Requires standard (non-reorder) block layout for src0.
 // Returns false if src0_type isn't handled; caller should fall back.
+bool ggml_sycl_mul_mat_vec_q_id_q5_0_aos(const void * vx_base, const void * vy, const int32_t * ids_dev, float * dst_base,
+                                         int ncols, int nrows, int n_experts_used, size_t expert_weight_stride,
+                                         size_t dst_row_stride, size_t src1_row_stride, dpct::queue_ptr stream,
+                                         int n_tokens, size_t ids_row_stride, size_t dst_tok_stride,
+                                         size_t src1_tok_stride);
+
 bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,             // start of stacked expert weights

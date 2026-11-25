@@ -311,6 +311,27 @@ template <> struct block_q_t<GGML_TYPE_Q8_0> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }  // 1
 };
 
+// Q5_0 has no reordered layout: the reordered MoE mat-vec (and its token dedup) reads the AoS blocks
+// [d 2][qh 4][qs 16] in place through these offsets (first: qs, second: qh)
+template <> struct block_q_t<GGML_TYPE_Q5_0> {
+    struct traits {
+        static constexpr uint32_t qk       = QK5_0;  // 32
+        static constexpr uint32_t qi       = QI5_0;  // 4
+        static constexpr uint32_t qr       = QR5_0;  // 2
+        static constexpr uint32_t vdr_mmvq = 2;
+    };
+
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (int) sizeof(block_q5_0) + 6, block_index * (int) sizeof(block_q5_0) + 2 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int /* nrows */, int /* ncols */, const int block_index) {
+        return { block_index * (int) sizeof(block_q5_0), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_MXFP4> {
     struct traits {
         static constexpr uint32_t qk       = QK_MXFP4;  // 32

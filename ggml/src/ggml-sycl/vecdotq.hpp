@@ -991,6 +991,68 @@ vec_dot_q5_0_q8_1_impl(const int *vl, const int *vh, const int *u,
     return d5 * (sumi * ds8f.x() - (16 * vdr / QI5_0) * ds8f.y());
 }
 
+// Q5_0 in its AoS layout for the reordered MoE mat-vec (block_q_t<GGML_TYPE_Q5_0>): the same integer dot and -16
+// correction as vec_dot_q5_0_q8_1; the weight side is unpacked once for every grouped token (shared weights)
+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q5_0> {
+    static constexpr ggml_type gtype = GGML_TYPE_Q5_0;
+    static constexpr int       vdr   = VDR_Q5_0_Q8_1_MMVQ;
+
+    struct weights {
+        int   vi0[vdr];
+        int   vi1[vdr];
+        float d;
+    };
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs) {
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        const uint8_t * qs   = base + ibx_offset.first;
+        const int       qh   = get_int_from_uint8(base + ibx_offset.second, 0);
+        weights         w;
+#pragma unroll
+        for (int i = 0; i < vdr; ++i) {
+            const int vl = get_int_from_uint8(qs, iqs + i);
+            const int vh = qh >> (4 * (iqs + i));
+            int vi0 = (vl >>  0) & 0x0F0F0F0F;
+            vi0    |= (vh <<  4) & 0x00000010;
+            vi0    |= (vh << 11) & 0x00001000;
+            vi0    |= (vh << 18) & 0x00100000;
+            vi0    |= (vh << 25) & 0x10000000;
+            int vi1 = (vl >>  4) & 0x0F0F0F0F;
+            vi1    |= (vh >> 12) & 0x00000010;
+            vi1    |= (vh >>  5) & 0x00001000;
+            vi1    |= (vh <<  2) & 0x00100000;
+            vi1    |= (vh <<  9) & 0x10000000;
+            w.vi0[i] = vi0;
+            w.vi1[i] = vi1;
+        }
+        w.d = (float) *reinterpret_cast<const ggml_half *>(base + d_offset.first);
+        return w;
+    }
+
+    __dpct_inline__ static float dot(const weights & w, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+                                     const int & iqs) {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < vdr; ++i) {
+            sumi = dpct::dp4a(w.vi0[i], get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i), sumi);
+            sumi = dpct::dp4a(w.vi1[i], get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i + QI5_0), sumi);
+        }
+        const sycl::float2 ds8f = q8_1_ds->convert<float, sycl::rounding_mode::automatic>();
+        return w.d * (sumi * ds8f.x() - (16 * vdr / QI5_0) * ds8f.y());
+    }
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        return dot(load(vbq, ibx_offset, d_offset, iqs), q8_1_quant_ptr, q8_1_ds, iqs);
+    }
+};
+
+template <> struct reorder_vec_dot_shared_weights<GGML_TYPE_Q5_0> {
+    static constexpr bool value = true;
+};
+
 #define VDR_Q5_1_Q8_1_MMVQ 2
 #define VDR_Q5_1_Q8_1_MMQ  4
 
