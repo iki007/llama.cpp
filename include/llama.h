@@ -716,6 +716,9 @@ extern "C" {
     // returns the number of extracted layers from target model
     LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
+    // width of the fused target features a draft encoder expects per token (EAGLE3 / DFlash)
+    LLAMA_API int32_t llama_model_n_embd_inp_enc(const struct llama_model * model);
+
     //
     // Adapters
     //
@@ -1214,6 +1217,10 @@ extern "C" {
 
     // Get the input embeddings of a specific layer, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+    // number of floats per token returned by llama_get_embeddings_layer_inp
+    // equals llama_model_n_embd, except for models with a wider residual (e.g. hyper-connection streams)
+    LLAMA_API int32_t llama_model_n_embd_layer_inp(const struct llama_model * model);
 
     // Write the enabled layer inputs to a device buffer [n_layer_inp*n_embd, n_batch] instead of host memory.
     // Row r holds the token at batch index r, layers in ascending layer id order.

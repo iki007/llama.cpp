@@ -248,6 +248,13 @@ ggml_tensor * llama_model_raon1_mini::graph::build_rda_conv(
         qkv * conv_state_size * ggml_element_size(conv_states_seq));
 
     ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
+
+    if (cparams.rs_replay) {
+        // the row holds the q, k and v conv histories one after the other [TAG_RECURRENT_REPLAY]
+        ggml_tensor * conv_x = build_conv_state_replay(inp_rs, conv_states_mem, x_3d, d_conv - 1, d_inner, il, conv_states_seq, qkv);
+        return build_rda_conv_out(conv_x, conv_w, n_seq_tokens, n_seqs);
+    }
+
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
     // group s holds the conv window s tokens back.
@@ -264,7 +271,15 @@ ggml_tensor * llama_model_raon1_mini::graph::build_rda_conv(
                     ((s * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_mem))));
     }
 
-    ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
+    return build_rda_conv_out(conv_x, conv_w, n_seq_tokens, n_seqs);
+}
+
+// conv_x: (d_conv - 1 + n_seq_tokens, d_inner, n_seqs); returns (head_dim, n_head, n_seq_tokens, n_seqs)
+ggml_tensor * llama_model_raon1::graph::build_rda_conv_out(ggml_tensor * conv_x, ggml_tensor * conv_w, int64_t n_seq_tokens, int64_t n_seqs) {
+    const int64_t head_dim = hparams.n_embd_head_kda;
+    const int64_t d_inner  = head_dim * n_head;
+
+    ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, hparams.ssm_d_conv, d_inner);
     ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
     Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
     Xcur = ggml_silu(ctx0, Xcur);
@@ -299,7 +314,8 @@ ggml_tensor * llama_model_raon1_mini::graph::build_rda_layer(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
-    ggml_tensor * conv_states_seq = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), hparams.n_embd_r(), n_seqs);
+    // rs_replay rows are wider than n_embd_r: the conv windows plus the pending tokens
+    ggml_tensor * conv_states_seq = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), inp_rs->mctx->get_r_l(il)->ne[0], n_seqs);
 
     ggml_tensor * Qcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wq, cur), layer.ssm_q_conv, 0, il);
     ggml_tensor * Kcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wk, cur), layer.ssm_k_conv, 1, il);
