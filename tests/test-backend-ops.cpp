@@ -13764,6 +13764,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // short rows over many channels: Raon-1's conv window [3 | 1] x 5120 on decode, two sequences, and a wider tail
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 5120, 1, 1}, 1, 0, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 5120, 2, 1}, 1, 0, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 5120, 2, 1}, 4, 2, 0));
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {

@@ -94,6 +94,35 @@ template <typename T>
 static void concat_T_sycl(const T *x, const T *y, T *dst,
                             int ne00, int ne01, int ne02, int ne0, int ne1,
                             int ne2, int dim, queue_ptr stream) {
+  // short rows (a conv window of 3 + 1 columns over 5120 channels: Raon-1 decode) as one work-item an element; a
+  // work-group a row left 252 of 256 work-items idle in each of 5120 work-groups
+  if (ne0 < SYCL_CONCAT_BLOCK_SIZE / 4) {
+    const int64_t n = (int64_t) ne0 * ne1 * ne2;
+    const int64_t nb = (n + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
+    stream->parallel_for(sycl::nd_range<1>(nb * SYCL_CONCAT_BLOCK_SIZE, SYCL_CONCAT_BLOCK_SIZE), [=](sycl::nd_item<1> it) {
+      const int64_t i = it.get_global_id(0);
+      if (i >= n) {
+        return;
+      }
+      const int i0 = (int) (i % ne0);
+      const int i1 = (int) ((i / ne0) % ne1);
+      const int i2 = (int) (i / ((int64_t) ne0 * ne1));
+      const int c  = dim == 0 ? i0 : dim == 1 ? i1 : i2;
+      const int n0 = dim == 0 ? ne00 : dim == 1 ? ne01 : ne02;
+      if (c < n0) {
+        dst[i] = x[(int64_t) i2 * ne01 * ne00 + (int64_t) i1 * ne00 + i0];
+      } else {
+        // src1 has the dst shape with the concat dim reduced by n0
+        const int ne10 = dim == 0 ? ne0 - ne00 : ne0;
+        const int ne11 = dim == 1 ? ne1 - ne01 : ne1;
+        const int j0 = dim == 0 ? i0 - ne00 : i0;
+        const int j1 = dim == 1 ? i1 - ne01 : i1;
+        const int j2 = dim == 2 ? i2 - ne02 : i2;
+        dst[i] = y[(int64_t) j2 * ne11 * ne10 + (int64_t) j1 * ne10 + j0];
+      }
+    });
+    return;
+  }
   int num_blocks = (ne0 + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
   sycl::range<3> gridDim(ne2, ne1, num_blocks);
   switch (dim) {
