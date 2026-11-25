@@ -196,6 +196,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const auto mkl_kv_ok = [](const ggml_tensor * t) {
         return t->type == GGML_TYPE_F16 || ggml_get_to_fp16_nc_sycl(t->type) != nullptr;
     };
+    // MLA decode with >= 32 heads on one latent head: the XMX decode kernel reads the latent cache once (fattn-xmx-dec.cpp)
+    if (glm_mla_shape && !per_head_mask && ggml_sycl_flash_attn_ext_xmx_dec_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMXD;
+    }
     if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !per_head_mask && (!sinks || indexed_bias) && gqa_ratio >= 2 &&
         mkl_kv_ok(K) && mkl_kv_ok(V) &&
         (standard_shape || glm_mla_shape) &&
