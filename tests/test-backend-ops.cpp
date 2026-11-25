@@ -5272,6 +5272,76 @@ struct test_raon_hc_mix : public test_case {
     }
 };
 
+// hc_post of a branch that is the sum of two tensors (an MoE layer's routed + shared experts); backends may fold the add
+struct test_hc_post_add : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_post_add(int64_t n_embd = 2560, int64_t n_tokens = 1) : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(b, "b");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_tokens);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, n_tokens);
+        ggml_set_name(comb, "comb");
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, ggml_add(ctx, a, b), residual, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// a Raon-1 mHC site as the model builds it: the bf16 selector projection of the flat streams, then the mixing weights
+// (backends may fold the projection into the mix)
+struct test_raon_hc_site : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RAON_HC_SITE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_raon_hc_site(int64_t n = 10240, int64_t n_tokens = 1) : n(n), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * fn = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n, 17);
+        ggml_set_name(fn, "fn");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 17);
+        ggml_set_name(base, "base");
+        ggml_tensor * mm  = ggml_mul_mat(ctx, fn, x);
+        ggml_tensor * out = ggml_raon_hc_mix(ctx, x, mm, scale, base, 1e-6f, 2.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_hc;
@@ -11651,6 +11721,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_situ({1088, 1, 1, 1}));
     test_cases.emplace_back(new test_situ({12032, 3, 1, 1}));
     test_cases.emplace_back(new test_situ({256, 6, 1, 1}, 4.0f, 25.0f, true));
+    test_cases.emplace_back(new test_hc_post_add(2560, 1));
+    test_cases.emplace_back(new test_hc_post_add(2560, 5));
+    test_cases.emplace_back(new test_raon_hc_site(10240, 1));
+    test_cases.emplace_back(new test_raon_hc_site(10240, 3));
+    test_cases.emplace_back(new test_raon_hc_site(10240, 12));
     test_cases.emplace_back(new test_raon_hc_mix(10240, 1));
     test_cases.emplace_back(new test_raon_hc_mix(10240, 7));
     test_cases.emplace_back(new test_raon_hc_mix(333, 64));

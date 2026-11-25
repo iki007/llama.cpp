@@ -6235,6 +6235,100 @@ static int ggml_sycl_try_situ_fusion(ggml_backend_sycl_context & ctx, ggml_cgrap
 // Raon-1 / KDA decay gate with a lower bound (llama_model_raon1::graph::build_rda_gate):
 //   g = s2 * sigmoid(s1 * ((x + bias) * A[head]))   as ADD, (views), MUL, SCALE, SIGMOID, SCALE
 // x [D * H, T] contiguous, bias [D * H], A [1, H] (a per-head scalar); one kernel instead of five.
+// Raon-1 RDA beta gates (llama_model_raon1::graph::build_rda_layer) in one kernel:
+//   beta = sigmoid(clamp(b, lo, hi)), V' = V * sigmoid(b + delta) / beta
+// as ADD, SIGMOID, CLAMP, SIGMOID, DIV, MUL; b, delta [1, H, T], V [D, H, T]. Writes both live outputs (beta for the
+// GDN, V'); the four intermediates are skipped.
+static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t);
+static int ggml_sycl_try_rda_beta_fusion(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FUSE_RDA_BETA", 1) != 0;
+    ggml_tensor * add = cgraph->nodes[i];
+    if (!enabled || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    int idx[5];
+    int found = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 16 && found < 5; ++j) {
+        if (!ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+            idx[found++] = j;
+        }
+    }
+    if (found < 5) {
+        return 0;
+    }
+    ggml_tensor * sw = cgraph->nodes[idx[0]];
+    ggml_tensor * cl = cgraph->nodes[idx[1]];
+    ggml_tensor * sb = cgraph->nodes[idx[2]];
+    ggml_tensor * dv = cgraph->nodes[idx[3]];
+    ggml_tensor * mv = cgraph->nodes[idx[4]];
+    if (sw->op != GGML_OP_UNARY || ggml_get_unary_op(sw) != GGML_UNARY_OP_SIGMOID || cl->op != GGML_OP_CLAMP ||
+        sb->op != GGML_OP_UNARY || ggml_get_unary_op(sb) != GGML_UNARY_OP_SIGMOID || dv->op != GGML_OP_DIV ||
+        mv->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * b = add->src[0];
+    const ggml_tensor * d = add->src[1];
+    const ggml_tensor * V = mv->src[0] == dv ? mv->src[1] : mv->src[0];
+    if (sw->src[0] != add || cl->src[0] != b || sb->src[0] != cl || dv->src[0] != sw || dv->src[1] != sb ||
+        (mv->src[0] != dv && mv->src[1] != dv)) {
+        return 0;
+    }
+    // intermediates read only inside the chain; beta (sb) and V' (mv) are the outputs
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, idx[0]) != 1 ||
+        ggml_node_get_use_count(cgraph, idx[1]) != 1 || ggml_node_get_use_count(cgraph, idx[3]) != 1 ||
+        ((add->flags | sw->flags | cl->flags | dv->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const int64_t H = b->ne[1];
+    const int64_t D = V->ne[0];
+    const int64_t n = ggml_nelements(V);
+    for (const ggml_tensor * t : { b, d, (const ggml_tensor *) sb, V, (const ggml_tensor *) mv }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+    }
+    if (b->ne[0] != 1 || !ggml_are_same_shape(b, d) || !ggml_are_same_shape(b, sb) || !ggml_are_same_shape(V, mv) ||
+        V->ne[1] != H || ggml_nelements(b) * D != n) {
+        return 0;
+    }
+    float lo, hi;
+    memcpy(&lo, (const float *) cl->op_params + 0, sizeof(float));
+    memcpy(&hi, (const float *) cl->op_params + 1, sizeof(float));
+    // the outputs are written while b, delta and V are read, all three dead inside the chain for the allocator. A
+    // work-group a (token, head) row reads its b and delta before a barrier, then writes beta: beta may sit on b or
+    // delta exactly (the allocator's usual reuse); V' may sit on V exactly. Any other overlap: no fusion.
+    const auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * xs = (const char *) x->data;
+        const char * ys = (const char *) y->data;
+        return xs < ys + ggml_nbytes(y) && ys < xs + ggml_nbytes(x);
+    };
+    if ((overlap(sb, b) && sb->data != b->data) || (overlap(sb, d) && sb->data != d->data) || overlap(sb, V) ||
+        overlap(mv, b) || overlap(mv, d) || overlap(mv, sb) || (overlap(mv, V) && mv->data != V->data) ||
+        D > 1024) {
+        return 0;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, mv, /*num_src=*/2, " : RDA beta gates fused (6 nodes)");
+    const float * bd  = (const float *) b->data;
+    const float * dd  = (const float *) d->data;
+    const float * vd  = (const float *) V->data;
+    float *       sbd = (float *) sb->data;
+    float *       md  = (float *) mv->data;
+    const int64_t nr  = ggml_nelements(b);
+    ctx.stream()->parallel_for(sycl::nd_range<1>(sycl::range<1>(nr * D), sycl::range<1>(D)), [=](sycl::nd_item<1> it) {
+        const int64_t r  = it.get_group(0);  // (token, head) row
+        const int64_t e  = it.get_global_id(0);
+        const float   bv = bd[r];
+        const float   wr = 1.0f / (1.0f + sycl::native::exp(-(bv + dd[r])));
+        const float   be = 1.0f / (1.0f + sycl::native::exp(-sycl::clamp(bv, lo, hi)));
+        md[e] = vd[e] * (wr / be);
+        sycl::group_barrier(it.get_group());
+        if (it.get_local_id(0) == 0) {
+            sbd[r] = be;
+        }
+    });
+    return idx[4] - i;
+}
+
 static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t);
 static int ggml_sycl_try_kda_gate_fusion(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FUSE_KDA_GATE", 1) != 0;
@@ -8139,6 +8233,26 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                                        cgraph->nodes[i + 7]);
             i += 7;
             continue;
+        }
+        static const bool fuse_post_add = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_POST_ADD", 1) != 0;
+        if (node->op == GGML_OP_ADD && fuse_post_add && ggml_node_get_use_count(cgraph, i) == 1 &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            int j = i + 1;
+            while (j < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_DSV4_HC_POST && cgraph->nodes[j]->src[0] == node &&
+                ggml_sycl_op_dsv4_hc_post_add(*sycl_ctx, cgraph->nodes[j], node)) {
+                i = j;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_ADD) {
+            const int beta_skip = ggml_sycl_try_rda_beta_fusion(*sycl_ctx, cgraph, i);
+            if (beta_skip > 0) {
+                i += beta_skip;
+                continue;
+            }
         }
         if (node->op == GGML_OP_ADD) {
             const int gate_skip = ggml_sycl_try_kda_gate_fusion(*sycl_ctx, cgraph, i);
