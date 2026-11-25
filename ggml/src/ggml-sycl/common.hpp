@@ -596,6 +596,8 @@ struct ggml_backend_sycl_context {
     static constexpr int q8_cache_n = 4;
     q8_cache_entry       q8_cache[q8_cache_n];
     uint64_t             q8_cache_epoch = 1;
+    // GET_ROWS of recurrent states the GDN kernel reads through their row indices instead (this graph run)
+    std::vector<const ggml_tensor *> gdn_folded_gathers;
     uint64_t             q8_cache_tick  = 0;
     bool                 q8_cache_recording = false;  // off while a SYCL graph records: the graph keeps the buffers it saw
 
