@@ -2626,7 +2626,8 @@ static void scale_f32_sycl(const float *x, float *dst, const float scale, const 
 // A few long rows (a vocabulary-sized sum: the Inkling2 DSpark drafter sums 200K values several times a draft step)
 // walked in sequence by one sub-group a row cost ~0.13 ms a call. Chunks of SUM_ROWS_CHUNK values take a work-group
 // each, and the existing kernel then sums each row's partials. Other shapes keep the one-pass kernel and its rounding.
-static constexpr int SUM_ROWS_CHUNK = 4096;
+// Raon-1 mHC norms take the mean of 10240-wide rows (one row a token): 1024-value chunks spread those too.
+static constexpr int SUM_ROWS_CHUNK = 1024;
 
 static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
                               const int nrows, queue_ptr stream, ggml_sycl_pool * pool = nullptr) {
