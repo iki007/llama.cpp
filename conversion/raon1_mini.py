@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+
 from typing import Any, Callable, Iterable
 
 import torch
 from torch import Tensor
 
-from .base import ModelBase, TextModel, gguf
+from .base import ModelBase, TextModel, gguf, logger
 
 
 _REQUIRED = object()
@@ -61,7 +62,6 @@ class Raon1MiniModel(TextModel):
         self._experts: dict[tuple[int, str], dict[int, Tensor]] = {}
         self._mhc: dict[tuple[int, str], dict[str, Tensor]] = {}
         self._rda_layers = set(_rda_config(self.hparams)["rda_layers"])
-        self._rda_layers = set(self.hparams["rda_config"]["rda_layers"])
         self._effort_layers = self._reasoning_effort_layers()
         self._effort_seen: set[int] = set()
 
@@ -152,9 +152,6 @@ class Raon1MiniModel(TextModel):
         self.gguf_writer.add_hyper_connection_count(_renamed_key(hp, "raon_mhc_streams", "mhc_streams", 4))
         self.gguf_writer.add_hyper_connection_epsilon(_renamed_key(hp, "raon_mhc_selector_eps", "mhc_selector_eps", 1e-5))
         self.gguf_writer.add_hyper_connection_magnitude(_renamed_key(hp, "raon_mhc_post_factor", "mhc_post_factor", 2.0))
-        self.gguf_writer.add_hyper_connection_count(_with_default(hp, "raon_mhc_streams", 4))
-        self.gguf_writer.add_hyper_connection_epsilon(_with_default(hp, "raon_mhc_selector_eps", 1e-5))
-        self.gguf_writer.add_hyper_connection_magnitude(_with_default(hp, "raon_mhc_post_factor", 2.0))
         if self._effort_layers:
             steering = hp["reasoning_effort_steering"]
             self.gguf_writer.add_reasoning_effort_names(list(steering["alpha"]))
@@ -167,7 +164,6 @@ class Raon1MiniModel(TextModel):
         super().prepare_tensors()
         if self._experts or self._mhc:
             raise ValueError(f"Incomplete Raon-1 mini tensor groups: experts={list(self._experts)}, mHC={list(self._mhc)}")
-            raise ValueError(f"Incomplete Raon-1 tensor groups: experts={list(self._experts)}, mHC={list(self._mhc)}")
         if missing := sorted(self._effort_layers - self._effort_seen):
             raise ValueError(f"reasoning_effort_steering lists layers {missing} without a steering vector")
 
@@ -206,8 +202,6 @@ class Raon1MiniModel(TextModel):
             del self._mhc[(bid, site)]
             return
 
-        # moe.experts.{e}.{gate,down,up}_proj; older exports: block_sparse_moe.experts.{e}.{w1,w2,w3}
-        if ".moe.experts." in name or ".block_sparse_moe.experts." in name:
         if name.endswith(self._EFFORT_SUFFIXES):
             assert bid is not None
             if not self._effort_layers:
@@ -219,7 +213,8 @@ class Raon1MiniModel(TextModel):
             yield self.format_tensor_name(gguf.MODEL_TENSOR.FFN_EFFORT_STEER, bid), data_torch.float()
             return
 
-        if ".moe.experts." in name:
+        # moe.experts.{e}.{gate,down,up}_proj; older exports: block_sparse_moe.experts.{e}.{w1,w2,w3}
+        if ".moe.experts." in name or ".block_sparse_moe.experts." in name:
             assert bid is not None
             tail = name.split(".experts.", 1)[1].split(".")
             eid, wid = int(tail[0]), tail[1]

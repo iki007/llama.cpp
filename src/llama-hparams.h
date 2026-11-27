@@ -302,8 +302,6 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
-    uint32_t dspark_context_rank = 0;
-
     // per-token width of the extracted layer inputs (0 = use n_embd)
     // e.g. hyper-connection models carry hc_mult * n_embd residual streams
     uint32_t n_embd_layer_inp_impl = 0;
@@ -315,6 +313,8 @@ struct llama_hparams {
     uint32_t dflash_selector_top_k   = 0;
     bool     dflash_softcap_post     = false; // DFlash2 softcaps the selector scores instead of the logits
     bool     dspark_f_rnn            = false; // rnn markov head reads f_rnn from embd_state
+    // DFlash2: candidates only from the first valid_vocab_size rows (the rest of the head is padding); 0 = all
+    uint32_t dflash_valid_vocab_size = 0;
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
     uint32_t lilicorr_num_heads      = 0;

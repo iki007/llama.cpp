@@ -524,8 +524,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd_dec = 0;       // draft hidden size
-    int32_t n_embd_enc = 0;       // target_layer_ids_n * n_embd_tgt
-    int32_t n_embd_tgt = 0;       // per-token width of one extracted target layer
+    int32_t n_embd_enc = 0;       // target_layer_ids_n * target_hidden_size
+    int32_t n_embd_tgt = 0;       // target model hidden size
     int32_t n_layer_tgt = 0;      // target model layer count
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
@@ -565,22 +565,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                                      std::to_string(target_layer_ids_n) + ")");
         }
 
-        n_embd_tgt = llama_model_n_embd_layer_inp(model_tgt);
+        n_embd_tgt = llama_model_n_embd(model_tgt);
         n_embd_dec = llama_model_n_embd(model_dft);
         n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
-        if (n_embd_enc != llama_model_n_embd_inp_enc(model_dft)) {
-            throw std::runtime_error("EAGLE3 draft expects " + std::to_string(llama_model_n_embd_inp_enc(model_dft)) +
-                    " target features per token, but the target exports " + std::to_string(target_layer_ids_n) + " x " +
-                    std::to_string(n_embd_tgt) + " (incompatible draft/target pair)");
-        }
         n_layer_tgt = llama_model_n_layer(model_tgt);
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            // a tap past the last layer reads the nextn embeddings, which are n_embd_out wide
-            if (target_layer_ids[k] >= n_layer_tgt && llama_model_n_embd_out(model_tgt) != n_embd_tgt) {
-                throw std::runtime_error("EAGLE3: the target's nextn embeddings are " + std::to_string(llama_model_n_embd_out(model_tgt)) +
-                        " wide, but its layer inputs are " + std::to_string(n_embd_tgt) + " (incompatible draft/target pair)");
-            }
-        }
 
         batch     = common_batch(ctx_dft);
         batch_enc = common_batch(ctx_dft);
@@ -1007,8 +995,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd_dec = 0;  // draft hidden size
-    int32_t n_embd_enc = 0;  // target_layer_ids_n * n_embd_tgt
-    int32_t n_embd_tgt = 0;  // per-token width of one extracted target layer
+    int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
+    int32_t n_embd_tgt = 0;  // target model hidden size
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -1059,14 +1047,9 @@ protected:
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
         GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
 
-        n_embd_tgt    = llama_model_n_embd_layer_inp(model_tgt);
+        n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
-        if (n_embd_enc != llama_model_n_embd_inp_enc(model_dft)) {
-            throw std::runtime_error("DFlash draft expects " + std::to_string(llama_model_n_embd_inp_enc(model_dft)) +
-                    " target features per token, but the target exports " + std::to_string(target_layer_ids_n) + " x " +
-                    std::to_string(n_embd_tgt) + " (incompatible draft/target pair)");
-        }
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -3267,12 +3250,6 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
-    // --spec-draft-n-ubatch: the draft's compute buffer holds an attention mask of n_ctx x n_ubatch, and the draft
-    // follows the target's batches in ubatch-sized pieces, so a smaller ubatch returns that memory
-    if (params.speculative.draft.n_ubatch > 0) {
-        cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, (uint32_t) params.speculative.draft.n_ubatch);
-    }
-
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
@@ -3584,61 +3561,6 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     return result;
 }
 
-// Appends to a draft the tokens that followed the longest earlier occurrence of the tail of prompt + id_last + draft
-// (at least n_min tokens), up to n_max draft tokens in total. Where the output repeats the context (edits, quotes,
-// tool calls) this fills the verify batch beyond the drafter's own length.
-// With probabilistic drafts (draft_q set) each appended token gets a one-hot q: the verifier then accepts it with the
-// target's probability of it and samples a rejection from the target minus that token, so the output stays exact.
-static void common_speculative_lookup_extend(const llama_tokens & prompt, llama_token id_last, llama_tokens & draft, int n_min, int n_max,
-                                             std::vector<std::vector<llama_token_data>> * draft_q) {
-    const int64_t n_prompt = (int64_t) prompt.size();
-    const int64_t n        = n_prompt + 1 + (int64_t) draft.size();
-    const int     n_ext    = n_max - (int) draft.size();
-    if (n_min <= 0 || n_ext <= 0 || n <= n_min) {
-        return;
-    }
-
-    auto at = [&](int64_t i) -> llama_token {
-        return i < n_prompt ? prompt[i] : i == n_prompt ? id_last : draft[i - n_prompt - 1];
-    };
-
-    // the tail, last token first
-    const int n_back = 64;
-    llama_token tail[n_back];
-    const int n_tail = (int) std::min<int64_t>(n_back, n);
-    for (int m = 0; m < n_tail; ++m) {
-        tail[m] = at(n - 1 - m);
-    }
-
-    // e = end of an earlier occurrence; the most recent of the longest matches wins
-    int64_t best     = -1;
-    int     best_len = 0;
-    for (int64_t e = n - 1; e >= n_min; --e) {
-        if (at(e - 1) != tail[0]) {
-            continue;
-        }
-        int m = 1;
-        while (m < n_tail && e - 1 - m >= 0 && at(e - 1 - m) == tail[m]) {
-            m++;
-        }
-        if (m >= n_min && m > best_len) {
-            best     = e;
-            best_len = m;
-        }
-    }
-    if (best < 0) {
-        return;
-    }
-
-    for (int64_t i = best; i < n && (int) (i - best) < n_ext; ++i) {
-        const llama_token t = at(i);
-        draft.push_back(t);
-        if (draft_q && !draft_q->empty()) {
-            draft_q->push_back({ { t, 0.0f, 1.0f } });
-        }
-    }
-}
-
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3700,10 +3622,6 @@ void common_speculative_draft(common_speculative * spec) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
                             common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
                             impl.get()->n_call_draft, result.size());
-
-                    if (dp.lookup_n_min > 0) {
-                        common_speculative_lookup_extend(*dp.prompt, dp.id_last, result, dp.lookup_n_min, dp.lookup_n_max, dp.result_q);
-                    }
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();

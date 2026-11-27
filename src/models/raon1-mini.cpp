@@ -5,12 +5,11 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
-void llama_model_raon1_mini::load_arch_hparams(llama_model_loader & ml) {
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
-void llama_model_raon1::load_arch_hparams(llama_model_loader & ml) {
+void llama_model_raon1_mini::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
@@ -50,6 +49,7 @@ void llama_model_raon1::load_arch_hparams(llama_model_loader & ml) {
 
     // The Raon router normalizes selected scores by sum(scores) + 1e-20.
     hparams.expert_weights_norm_eps = 1e-20f;
+
     std::vector<float> effort_alpha;
     std::vector<uint32_t> effort_layers;
     hparams.effort_steering = ml.get_arr(LLM_KV_REASONING_EFFORT_ALPHA, effort_alpha, false);
@@ -61,15 +61,15 @@ void llama_model_raon1::load_arch_hparams(llama_model_loader & ml) {
         }
         ml.get_arr(LLM_KV_REASONING_EFFORT_LAYERS, effort_layers, true);
         if (effort_alpha.empty() || effort_alpha.size() > LLAMA_MAX_EFFORTS || effort_names.size() != effort_alpha.size() || effort_layers.empty()) {
-            throw std::runtime_error(format("invalid Raon-1 hyperparameters: reasoning_effort needs 1 to %d named alphas and the steered layers", LLAMA_MAX_EFFORTS));
+            throw std::runtime_error(format("invalid Raon-1 mini hyperparameters: reasoning_effort needs 1 to %d named alphas and the steered layers", LLAMA_MAX_EFFORTS));
         }
         hparams.n_effort = effort_alpha.size();
         for (size_t i = 0; i < effort_alpha.size(); ++i) {
             if (!std::isfinite(effort_alpha[i]) || effort_alpha[i] < 0.0f) {
-                throw std::runtime_error(format("invalid Raon-1 hyperparameters: reasoning_effort alpha %g", effort_alpha[i]));
+                throw std::runtime_error(format("invalid Raon-1 mini hyperparameters: reasoning_effort alpha %g", effort_alpha[i]));
             }
             if (effort_names[i].empty() || effort_names[i].size() >= LLAMA_MAX_EFFORT_NAME) {
-                throw std::runtime_error(format("invalid Raon-1 hyperparameters: reasoning_effort name '%s'", effort_names[i].c_str()));
+                throw std::runtime_error(format("invalid Raon-1 mini hyperparameters: reasoning_effort name '%s'", effort_names[i].c_str()));
             }
             hparams.effort_alpha[i] = effort_alpha[i];
             std::copy(effort_names[i].begin(), effort_names[i].end(), hparams.effort_name[i].begin());
@@ -78,13 +78,13 @@ void llama_model_raon1::load_arch_hparams(llama_model_loader & ml) {
         if (ml.get_key(LLM_KV_REASONING_EFFORT_DEFAULT, effort_default, false)) {
             const auto it = std::find(effort_names.begin(), effort_names.end(), effort_default);
             if (it == effort_names.end()) {
-                throw std::runtime_error(format("invalid Raon-1 hyperparameters: reasoning_effort default '%s' is not an effort", effort_default.c_str()));
+                throw std::runtime_error(format("invalid Raon-1 mini hyperparameters: reasoning_effort default '%s' is not an effort", effort_default.c_str()));
             }
             hparams.effort_default = it - effort_names.begin();
         }
         for (uint32_t il : effort_layers) {
             if (il < hparams.n_layer_dense_lead || il >= hparams.n_layer()) {
-                throw std::runtime_error(format("invalid Raon-1 hyperparameters: reasoning_effort layer %u is not a MoE layer", il));
+                throw std::runtime_error(format("invalid Raon-1 mini hyperparameters: reasoning_effort layer %u is not a MoE layer", il));
             }
             hparams.effort_layer[il] = true;
         }
@@ -275,7 +275,7 @@ ggml_tensor * llama_model_raon1_mini::graph::build_rda_conv(
 }
 
 // conv_x: (d_conv - 1 + n_seq_tokens, d_inner, n_seqs); returns (head_dim, n_head, n_seq_tokens, n_seqs)
-ggml_tensor * llama_model_raon1::graph::build_rda_conv_out(ggml_tensor * conv_x, ggml_tensor * conv_w, int64_t n_seq_tokens, int64_t n_seqs) {
+ggml_tensor * llama_model_raon1_mini::graph::build_rda_conv_out(ggml_tensor * conv_x, ggml_tensor * conv_w, int64_t n_seq_tokens, int64_t n_seqs) {
     const int64_t head_dim = hparams.n_embd_head_kda;
     const int64_t d_inner  = head_dim * n_head;
 
@@ -477,13 +477,16 @@ ggml_tensor * llama_model_raon1_mini::graph::build_mla_layer(
     const int64_t nk = hparams.n_embd_head_k_mla();
     const int64_t nn = nk - nr;
     const int64_t rank = hparams.n_lora_kv;
+    // Raon defines a separate RMSNorm epsilon for its Q and KV latent projections.
     const float eps = hparams.f_norm_rms_eps_latent;
     ggml_tensor * q = build_lora_mm(layer.wq_a, cur);
     q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, eps), layer.attn_q_a_norm);
+    cb(q, "mla_q_norm", il);
     q = build_lora_mm(layer.wq_b, q);
     ggml_tensor * kv = build_lora_mm(layer.wkv_a_mqa, cur);
     ggml_tensor * latent = ggml_view_2d(ctx0, kv, rank, n_tokens, kv->nb[1], 0);
     latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, eps), layer.attn_kv_a_norm);
+    cb(latent, "mla_kv_norm", il);
     // NoPE: the "rope" dims of q and k are concatenated as they are, without rotation
     ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, nn, n_head, n_tokens, nk*q->nb[0], q->nb[1], 0);

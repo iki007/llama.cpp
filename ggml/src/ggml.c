@@ -5570,6 +5570,7 @@ bool ggml_validate_flash_attn_ext_indexed_bias(const struct ggml_tensor * a) {
         (!rows || (rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && ggml_is_matrix(rows) && rows->ne[1] == q->ne[3])) &&
         table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[0] > 0 && table->ne[1] == q->ne[2] &&
         (q->ne[1] == 0 || q->ne[3] <= INT64_MAX/q->ne[1]) && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1 &&
+        ggml_get_op_params_i32(a, 6) == 0 && // the positions mode (ggml_flash_attn_ext_add_rel_pos_bias) is SYCL-only
         indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices) &&
         indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2];
 }
@@ -5582,20 +5583,8 @@ void ggml_flash_attn_ext_add_indexed_bias(
     a->src[6] = table;
     a->src[7] = indices;
     ggml_set_op_params_i32(a, 5, table != NULL);
-    GGML_ASSERT(ggml_validate_flash_attn_ext_indexed_bias(a));
-    if (!table) {
-        return;
-    }
-
-    const struct ggml_tensor * q = a->src[0];
-    const struct ggml_tensor * mask = a->src[3];
-    GGML_ASSERT(mask && mask->ne[0] == (a->src[5] ? a->src[5]->ne[0] : a->src[1]->ne[1]) && mask->ne[1] == q->ne[1]);
-    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
-    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
-    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[0] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
-    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
-    GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
     ggml_set_op_params_i32(a, 6, 0);
+    GGML_ASSERT(ggml_validate_flash_attn_ext_indexed_bias(a));
 }
 
 void ggml_flash_attn_ext_add_rel_pos_bias(
@@ -5604,14 +5593,17 @@ void ggml_flash_attn_ext_add_rel_pos_bias(
         struct ggml_tensor * positions,
         int32_t              extent) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(table && positions && extent > 0 && extent < table->ne[0]);
+    GGML_ASSERT(table && positions && extent > 0);
     a->src[6] = table;
     a->src[7] = positions;
     ggml_set_op_params_i32(a, 5, 1);
     ggml_set_op_params_i32(a, 6, extent);
 
+    // not ggml_validate_flash_attn_ext_indexed_bias: it accepts index tensors only, so backends without the positions
+    // mode reject this node
     const struct ggml_tensor * q = a->src[0];
     const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(extent < table->ne[0]);
     GGML_ASSERT(mask && mask->ne[0] == (a->src[5] ? a->src[5]->ne[0] : a->src[1]->ne[1]) && mask->ne[1] == q->ne[1]);
     GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
     GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));

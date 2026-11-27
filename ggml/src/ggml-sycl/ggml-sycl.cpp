@@ -8152,8 +8152,8 @@ static bool ggml_sycl_try_gdn_gather_fold(ggml_backend_sycl_context & ctx, const
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
-    ggml_sycl_conv_window_match conv_window;
     sycl_ctx->gdn_folded_gathers.clear();
+    ggml_sycl_conv_window_match conv_window;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -8161,6 +8161,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (node->op == GGML_OP_REPEAT) {
+            const int glue_nodes_to_skip = ggml_sycl_try_moe_glue_fusion(*sycl_ctx, cgraph, i);
+            if (glue_nodes_to_skip > 0) {
+                i += glue_nodes_to_skip;
+                continue;
+            }
         }
 
         // Run the window and cache updates at the convolution.
@@ -8177,10 +8185,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 ggml_sycl_ssm_conv_window(*sycl_ctx, conv_window);
                 i           = conv_window.last_idx;
                 conv_window = {};
-        if (node->op == GGML_OP_REPEAT) {
-            const int glue_nodes_to_skip = ggml_sycl_try_moe_glue_fusion(*sycl_ctx, cgraph, i);
-            if (glue_nodes_to_skip > 0) {
-                i += glue_nodes_to_skip;
                 continue;
             }
         }

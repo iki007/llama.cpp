@@ -3337,7 +3337,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
             }
             const auto dev = model.dev_layer(il);
-            if (!cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
+            if (!dev || (!cparams.offload_kqv && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) ||
+                    !ggml_backend_dev_supports_op(dev, cur)) {
+                // Keep ordinary flash attention on the layer device.
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                 cur->src[3] = dense_bias_mask();
             } else if (kv_rows) {
@@ -3349,16 +3351,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                         break;
                     }
                 }
-            }
-        }
-
-        if (bias_table) {
-            ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
-            auto * dev = model.dev_layer(il);
-            if ((!cparams.offload_kqv && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) || !ggml_backend_dev_supports_op(dev, cur)) {
-                // Keep ordinary flash attention on the layer device.
-                ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
-                cur->src[3] = dense_bias_mask();
             }
         }
 
