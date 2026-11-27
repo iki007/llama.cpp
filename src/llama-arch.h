@@ -378,6 +378,10 @@ enum llm_kv {
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
     LLM_KV_HYPER_CONNECTION_EPSILON,
     LLM_KV_HYPER_CONNECTION_MAGNITUDE,
+    LLM_KV_REASONING_EFFORT_NAMES,
+    LLM_KV_REASONING_EFFORT_ALPHA,
+    LLM_KV_REASONING_EFFORT_LAYERS,
+    LLM_KV_REASONING_EFFORT_DEFAULT,
     LLM_KV_HYPER_CONNECTION_LOW_RANK,
     LLM_KV_HYPER_CONNECTION_SINGLE_PASS,
 
@@ -502,7 +506,9 @@ enum llm_kv {
     LLM_KV_DFLASH_SELECTOR_RANK,
     LLM_KV_DFLASH_SELECTOR_TOP_K,
     LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION,
+    LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_LEGACY, // pre-upstream local drafter GGUFs
     LLM_KV_DFLASH_HAS_MARKOV_CONTEXT,
+    LLM_KV_DFLASH_VALID_VOCAB_SIZE,
     LLM_KV_LILICORR_HIDDEN_SIZE,
     LLM_KV_LILICORR_CANDIDATE_TOPK,
     LLM_KV_LILICORR_NUM_HEADS,
@@ -589,6 +595,9 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_V_CONV_PROJ,
     LLM_TENSOR_ATTN_POST_CONV,
     LLM_TENSOR_ATTN_RES_QUERY,
+    LLM_TENSOR_ATTN_K_CTX,
+    LLM_TENSOR_ATTN_V_CTX,
+    LLM_TENSOR_ATTN_K_CTX_NORM,
     LLM_TENSOR_FFN_GATE_INP,
     LLM_TENSOR_FFN_GATE_INP_SHEXP,
     LLM_TENSOR_FFN_NORM,
@@ -788,6 +797,7 @@ enum llm_tensor {
     LLM_TENSOR_HC_FFN_FN,
     LLM_TENSOR_HC_FFN_BASE,
     LLM_TENSOR_HC_FFN_SCALE,
+    LLM_TENSOR_FFN_EFFORT_STEER,
     LLM_TENSOR_HC_ATTN_NORM,   // qwen4exp
     LLM_TENSOR_HC_ATTN_DOWN,   // qwen4exp
     LLM_TENSOR_HC_ATTN_UP,     // qwen4exp
@@ -1037,6 +1047,10 @@ struct LLM_TN {
 struct llm_tensor_info {
     llm_tensor_layer layer;
     ggml_op op;
+    // the graph may use the weight with a non-contiguous src1: MLA attn_k_b (permuted q_nope view) and attn_v_b (permuted attention output
+    // on the flash-attention path; contiguous without FA). the loader probes with such a src1, so a buffer type that rejects it is skipped
+    // (CPU AMX; CANN, OpenCL and ET for some weight types)
+    bool src1_noncont = false;
 };
 
 std::vector<llm_arch> llm_arch_all();

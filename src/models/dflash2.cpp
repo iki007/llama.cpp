@@ -138,7 +138,13 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
+    // candidates from the real vocabulary only: a padded head has rows no token uses
+    ggml_tensor * cand_logits = res->t_logits;
+    if (hparams.dflash_valid_vocab_size > 0 && hparams.dflash_valid_vocab_size < res->t_logits->ne[0]) {
+        cand_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, res->t_logits, hparams.dflash_valid_vocab_size, n_tokens,
+                res->t_logits->nb[1], 0));
+    }
+    ggml_tensor * candidates  = ggml_top_k(ctx0, cand_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);

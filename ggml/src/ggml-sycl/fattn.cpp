@@ -134,9 +134,6 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     float logit_softcap = 0.0f;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    // The GQA-optimized TILE variant handles a trailing partial chunk (out-of-bounds
-    // checked iteration), so n_kv no longer needs to be a multiple of FATTN_KQ_STRIDE.
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f;
     // a mask with its own slice for each head (ne[2] > 1, head h reads slice h % ne[2]; e.g. Inkling 2's relative-position
     // table): only the VEC and TILE kernels index it per head, TILE one head a group
     const bool per_head_mask = mask && mask->ne[2] != 1;
@@ -150,7 +147,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                          (K->ne[0] != 64 && K->ne[0] != 128) || V->ne[0] != K->ne[0])) {
         return BEST_FATTN_KERNEL_NONE;
     }
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // The GQA-optimized TILE variant handles a trailing partial chunk (out-of-bounds
+    // checked iteration), so n_kv no longer needs to be a multiple of FATTN_KQ_STRIDE.
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f;
 
     // prompt batches over an f16 cache, head 128, with or without an indexed bias
     if (!per_head_mask && ggml_sycl_flash_attn_ext_xmx_prompt_supported(device, dst)) {
@@ -312,7 +311,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                 const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
                 const bool vec_decode = (arch == gpu_arch::intel_gpu_bmg_g21 ||
                                          arch == gpu_arch::intel_gpu_bmg_g31) && Q->ne[0] == 256;
-                if (vec_decode || !gqa_opt_applies) {
+                // with an indexed bias the mask is shared, which would allow the GQA tile; the vector kernel takes it
+                if (vec_decode || !gqa_opt_applies || indexed_bias) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }

@@ -3282,8 +3282,6 @@ void llama_kv_cache_context::set_input_kpool(ggml_tensor * pool_idxs, ggml_tenso
     kv->set_input_kpool(pool_idxs, pool_pos, pool_mask, tail_idxs, ubatch, sinfos[i_cur], kpool, n_kv);
 }
 
-void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_relative_pos(dst, ubatch, extent);
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, rows, ubatch, extent);
 }

@@ -35,6 +35,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_VALID_VOCAB_SIZE, hparams.dflash_valid_vocab_size, false);
 
     const bool has_markov   = ml.get_tensor_meta("markov_w1.weight")       != nullptr;
     const bool has_selector = ml.get_tensor_meta("selector_hidden.weight") != nullptr;
@@ -47,7 +48,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         }
     } else if (has_selector) {
         variant = VARIANT_DFLASH2;
-        ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, hparams.dflash_softcap_post, false);
+        if (!ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, hparams.dflash_softcap_post, false)) {
+            // drafters converted before the upstream DFlash2 support spell the key selector_softcap_after
+            ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_LEGACY, hparams.dflash_softcap_post, false);
+        }
     } else if (has_lilicorr) {
         variant = VARIANT_LILICORR;
         load_hparams_lilicorr(ml);
@@ -57,7 +61,13 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
-    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
+    // per-tap width of the target features, as for EAGLE3: n_embd by default, n_streams*n_embd for a hyper-connection target
+    uint32_t n_embd_tgt = hparams.n_embd;
+    ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, n_embd_tgt, false);
+    if (n_embd_tgt == 0) {
+        throw std::runtime_error("DFlash 'target_hidden_size' must be positive");
+    }
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
 
     std::string layers;
     const char * sep = "";
@@ -66,7 +76,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         layers += std::to_string(id);
         sep = ", ";
     }
-    LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s]\n", __func__, layers.c_str());
+    LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s], n_embd_tgt = %u\n", __func__, layers.c_str(), n_embd_tgt);
 
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
@@ -190,6 +200,39 @@ void llama_model_dflash::load_tensors_layers_base() {
     }
 }
 
+// target features wider than taps x draft n_embd (the raw residual streams of a hyper-connection target) are not normalized, so fc(x) can exceed the F16 range
+// build_lora_mm is mul_mat(fc, x), optionally followed by mul(., fc_s) and add(., lora): request F32 on every matmul of that chain, since each reads the raw features
+static void dflash_fc_prec_f32(ggml_tensor * t, int & n_set) {
+    if (t == nullptr) {
+        return;
+    }
+    switch (t->op) {
+        case GGML_OP_MUL_MAT:
+            n_set += ggml_prec_set_acc(t, GGML_PREC_F32);
+            dflash_fc_prec_f32(t->src[1], n_set); // lora: b * (a * x)
+            break;
+        case GGML_OP_MUL:
+        case GGML_OP_ADD:
+        case GGML_OP_SCALE:
+            dflash_fc_prec_f32(t->src[0], n_set);
+            dflash_fc_prec_f32(t->src[1], n_set);
+            break;
+        default:
+            break;
+    }
+}
+
+static ggml_tensor * build_dflash_fc(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp) {
+    ggml_tensor * cur = g.build_lora_mm(model.fc, inp, model.fc_s);
+    // only when the fused target features are wider than taps x draft n_embd; n_embd-wide taps keep the default precision
+    if (g.hparams.n_embd_inp_enc() > model.target_layer_ids.size() * g.hparams.n_embd) {
+        int n_set = 0;
+        dflash_fc_prec_f32(cur, n_set);
+        GGML_ASSERT(n_set > 0 && "DFlash fc: no matmul found to request F32 accumulation");
+    }
+    return cur;
+}
+
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
@@ -211,7 +254,7 @@ template <>
 llama_model_dflash::graph<true>::graph(const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
 
-    cur = build_lora_mm(model.fc, cur, model.fc_s);
+    cur = build_dflash_fc(*this, model, cur);
     cb(cur, "fc_out", -1);
 
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -251,7 +294,7 @@ ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const 
 
     g.res->add_input(std::move(inp));
 
-    ggml_tensor * inp_g = g.build_lora_mm(model.fc, inp_target, model.fc_s);
+    ggml_tensor * inp_g = build_dflash_fc(g, model, inp_target);
     return g.build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
 }
 
@@ -450,6 +493,13 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
         : ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
     if (model.tok_norm && !model.dspark_mask_embd) {
         inpL = build_norm(inpL, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
+    } else if (!model.dspark_mask_embd && !model.tok_embd && cparams.ctx_other) {
+        // drafters converted before the upstream DFlash2 support carry no tok_norm of their own: an Inkling target
+        // normalizes its token embeddings (tok_norm), and the shared embedding of the block is normalized the same way
+        const auto & target = *llama_get_model(cparams.ctx_other);
+        if ((target.arch == LLM_ARCH_INKLING2 || target.arch == LLM_ARCH_INKLING2_LOOP) && target.tok_norm) {
+            inpL = ggml_mul(ctx0, ggml_rms_norm(ctx0, inpL, target.hparams.f_norm_rms_eps), target.tok_norm);
+        }
     }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);

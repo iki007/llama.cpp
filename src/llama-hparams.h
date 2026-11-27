@@ -307,6 +307,8 @@ struct llama_hparams {
     uint32_t dflash_selector_top_k   = 0;
     bool     dflash_softcap_post     = false; // DFlash2 softcaps the selector scores instead of the logits
     bool     dspark_f_rnn            = false; // rnn markov head reads f_rnn from embd_state
+    // DFlash2: candidates only from the first valid_vocab_size rows (the rest of the head is padding); 0 = all
+    uint32_t dflash_valid_vocab_size = 0;
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
     uint32_t lilicorr_num_heads      = 0;

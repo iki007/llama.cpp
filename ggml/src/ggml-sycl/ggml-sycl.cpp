@@ -7705,6 +7705,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        if (node->op == GGML_OP_REPEAT) {
+            const int glue_nodes_to_skip = ggml_sycl_try_moe_glue_fusion(*sycl_ctx, cgraph, i);
+            if (glue_nodes_to_skip > 0) {
+                i += glue_nodes_to_skip;
+                continue;
+            }
+        }
+
         // Run the window and cache updates at the convolution.
         if (conv_window.concat == nullptr && node->op == GGML_OP_CONCAT &&
             ggml_sycl_match_conv_window(cgraph, i, conv_window)) {
@@ -7719,10 +7727,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 ggml_sycl_ssm_conv_window(*sycl_ctx, conv_window);
                 i           = conv_window.last_idx;
                 conv_window = {};
-        if (node->op == GGML_OP_REPEAT) {
-            const int glue_nodes_to_skip = ggml_sycl_try_moe_glue_fusion(*sycl_ctx, cgraph, i);
-            if (glue_nodes_to_skip > 0) {
-                i += glue_nodes_to_skip;
                 continue;
             }
         }
