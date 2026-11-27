@@ -2995,6 +2995,12 @@ bool ggml_sycl_mul_mat_vec_q_id_dedup(enum ggml_type src0_type, const void * vx_
     }
     // 4 rows a sub-group: 2 and 8 were slower (fewer loads in flight; registers)
     if (reordered) {
+        if (ggml_sycl_moe_esimd::launch_moe_nvfp4_reorder_esimd(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream,
+                n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride)) {
+            return true;
+        }
         launch_mul_mat_vec_nvfp4_moe_dedup<4, true>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                                                     expert_weight_stride, dst_row_stride, src1_row_stride, stream,
                                                     n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride);

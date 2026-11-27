@@ -617,6 +617,247 @@ static void launch_moe_q8_0_reorder_esimd_impl(
     });
 }
 
+// ============================================================================
+// 4. NVFP4 SoA MoE ESIMD `dp4a (32|M0)` Kernel
+// Layout (reorder_qw_nvfp4_moe): [qs: nblocks*32B (no -0 codes)] [d: nblocks*4B (UE4M3)]
+// Processes 4 NVFP4 blocks (256 weights = 16 sub-blocks of 16) via 2 chained 32-wide dp4a!
+// ============================================================================
+template <int N>
+static SYCL_ESIMD_FUNCTION inline esimd::simd<int32_t, N>
+mxfp4_nz_vec(esimd::simd<uint32_t, N> x) {
+    const esimd::simd<uint32_t, N> m   = x & 0x07070707u;
+    const esimd::simd<uint32_t, N> t   = m & (((m >> 2) & 0x01010101u) * 3u);
+    const esimd::simd<uint32_t, N> mag = m + t + (((t >> 1) & t & 0x01010101u) << 1);
+    const esimd::simd<uint32_t, N> neg = (x >> 3) & 0x01010101u;
+    return esimd::simd<int32_t, N>((mag ^ (neg * 0xFFu)) + neg);
+}
+
+template <int N>
+static SYCL_ESIMD_FUNCTION inline esimd::simd<float, N>
+ue4m3_to_fp32_vec(esimd::simd<uint8_t, N> d_u8) {
+    esimd::simd<uint32_t, N> x     = d_u8;
+    esimd::simd<uint32_t, N> exp   = (x >> 3) & 0xFu;
+    esimd::simd<uint32_t, N> man   = x & 0x7u;
+    esimd::simd<uint32_t, N> fbits = ((exp + 119u) << 23) | (man << 20);
+    esimd::simd<float, N> res      = fbits.template bit_cast_view<float>();
+    res.merge(esimd::simd<float, N>(man) * (1.0f / 1024.0f), exp == 0u);
+    res.merge(0.0f, (x == 0u) | (x == 0x7Fu));
+    return res;
+}
+
+template <int RI, size_t WG_THRS>
+static void launch_moe_nvfp4_reorder_esimd_impl(
+    const void *    vx_base,
+    const void *    vy_base,
+    const int32_t * ids_dev,
+    float *         dst_base,
+    const int       ncols,
+    const int       nrows,
+    const int       n_experts_used,
+    const size_t    expert_weight_stride,
+    const size_t    dst_row_stride,
+    const size_t    src1_row_stride,
+    dpct::queue_ptr stream,
+    const int       n_tokens,
+    const size_t    ids_row_stride,
+    const size_t    dst_tok_stride,
+    const size_t    src1_tok_stride) {
+
+    constexpr int MAX_M = 8;
+    const int    bpr         = ncols / QK_NVFP4;
+    const size_t nblocks     = size_t(nrows) * size_t(bpr);
+    const size_t rblocks     = size_t((nrows + RI - 1) / RI);
+    const size_t wg_per_slot = (rblocks + WG_THRS - 1) / WG_THRS;
+
+    const sycl::range<3> g_range(size_t(n_tokens), size_t(n_experts_used), wg_per_slot * WG_THRS);
+    const sycl::range<3> l_range(1, 1, WG_THRS);
+
+    stream->submit([&](sycl::handler & h) {
+        h.parallel_for(
+            sycl::nd_range<3>(g_range, l_range),
+            [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+                const int    t0 = int(item.get_group(0));
+                const int    k0 = int(item.get_group(1));
+                const size_t rb = item.get_group(2) * WG_THRS + item.get_local_id(2);
+                if (rb >= rblocks) return;
+
+                const int i02 = ids_dev[size_t(t0) * ids_row_stride + size_t(k0)];
+                const int r0  = int(rb) * RI;
+
+                if (i02 < 0) {
+                    float * dst_s = reinterpret_cast<float *>(
+                        reinterpret_cast<char *>(dst_base) +
+                        size_t(t0) * dst_tok_stride + size_t(k0) * dst_row_stride);
+                    store_zero_rows<RI>(dst_s, r0, nrows);
+                    return;
+                }
+
+                size_t vy_off[MAX_M], dst_off[MAX_M];
+                const int cnt = dedup_moe_slots<MAX_M>(
+                    ids_dev, t0, k0, i02, n_tokens, n_experts_used, ids_row_stride,
+                    src1_tok_stride, src1_row_stride, dst_tok_stride, dst_row_stride, vy_off, dst_off);
+                if (cnt == 0) return;
+
+                const uint8_t * vx      = reinterpret_cast<const uint8_t *>(vx_base) + size_t(i02) * expert_weight_stride;
+                const uint8_t * qs_base = vx;
+                const uint8_t * d_base  = vx + nblocks * (QK_NVFP4 / 2);
+
+                esimd::simd<float, MAX_M> acc[RI];
+                #pragma unroll
+                for (int r = 0; r < RI; ++r) acc[r] = 0.0f;
+
+                const esimd::simd<int32_t, 32> zero32(0);
+                const esimd::simd<int32_t, 8>  zero8(0);
+
+                // Main loop: 4 NVFP4 blocks (256 weights = 16 sub-blocks of 16) per iteration
+                const int bpr4 = bpr & ~3;
+                for (int ib = 0; ib < bpr4; ib += 4) {
+                    esimd::simd<int32_t, 32> v_lo[RI], v_hi[RI];
+                    esimd::simd<float, 16>   dw16[RI];
+
+                    #pragma unroll
+                    for (int r = 0; r < RI; ++r) {
+                        const int    rr  = (r0 + r < nrows) ? (r0 + r) : r0;
+                        const size_t ibx = size_t(rr) * size_t(bpr) + size_t(ib);
+                        const esimd::simd<uint32_t, 32> qv = esimd::block_load<uint32_t, 32>(
+                            reinterpret_cast<const uint32_t *>(qs_base + ibx * (QK_NVFP4 / 2)));
+                        const esimd::simd<uint8_t, 16> du = esimd::block_load<uint8_t, 16>(
+                            d_base + ibx * (QK_NVFP4 / QK_NVFP4_SUB));
+                        v_lo[r] = mxfp4_nz_vec<32>(qv & 0x0F0F0F0Fu);
+                        v_hi[r] = mxfp4_nz_vec<32>((qv >> 4) & 0x0F0F0F0Fu);
+                        dw16[r] = ue4m3_to_fp32_vec<16>(du);
+                    }
+
+                    for (int i = 0; i < cnt; ++i) {
+                        const char * vy = reinterpret_cast<const char *>(vy_base) + vy_off[i];
+                        esimd::simd<int32_t, 64> raw = esimd::block_load<int32_t, 64>(
+                            reinterpret_cast<const int32_t *>(vy + size_t(ib) * QK_NVFP4));
+                        esimd::simd<uint32_t, 8> ds_raw = esimd::block_load<uint32_t, 8>(
+                            reinterpret_cast<const uint32_t *>(vy + ncols) + size_t(ib) * (QK_NVFP4 / QK8_1));
+
+                        auto ds_h = ds_raw.bit_cast_view<sycl::half>();
+                        const esimd::simd<float, 8> d8_8 = esimd::simd<sycl::half, 8>(ds_h.select<8, 2>(0));
+                        esimd::simd<float, 16> d8_16;
+                        d8_16.select<8, 2>(0) = d8_8;
+                        d8_16.select<8, 2>(1) = d8_8;
+
+                        // Each 16-element sub-block has 4 int32s: [a0, a1] -> lo, [a2, a3] -> hi
+                        esimd::simd<int64_t, 32> raw64 = raw.bit_cast_view<int64_t>();
+                        esimd::simd<int64_t, 16> a_lo64 = raw64.select<16, 2>(0);
+                        esimd::simd<int64_t, 16> a_hi64 = raw64.select<16, 2>(1);
+                        const esimd::simd<int32_t, 32> a_lo = a_lo64.bit_cast_view<int32_t>();
+                        const esimd::simd<int32_t, 32> a_hi = a_hi64.bit_cast_view<int32_t>();
+
+                        #pragma unroll
+                        for (int r = 0; r < RI; ++r) {
+                            esimd::simd<int32_t, 32> dot = esimd::dp4a<int32_t>(zero32, v_lo[r], a_lo);
+                            dot = esimd::dp4a<int32_t>(dot, v_hi[r], a_hi);
+                            const esimd::simd<int32_t, 16> sub16 = dot.select<16, 2>(0) + dot.select<16, 2>(1);
+                            esimd::simd<float, 16> p16 = dw16[r] * d8_16 * esimd::simd<float, 16>(sub16);
+                            esimd::simd<float, 8>  s8  = p16.select<8, 1>(0) + p16.select<8, 1>(8);
+                            esimd::simd<float, 4>  s4  = s8.select<4, 1>(0)  + s8.select<4, 1>(4);
+                            esimd::simd<float, 2>  s2  = s4.select<2, 1>(0)  + s4.select<2, 1>(2);
+                            const float prev = acc[r][i];
+                            acc[r][i] = prev + (float(s2[0]) + float(s2[1]));
+                        }
+                    }
+                }
+
+                // Tail loop for bpr % 4 != 0 (e.g. Inkling down_exps ncols=1152 -> bpr=18 -> 2 tail blocks)
+                for (int ib = bpr4; ib < bpr; ++ib) {
+                    esimd::simd<int32_t, 8> v_lo[RI], v_hi[RI];
+                    esimd::simd<float, 4>   dw4[RI];
+
+                    #pragma unroll
+                    for (int r = 0; r < RI; ++r) {
+                        const int    rr  = (r0 + r < nrows) ? (r0 + r) : r0;
+                        const size_t ibx = size_t(rr) * size_t(bpr) + size_t(ib);
+                        const esimd::simd<uint32_t, 8> qv = esimd::block_load<uint32_t, 8>(
+                            reinterpret_cast<const uint32_t *>(qs_base + ibx * (QK_NVFP4 / 2)));
+                        const esimd::simd<uint8_t, 4> du = esimd::block_load<uint8_t, 4>(
+                            d_base + ibx * (QK_NVFP4 / QK_NVFP4_SUB));
+                        v_lo[r] = mxfp4_nz_vec<8>(qv & 0x0F0F0F0Fu);
+                        v_hi[r] = mxfp4_nz_vec<8>((qv >> 4) & 0x0F0F0F0Fu);
+                        dw4[r]  = ue4m3_to_fp32_vec<4>(du);
+                    }
+
+                    for (int i = 0; i < cnt; ++i) {
+                        const char * vy = reinterpret_cast<const char *>(vy_base) + vy_off[i];
+                        esimd::simd<int32_t, 16> raw = esimd::block_load<int32_t, 16>(
+                            reinterpret_cast<const int32_t *>(vy + size_t(ib) * QK_NVFP4));
+                        esimd::simd<uint32_t, 2> ds_raw = esimd::block_load<uint32_t, 2>(
+                            reinterpret_cast<const uint32_t *>(vy + ncols) + size_t(ib) * (QK_NVFP4 / QK8_1));
+                        auto ds_h = ds_raw.bit_cast_view<sycl::half>();
+                        const esimd::simd<float, 2> d8_2 = esimd::simd<sycl::half, 2>(ds_h.select<2, 2>(0));
+                        esimd::simd<float, 4> d8_4;
+                        d8_4[0] = d8_2[0]; d8_4[1] = d8_2[0];
+                        d8_4[2] = d8_2[1]; d8_4[3] = d8_2[1];
+
+                        esimd::simd<int64_t, 8> raw64  = raw.bit_cast_view<int64_t>();
+                        esimd::simd<int64_t, 4> a_lo64 = raw64.select<4, 2>(0);
+                        esimd::simd<int64_t, 4> a_hi64 = raw64.select<4, 2>(1);
+                        const esimd::simd<int32_t, 8> a_lo = a_lo64.bit_cast_view<int32_t>();
+                        const esimd::simd<int32_t, 8> a_hi = a_hi64.bit_cast_view<int32_t>();
+
+                        #pragma unroll
+                        for (int r = 0; r < RI; ++r) {
+                            esimd::simd<int32_t, 8> dot = esimd::dp4a<int32_t>(zero8, v_lo[r], a_lo);
+                            dot = esimd::dp4a<int32_t>(dot, v_hi[r], a_hi);
+                            const esimd::simd<int32_t, 4> sub4 = dot.select<4, 2>(0) + dot.select<4, 2>(1);
+                            esimd::simd<float, 4> p4 = dw4[r] * d8_4 * esimd::simd<float, 4>(sub4);
+                            esimd::simd<float, 2> s2 = p4.select<2, 1>(0) + p4.select<2, 1>(2);
+                            const float prev = acc[r][i];
+                            acc[r][i] = prev + (float(s2[0]) + float(s2[1]));
+                        }
+                    }
+                }
+
+                store_acc_rows<RI, MAX_M>(dst_base, dst_off, acc, cnt, r0, nrows);
+            }
+        );
+    });
+}
+
+static inline bool launch_moe_nvfp4_reorder_esimd(
+    const void *    vx_base,
+    const void *    vy_base,
+    const int32_t * ids_dev,
+    float *         dst_base,
+    const int       ncols,
+    const int       nrows,
+    const int       n_experts_used,
+    const size_t    expert_weight_stride,
+    const size_t    dst_row_stride,
+    const size_t    src1_row_stride,
+    dpct::queue_ptr stream,
+    const int       n_tokens,
+    const size_t    ids_row_stride,
+    const size_t    dst_tok_stride,
+    const size_t    src1_tok_stride) {
+
+    static const int mode = ggml_sycl_get_env("GGML_SYCL_MOE_NVFP4_ESIMD", 1);
+    if (mode == 0 || ncols <= 0 || (ncols % QK_NVFP4) != 0 || nrows <= 0 || n_tokens <= 0 || n_experts_used <= 0) {
+        return false;
+    }
+    // Auto (mode=1): NVFP4 ESIMD RI=4 wins single-token decode (tg64 +1.2..1.5% on Inkling-2-Mini);
+    // multi-token batches stay on mul_mat_vec_nvfp4_moe_dedup<4, true> unless forced (mode=2/3).
+    if (mode == 1 && n_tokens > 1) {
+        return false;
+    }
+    if (mode == 3) {
+        launch_moe_nvfp4_reorder_esimd_impl<8, 16>(
+            vx_base, vy_base, ids_dev, dst_base, ncols, nrows, n_experts_used,
+            expert_weight_stride, dst_row_stride, src1_row_stride, stream,
+            n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride);
+    } else {
+        launch_moe_nvfp4_reorder_esimd_impl<4, 16>(
+            vx_base, vy_base, ids_dev, dst_base, ncols, nrows, n_experts_used,
+            expert_weight_stride, dst_row_stride, src1_row_stride, stream,
+            n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride);
+    }
+    return true;
+}
+
 // Unified runtime dispatcher for Q4_K / Q5_K / Q6_K / Q8_0 SoA MoE ESIMD dp4a
 static inline bool launch_moe_reorder_esimd(
     enum ggml_type  src0_type,
