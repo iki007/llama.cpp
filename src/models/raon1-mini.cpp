@@ -62,9 +62,10 @@ void llama_model_raon1_mini::load_arch_hparams(llama_model_loader & ml) {
     require(hparams.hc_magnitude > 0, "hyper_connection.magnitude is not positive");
     require(hparams.situ_beta > 0 && hparams.situ_linear_beta > 0, "a SiTU beta is not positive");
     require(hparams.n_layer_dense_lead <= hparams.n_layer(), format("leading_dense_block_count %u is larger than block_count %u", hparams.n_layer_dense_lead, hparams.n_layer()));
-    const auto head_dim = hparams.n_embd_head_kda;
-    require(head_dim == 16 || head_dim == 32 || head_dim == 64 || head_dim == 128,
-            format("RDA head dimension %u is not 16, 32, 64 or 128", head_dim));
+    if (hparams.n_embd_head_kda != 16 && hparams.n_embd_head_kda != 32 &&
+        hparams.n_embd_head_kda != 64 && hparams.n_embd_head_kda != 128) {
+        throw std::runtime_error(format("unsupported Raon-1 mini RDA head dimension %u (16, 32, 64 or 128)", hparams.n_embd_head_kda));
+    }
 
     switch (hparams.n_layer()) {
         case 25: type = LLM_TYPE_29B_A4B; break;
@@ -165,7 +166,59 @@ void llama_model_raon1_mini::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_raon1_mini::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    return std::make_unique<graph>(*this, params);
+}
+
+// causal conv1d over one third (qkv = 0, 1, 2) of the shared Q/K/V conv state, with the rollback snapshots
+// x_proj: (d_inner, n_tokens); returns (head_dim, n_head, n_seq_tokens, n_seqs)
+ggml_tensor * llama_model_raon1_mini::graph::build_rda_conv(
+        llm_graph_input_rs * inp_rs, ggml_tensor * conv_states_seq, ggml_tensor * x_proj,
+        ggml_tensor * conv_w, int64_t qkv, int il) {
+    const auto * mctx_cur = inp_rs->mctx;
+
+    const int64_t kv_head  = mctx_cur->get_head();
+    const int64_t mem_size = mctx_cur->get_size();
+    const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
+
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seqs       = ubatch.n_seqs;
+
+    const int64_t head_dim        = hparams.n_embd_head_kda;
+    const int64_t d_conv          = hparams.ssm_d_conv;
+    const int64_t d_inner         = head_dim * n_head;
+    const int64_t conv_state_size = (d_conv - 1) * d_inner;
+    const int64_t n_embd_r_total  = 3 * conv_state_size;
+
+    ggml_tensor * conv_states_mem = mctx_cur->get_r_l(il);
+
+    ggml_tensor * conv_state_x = ggml_view_3d(ctx0, conv_states_seq, d_conv - 1, d_inner, n_seqs,
+        (d_conv - 1)   * ggml_element_size(conv_states_seq),
+        n_embd_r_total * ggml_element_size(conv_states_seq),
+        qkv * conv_state_size * ggml_element_size(conv_states_seq));
+
+    ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
+    ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
+
+    // group s holds the conv window s tokens back.
+    // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
+    for (int64_t s = 0; s < K_rs; ++s) {
+        const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
+        ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
+            conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, conv_x_s,
+                ggml_view_3d(ctx0, conv_states_mem, d_conv - 1, d_inner, n_seqs,
+                    (d_conv - 1)   * ggml_element_size(conv_states_mem),
+                    n_embd_r_total * ggml_element_size(conv_states_mem),
+                    ((s * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_mem))));
+    }
+
+    ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
+    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
+    Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
+    Xcur = ggml_silu(ctx0, Xcur);
+
+    return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
 
 // decay gate from x = f_b(f_a(cur)) + dt_bias; ssm_a holds -exp(A_log)
@@ -191,20 +244,15 @@ ggml_tensor * llama_model_raon1_mini::graph::build_rda_gate(ggml_tensor * x, ggm
 ggml_tensor * llama_model_raon1_mini::graph::build_rda_layer(
         ggml_tensor * cur, const llama_layer & layer, llm_graph_input_rs * inp_rs, int il) {
     const int64_t head_dim     = hparams.n_embd_head_kda;
-    const int64_t d_conv       = hparams.ssm_d_conv;
     const int64_t d_inner      = head_dim * n_head;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
-    ggml_tensor * conv_states_all = inp_rs->mctx->get_r_l(il);
-    ggml_tensor * conv_states_seq = build_rs(inp_rs, conv_states_all, conv_states_all->ne[0], n_seqs);
+    ggml_tensor * conv_states_seq = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), hparams.n_embd_r(), n_seqs);
 
-    ggml_tensor * Qcur = build_kda_conv1d(inp_rs, conv_states_all, conv_states_seq, 0, build_lora_mm(layer.wq, cur),
-            layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, il);
-    ggml_tensor * Kcur = build_kda_conv1d(inp_rs, conv_states_all, conv_states_seq, 1, build_lora_mm(layer.wk, cur),
-            layer.ssm_k_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, il);
-    ggml_tensor * Vcur = build_kda_conv1d(inp_rs, conv_states_all, conv_states_seq, 2, build_lora_mm(layer.wv, cur),
-            layer.ssm_v_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, il);
+    ggml_tensor * Qcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wq, cur), layer.ssm_q_conv, 0, il);
+    ggml_tensor * Kcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wk, cur), layer.ssm_k_conv, 1, il);
+    ggml_tensor * Vcur = build_rda_conv(inp_rs, conv_states_seq, build_lora_mm(layer.wv, cur), layer.ssm_v_conv, 2, il);
     cb(Qcur, "rda_q_conv", il);
     cb(Kcur, "rda_k_conv", il);
     cb(Vcur, "rda_v_conv", il);
@@ -346,16 +394,13 @@ ggml_tensor * llama_model_raon1_mini::graph::build_mla_layer(
     const int64_t nk = hparams.n_embd_head_k_mla();
     const int64_t nn = nk - nr;
     const int64_t rank = hparams.n_lora_kv;
-    // Raon defines a separate RMSNorm epsilon for its Q and KV latent projections.
     const float eps = hparams.f_norm_rms_eps_latent;
     ggml_tensor * q = build_lora_mm(layer.wq_a, cur);
     q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, eps), layer.attn_q_a_norm);
-    cb(q, "mla_q_norm", il);
     q = build_lora_mm(layer.wq_b, q);
     ggml_tensor * kv = build_lora_mm(layer.wkv_a_mqa, cur);
     ggml_tensor * latent = ggml_view_2d(ctx0, kv, rank, n_tokens, kv->nb[1], 0);
     latent = ggml_mul(ctx0, ggml_rms_norm(ctx0, latent, eps), layer.attn_kv_a_norm);
-    cb(latent, "mla_kv_norm", il);
     // NoPE: the "rope" dims of q and k are concatenated as they are, without rotation
     ggml_tensor * extra = ggml_view_3d(ctx0, kv, nr, 1, n_tokens, kv->nb[1], kv->nb[1], rank*kv->nb[0]);
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, nn, n_head, n_tokens, nk*q->nb[0], q->nb[1], 0);
@@ -373,31 +418,7 @@ ggml_tensor * llama_model_raon1_mini::graph::build_mla_layer(
     return build_lora_mm(layer.wo, out);
 }
 
-// dense SiTU-GLU feed-forward for the lead layers and the shared expert:
-//   situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
-// build_ffn has no SiTU case; the routed experts go through build_moe_ffn, which has one
-ggml_tensor * llama_model_raon1_mini::graph::build_situ_ffn(
-        ggml_tensor * cur, ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) {
-    const float beta = hparams.situ_beta;
-    const float lb   = hparams.situ_linear_beta;
-
-    ggml_tensor * u = build_lora_mm(up, cur);
-    cb(u, "ffn_up", il);
-    ggml_tensor * g = build_lora_mm(gate, cur);
-    cb(g, "ffn_gate", il);
-
-    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, g, 1.0f/beta)), beta);
-    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, g));
-    u   = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, u, 1.0f/lb)), lb);
-    cur = ggml_mul(ctx0, act, u);
-    cb(cur, "ffn_situ", il);
-
-    cur = build_lora_mm(down, cur);
-    cb(cur, "ffn_out", il);
-    return cur;
-}
-
-llama_model_raon1_mini::graph::graph(const llm_graph_params & params) : llm_build_delta_net_base(params) {
+llama_model_raon1_mini::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_build_delta_net_base(params) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nm = hc - 1;
     helmert = nullptr;
@@ -442,22 +463,18 @@ llama_model_raon1_mini::graph::graph(const llm_graph_params & params) : llm_buil
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
         if (il < (int) hparams.n_layer_dense_lead) {
-            cur = build_situ_ffn(cur, layer.ffn_up, layer.ffn_gate, layer.ffn_down, il);
+            cur = build_ffn(cur, layer.ffn_up, nullptr, nullptr, layer.ffn_gate, nullptr, nullptr,
+                    layer.ffn_down, nullptr, nullptr, nullptr, LLM_FFN_SITU, LLM_FFN_PAR, il);
         } else {
-            ggml_tensor * moe = build_moe_ffn(cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
-                layer.ffn_exp_probs_b,
-                hparams.n_expert, hparams.n_expert_used(),
-                LLM_FFN_SITU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+            ggml_tensor * moe = build_moe_ffn(cur, layer.ffn_gate_inp, layer.ffn_up_exps,
+                    layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_exp_probs_b,
+                    hparams.n_expert, hparams.n_expert_used(), LLM_FFN_SITU,
+                    hparams.expert_weights_norm, hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func, il);
             if (layer.ffn_gate_shexp) {
-                ggml_tensor * shared = build_situ_ffn(cur, layer.ffn_up_shexp, layer.ffn_gate_shexp,
-                        layer.ffn_down_shexp, il);
+                ggml_tensor * shared = build_ffn(cur, layer.ffn_up_shexp, nullptr, nullptr,
+                        layer.ffn_gate_shexp, nullptr, nullptr, layer.ffn_down_shexp, nullptr,
+                        nullptr, nullptr, LLM_FFN_SITU, LLM_FFN_PAR, il);
                 moe = ggml_add(ctx0, moe, shared);
             }
             cur = moe;
@@ -481,4 +498,5 @@ llama_model_raon1_mini::graph::graph(const llm_graph_params & params) : llm_buil
     cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
 }
