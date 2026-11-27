@@ -9,6 +9,7 @@
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
 #    include "esimd.hpp"
 #endif // GGML_SYCL_MMVQ_HAS_XMX
+#include "moe-q4k-esimd.hpp"
 
 // vec_dot_q_sycl_t adapters for the IQ vec_dots that take their codebook tables as extra
 // arguments: bind the constant tables here (as vec_dot_iq2_s_q8_1 / vec_dot_iq1_m_q8_1 already do
@@ -3598,6 +3599,12 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             src1_tok_stride) {
     if (!ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0_type)) {
         return false;
+    }
+    if (ggml_sycl_moe_esimd::launch_moe_reorder_esimd(
+            src0_type, vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+            expert_weight_stride, dst_row_stride, src1_row_stride, stream,
+            n_tokens, ids_row_stride, dst_tok_stride, src1_tok_stride)) {
+        return true;
     }
     switch (src0_type) {
         case GGML_TYPE_Q8_0:
