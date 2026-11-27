@@ -581,16 +581,6 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
       }
 }
 
-template <ggml_type type, typename dst_t>
-static void dequantize_row_iq4_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
-    // flat range<1>, four qs bytes (8 outputs) per item
-    GGML_ASSERT(k % ggml_sycl_reordered::block_q_t<type>::traits::qk == 0);
-    stream->parallel_for(sycl::range<1>((size_t) (k / 8)),
-        [=](sycl::id<1> idx) {
-            dequantize_block_iq4_reorder_wide<type>(vx, y, k, idx);
-        });
-}
-
 template <typename dst_t>
 static void dequantize_row_mxfp4_sycl(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     const int64_t nb32 = k / QK_MXFP4;
@@ -771,7 +761,7 @@ static void convert_unary_cont_vec4_sycl(const void * __restrict__ vx, dst_t * _
                             cvt_vec4<dst_t> yv;
 #pragma unroll
                             for (int j = 0; j < 4; ++j) {
-                                yv.v[j] = static_cast<dst_t>(xv.v[j]);
+                                yv.v[j] = ggml_sycl_cast<dst_t>(xv.v[j]);
                             }
 
                             ((cvt_vec4<dst_t> *) y)[i] = yv;

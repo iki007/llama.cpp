@@ -868,9 +868,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    // the lightning indexer scores small batches and reads an f16 mask; the scorer of larger batches adds an f32 one
-    const bool lid  = cparams.fused_lid && n_tokens <= 32;
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, lid ? GGML_TYPE_F16 : GGML_TYPE_F32, n_pool, n_tokens);
+    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -961,25 +959,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     q = build_rope(q, inp_pos, il);
     cb(q, "indexer_q", il);
 
-    ggml_tensor * score = nullptr;
-    if (inp_kpool->pool_mask->type == GGML_TYPE_F16) {
-        ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-        score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask);
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    } else {
-        // Prefill scores all heads with one matrix product.
-        ggml_tensor * kq = ggml_mul_mat(ctx0,
-                ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
-                ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
-        kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
-
-        for (int64_t h = 0; h < n_idx_h; ++h) {
-            ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
-            score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
-        }
-        score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
-        score = ggml_add(ctx0, score, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    }
+    // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
+    // which is the lightning indexer with every head weight set to that scale
+    ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
+    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
     cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
